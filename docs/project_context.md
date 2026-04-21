@@ -1,19 +1,26 @@
-# Project Context
 
-This project builds a temporal AML detection pipeline from transaction events.
 
-Input:
-- timestamped transactions between entities
-- daily or windowed event data
 
-Output:
-- risky entities
-- suspicious communities
-- suspicious temporal motifs
-- ML-ready features for downstream models
+## Environment Constraints
+- Runs on Google Colab
+- Limited RAM
+- T4 GPU available but not for graph processing
 
-Core goals:
-- narrow the search space with community detection
-- extract temporal motifs as behavioral signals
-- convert graph patterns into numeric features
-- avoid full in-memory graph construction for large datasets
+## Input
+- Timestamped transaction events
+- Daily or windowed data
+
+## Output
+- Suspicious entities
+- Suspicious communities
+- Temporal motifs
+- ML-ready features
+
+## Core Technical Goals
+- Avoid full in-memory graph construction
+- Use window-based processing
+- Extract behavioral patterns efficiently
+- Convert patterns into numeric features
+
+## Design Constraint
+All processing must be memory-efficient and runnable within Colab limits.

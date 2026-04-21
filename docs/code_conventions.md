@@ -1,10 +1,35 @@
+
+
 # Code Conventions
 
-- Make the smallest change that solves the task.
-- Do not refactor unrelated code.
-- Do not build a full in-memory MultiDiGraph for the entire dataset unless explicitly required.
-- Prefer window-based processing, joins, groupby, and local subgraph extraction.
-- Keep changes aligned with the existing style.
-- Remove only imports/variables/functions made unused by the change itself.
-- Prefer explicit, readable code over speculative abstractions.
-- Keep memory-heavy graph objects bounded to a window, a community, or a local candidate subgraph.
+## Core Principle
+Optimize for memory efficiency and scalability in a Colab environment.
+
+## Required Practices
+- Use vectorized operations (pandas/polars) whenever possible
+- Prefer groupby, joins, and filtering over graph traversal
+- Process data in time windows instead of full dataset
+- Use chunking for large datasets
+
+## Graph Usage Rules
+- DO NOT build full MultiDiGraph on entire dataset
+- ONLY build graph for:
+  - small time windows
+  - local subgraph analysis
+- Always justify why a graph is needed before using it
+
+## Performance Rules
+- Avoid iterrows()
+- Prefer itertuples() or vectorized operations
+- Avoid storing large intermediate lists in memory
+- Drop unused columns early
+
+## Memory Rules
+- Never duplicate full datasets in memory
+- Avoid copying DataFrames unless necessary
+- Use in-place operations when safe
+
+## Change Discipline
+- Minimal changes only
+- No unnecessary refactoring
+- Match existing code style
