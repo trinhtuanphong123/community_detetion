@@ -33,3 +33,10 @@ Optimize for memory efficiency and scalability in a Colab environment.
 - Minimal changes only
 - No unnecessary refactoring
 - Match existing code style
+
+
+## GPU / cuDF constraints
+- Không dùng .loc assignment trên cuDF — dùng arithmetic vectorized
+- Không dùng Python loops trên cuDF rows — dùng groupby/merge
+- cuGraph chỉ support undirected Leiden — cần canonical pair (min/max)
+- Mọi in-memory graph phải được giải phóng với gc.collect() sau mỗi window
