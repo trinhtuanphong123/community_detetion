@@ -1,65 +1,56 @@
 # CLAUDE.md
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+## Project: AML Graph Mining Pipeline
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+## Source of truth
+Use these docs as the working reference, in this order when there is overlap:
+1. `.cursorrule.md`
+2. `.cursorrule.conventions.md`
+3. `project_context.md`
+4. `skills_tools.md`
+5. Any task-specific spec or notebook already in the repo
 
-## 1. Think Before Coding
+## Operating principles
+- Prefer correctness, explainability, and low memory use over cleverness.
+- Keep changes minimal and local to the request.
+- Do not refactor unrelated code.
+- Do not invent abstractions that the task does not need.
+- Surface uncertainty instead of assuming.
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
+## AML domain rules
+- AML is risk-based detection, not deterministic classification.
+- Community detection produces candidate suspicious groups, not final truth.
+- Motifs are suspicious only when topology, timing, amount, repetition, and context align.
+- Thresholds must remain configurable and data-dependent.
 
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
+## Graph and data rules
+- Preserve time, direction, and weight.
+- Prefer windowed processing, joins, groupby, and local subgraph extraction.
+- Do not build a full dataset-wide MultiDiGraph.
+- Use graph structures only for bounded windows or local analysis.
+- Treat transactions as an event stream first.
 
-## 2. Simplicity First
+## Environment rules
+- Code must run in Google Colab with limited RAM.
+- T4 GPU may be present, but graph processing must not depend on it.
+- Keep notebook cells runnable independently when practical.
 
-**Minimum code that solves the problem. Nothing speculative.**
+## Implementation guidance
+- State assumptions when they matter.
+- Prefer explicit code over speculative helpers.
+- Remove only imports or variables that become unused because of the current change.
+- If a requested design is likely to fail at scale, push back with a simpler alternative.
 
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
+## Task execution style
+For multi-step tasks, use a brief plan and verify each step against the requested outcome.
 
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+## Project modules
+- `community/` for community detection logic
+- `motif/` for temporal motif mining logic
+- Feature extraction should consume outputs from both components
 
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
----
-
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+## Prohibited patterns
+- Full in-memory graph construction on the whole dataset
+- Dense matrix representations when sparse is enough
+- Row-wise Python loops over large tables
+- Hidden changes outside the requested scope

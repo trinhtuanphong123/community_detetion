@@ -1,87 +1,89 @@
-# AMLGentex Data Overview
+# AMLGentex Dataset (sweden_100K_dist_change_difficult)
 
-AMLGentex is the synthetic AML benchmark data family used in this project. It is designed to generate realistic, configurable transaction data for anti-money-laundering research and evaluation.
+This project uses the dataset:
 
-## Purpose in this repo
+AMLGentex/sweden_100K_dist_change_difficult
 
-Use AMLGentex as:
-- source data for graph construction
-- input for community detection
-- input for temporal motif mining
-- training / validation data for ML models
+## Dataset Nature
 
-## Data philosophy
+- Synthetic AML dataset (not real banking data)
+- ~100K transactions
+- Simulates financial activity in a Sweden-like environment
+- Includes both normal and suspicious transaction patterns
 
-This project should treat AMLGentex as an event stream first, not as a full in-memory graph.
+## Key Characteristics
 
-Recommended processing:
-- read raw transactions
-- normalize columns
-- create time windows
-- derive local graph views only when needed
-- convert graph patterns into numeric features
+- Temporal transaction data (event-based)
+- Directed transactions between entities
+- Contains AML typologies (e.g., layering, structuring)
+- Includes **distribution shift over time** (concept drift)
+- “difficult” variant → patterns are less obvious and noisier
 
-## Recommended folder usage
+## Labels
 
-- `data/raw/`  
-  Unmodified AMLGentex exports.
+- A binary suspicious label is provided (e.g., `isSAR`)
+- Labels are **not perfect ground truth**
+- Treat labels as:
+  - training signal
+  - evaluation reference
+  - NOT absolute truth
 
-- `data/processed/`  
-  Cleaned tables with normalized schema.
+## Canonical Schema Used in This Project
 
-- `data/sample/`  
-  Small synthetic subset for quick tests and debugging.
+All data must be normalized into:
 
-## Canonical transaction schema
+| field | type | description |
+|------|------|------------|
+| tx_id | string/int | unique transaction id |
+| timestamp | datetime | event timestamp |
+| step | int | discrete time index (e.g., day) |
+| src_node | int | sender entity |
+| dst_node | int | receiver entity |
+| amount | float | transaction amount |
+| normalized_amount | float | scaled amount (optional) |
+| type | string | transaction type |
+| is_sar | int | suspicious label (0/1) |
 
-The repo should normalize AMLGentex transactions into a common schema like this:
+## Important Constraints
 
-| field | type | meaning |
-|---|---|---|
-| `tx_id` | string | unique transaction id |
-| `timestamp` | datetime | event time in UTC or normalized local time |
-| `step` | int | discrete time bucket, often daily |
-| `src_node` | int/string | sender entity id |
-| `dst_node` | int/string | receiver entity id |
-| `amount` | float | transaction amount in source currency |
-| `normalized_amount` | float | amount normalized to a common scale |
-| `currency` | string | currency code |
-| `type` | string | transaction type if available |
-| `channel` | string | channel / rail if available |
-| `label` | int/nullable | suspicious label if available |
-| `scenario` | string/nullable | simulation or typology tag if available |
+- Transactions must be processed in **time order**
+- Do NOT shuffle data randomly (breaks temporal patterns)
+- Distribution changes across time → models must be robust to drift
+- Do NOT assume stationarity
 
-## Example record
+## Usage in This Project
 
-```json
-{
-  "tx_id": "tx_000001",
-  "timestamp": "2024-01-03T09:15:00Z",
-  "step": 3,
-  "src_node": 12,
-  "dst_node": 47,
-  "amount": 2500.0,
-  "normalized_amount": 2500.0,
-  "currency": "USD",
-  "type": "transfer",
-  "channel": "bank_transfer",
-  "label": 0,
-  "scenario": "baseline"
-}
-```
+### For Community Detection
+- Build graph per time window
+- Detect dense or abnormal subgraphs
+- Use communities as candidate suspicious regions
 
-## Minimal processing rules
+### For Motif Mining
+- Extract temporal motifs within windows
+- Use:
+  - time ordering
+  - amount relationships
+  - repetition
+- Do NOT rely on topology only
 
-- Keep only fields needed for graph / motif / feature generation.
-- Drop unused columns early.
-- Never duplicate the full dataset in memory.
-- Build graphs only inside a bounded window or a local subgraph.
-- Use the processed table as the source for both community detection and motif mining.
+### For Feature Engineering
+- Convert motifs and community signals into numeric features
+- Aggregate per:
+  - node
+  - community
+  - time window
+
+## Processing Rules
+
+- Prefer window-based processing (7d / 30d)
+- Avoid building full graph in memory
+- Use pandas/polars operations where possible
+- Build graph objects ONLY for local analysis
 
 ## Notes for Claude
 
-When working with AMLGentex data in this repo:
-- prefer window-based logic over full-graph logic
-- keep memory use low for Colab execution
-- treat suspicious labels as training signals, not perfect truth
-- preserve temporal order when deriving motifs
+- This dataset contains concept drift → patterns change over time
+- Suspicious behavior is not defined by a single rule
+- A motif is only meaningful when:
+  - timing + amount + repetition align
+- Always prioritize memory-efficient processing (Colab environment)

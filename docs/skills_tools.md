@@ -1,37 +1,36 @@
 # Skills / Tools Used
 
-This project runs primarily on Google Colab with limited RAM and optional T4 GPU.
-
-## Core Environment
-- Google Colab (primary execution environment)
+## Execution environment
+- Google Colab
+- T4 GPU available
 - Python 3.x
+- Limited RAM, so every step must be window-aware
 
-## Data Processing (Primary)
-- pandas (default)
-- polars (preferred for large datasets due to lower memory usage)
+## Primary stack
+- pandas / polars — tabular preprocessing
+- scipy.sparse — sparse adjacency and matrix operations
+- networkx — bounded local graph debugging and visualization only
+- python-igraph — directed community / flow analysis when needed
+- scikit-learn — feature modeling and evaluation
+- XGBoost / LightGBM — downstream ML
+- Pydantic — schema validation for transaction records
 
-## Graph Processing (Restricted Use Only)
-- NetworkX (ONLY for small, bounded subgraphs or short time windows)
-- DO NOT use NetworkX to build full event graphs for the entire dataset
+## Optional acceleration
+- cuDF may be used for tabular preprocessing only if the notebook path already supports it cleanly.
+- Do not rely on GPU for full-graph construction or large graph algorithms.
 
-## Modeling
-- scikit-learn
-- XGBoost / LightGBM (CPU-based by default)
+## Graph processing
+- Use windowed graphs as the default unit of work.
+- Keep graphs directed, weighted, and time-aware.
+- Use NetworkX only for small subgraphs and debug checks.
+- Prefer sparse representations over dense matrices.
+- Avoid full-dataset in-memory graph objects.
 
-## Schema & Validation
-- Pydantic (lightweight usage)
+## Data handling
+- Read and process only the columns needed for the current step.
+- Prefer groupby / merge / filter operations over custom loops.
+- Export intermediate results with parquet or csv when needed.
 
-## GPU Usage (T4)
-- GPU is NOT used for graph processing
-- GPU may be used for:
-  - model training (if supported)
-  - large matrix operations
-- Do NOT assume GPU accelerates NetworkX or pandas
-
-## Key Constraints
-- RAM is limited → avoid large in-memory structures
-- Prefer:
-  - chunked processing
-  - window-based computation
-  - vectorized operations
-  - joins/groupby instead of graph traversal
+## Validation
+- Validate transaction schema before graph building.
+- Ensure time, direction, and amount fields are present and consistent.
