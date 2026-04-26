@@ -29,8 +29,7 @@ from collections import defaultdict
 from typing import Dict, List
 
 import pandas as pd
-
-
+import os
 # ---------------------------------------------------------------------------
 # Type alias for an event record stored in the index
 # ---------------------------------------------------------------------------
@@ -83,6 +82,17 @@ def build_event_indexes(
     """
     # cuDF → pandas: motif index works on plain Python dicts after this point;
     # converting once here avoids per-row GPU tensor overhead in itertuples.
+
+    # --- FIX WARNING 4: Defensive Guard ---
+    # Sử dụng biến môi trường để chỉ kích hoạt trong môi trường Dev/Test
+    if os.getenv("MOTIF_DEBUG") == "1":
+        # Kiểm tra cột 'step' có tăng dần (đã sắp xếp) hay không
+        if not event_df["step"].is_monotonic_increasing:
+            raise ValueError(
+                "CRITICAL DATA ERROR: event_df phải được sắp xếp theo 'step' trước khi tạo index. "
+                "Nếu không, kết quả từ binary search (bisect) sẽ bị sai lệch hoàn toàn."
+            )
+    
     if hasattr(event_df, "to_pandas"):
         event_df = event_df.to_pandas()
 
@@ -114,19 +124,24 @@ def build_event_indexes(
     out_index  = dict(out_index)
     in_index   = dict(in_index)
     step_index = dict(step_index)
-
+    # At the end of build_event_indexes, after populating out_index:
+    out_steps = {node: [e["step"] for e in edges]
+             for node, edges in out_index.items()}
     gc.collect()
-    return out_index, in_index, step_index
+    return out_index, in_index, step_index, out_steps
+   
 
 
 # ---------------------------------------------------------------------------
 # Forward-only lookup helper
 # ---------------------------------------------------------------------------
 
+
 def edges_after_step(
     out_index: dict,
     node: int,
     step: int,
+    out_steps: dict,
 ) -> List[EventDict]:
     """
     Return all outgoing edges from `node` with step > `step`.
@@ -150,12 +165,15 @@ def edges_after_step(
     bucket = out_index.get(node)
     if not bucket:
         return []
-
-    # Extract step values for binary search (bucket is sorted by step)
-    steps = [e["step"] for e in bucket]
-    idx = bisect_right(steps, step)   # first position where step > cutoff
+    idx = bisect_right(out_steps[node], step)
     return bucket[idx:]
 
+# def edges_after_step(out_index, out_steps, node, step):
+#     bucket = out_index.get(node)
+#     if not bucket:
+#         return []
+#     idx = bisect_right(out_steps[node], step)
+#     return bucket[idx:]
 
 # ---------------------------------------------------------------------------
 # Window slice helper

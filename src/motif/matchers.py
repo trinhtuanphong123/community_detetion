@@ -114,7 +114,8 @@ def find_fanin(
             a0     = seed["amount"]
             seen   = {seed["src"]}
             group  = [seed]
-
+            
+            a_prev = a0
             for j in range(i + 1, n):
                 e = incoming[j]
 
@@ -127,11 +128,12 @@ def find_fanin(
                     continue
 
                 # Prune: amount ratio
-                if not _ratio_ok(a0, e["amount"], cfg.rho_min, cfg.rho_max):
+                if not _ratio_ok(a_prev, e["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
                 seen.add(e["src"])
                 group.append(e)
+                a_prev = e["amount"]
 
             if len(group) >= cfg.r_min_fanin:
                 nodes = [e["src"] for e in group] + [x]
@@ -215,7 +217,7 @@ def find_cycle3(
     Returns list of instance dicts.
     """
     results = []
-
+    seen = set()  
     for u, edges_u in out_index.items():
         for e1 in edges_u:
             v  = e1["dst"]
@@ -249,6 +251,12 @@ def find_cycle3(
 
                     if not _ratio_ok(a2, e3["amount"], cfg.rho_min, cfg.rho_max):
                         continue
+                    key = frozenset([e1["event_id"],
+                                     e2["event_id"],
+                                     e3["event_id"]])
+                    if key in seen:          # ← skip already-emitted triple
+                        continue
+                    seen.add(key)
 
                     results.append(_make_instance(
                         "cycle3",
@@ -280,7 +288,7 @@ def find_relay4(
     Returns list of instance dicts.
     """
     results = []
-
+    seen = set()
     for u, edges_u in out_index.items():
         for e1 in edges_u:
             v  = e1["dst"]
@@ -315,6 +323,13 @@ def find_relay4(
 
                     if not _ratio_ok(a2, a3, cfg.rho_min, cfg.rho_max):
                         continue
+
+                    key = frozenset([e1["event_id"],
+                     e2["event_id"],
+                     e3["event_id"]])
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
                     results.append(_make_instance(
                         "relay4",
@@ -377,9 +392,8 @@ def find_split_merge(
                 # Prune: split amount ratio
                 if not _ratio_ok(a_uv1, e_uv2["amount"], cfg.rho_min, cfg.rho_max):
                     continue
-
-                # Phase 2: collect targets reachable from v1 in (t0, t0 + 2*delta]
-                v1_targets: dict = {}  # z → edge dict
+                # Phase 2: collect targets reachable from v1
+                v1_targets: dict = {}          # z → list[edge]
                 for e in edges_after_step(out_index, v1, t0):
                     if e["step"] - t0 > 2 * cfg.delta:
                         break
@@ -388,37 +402,64 @@ def find_split_merge(
                         continue
                     if not _ratio_ok(a_uv1, e["amount"], cfg.rho_min, cfg.rho_max):
                         continue
-                    v1_targets[z] = e
+                    v1_targets.setdefault(z, []).append(e)   # ← collect all edges to z
 
-                if not v1_targets:
-                    continue
-
-                # Find v2 → z where z ∈ v1_targets
+                # Phase 2 match
                 for e_v2z in edges_after_step(out_index, v2, t0):
                     if e_v2z["step"] - t0 > 2 * cfg.delta:
                         break
-
                     z = e_v2z["dst"]
-                    if z not in v1_targets:
+                    if z not in v1_targets or z in (u, v1, v2):
                         continue
-                    if z in (u, v1, v2):
-                        continue
+                    for e_v1z in v1_targets[z]:             # ← iterate all, not just one
+                        if not _ratio_ok(e_uv2["amount"], e_v2z["amount"],
+                            cfg.rho_min, cfg.rho_max):
+                            continue
+                        all_edges = sorted([e_uv1, e_uv2, e_v1z, e_v2z],
+                                        key=lambda e: e["step"])
+                        results.append(_make_instance("split_merge", all_edges, [u, v1, v2, z]))
 
-                    e_v1z = v1_targets[z]
+                # # Phase 2: collect targets reachable from v1 in (t0, t0 + 2*delta]
+                # v1_targets: dict = {}  # z → edge dict
+                # for e in edges_after_step(out_index, v1, t0):
+                #     if e["step"] - t0 > 2 * cfg.delta:
+                #         break
+                #     z = e["dst"]
+                #     if z in (u, v1, v2):
+                #         continue
+                #     if not _ratio_ok(a_uv1, e["amount"], cfg.rho_min, cfg.rho_max):
+                #         continue
+                #     v1_targets[z] = e
 
-                    if not _ratio_ok(e_uv2["amount"], e_v2z["amount"], cfg.rho_min, cfg.rho_max):
-                        continue
+                # if not v1_targets:
+                #     continue
 
-                    # Sort all four edges chronologically for the instance
-                    all_edges = sorted(
-                        [e_uv1, e_uv2, e_v1z, e_v2z],
-                        key=lambda e: e["step"],
-                    )
-                    results.append(_make_instance(
-                        "split_merge",
-                        all_edges,
-                        [u, v1, v2, z],
-                    ))
+                # # Find v2 → z where z ∈ v1_targets
+                # for e_v2z in edges_after_step(out_index, v2, t0):
+                #     if e_v2z["step"] - t0 > 2 * cfg.delta:
+                #         break
+
+                #     z = e_v2z["dst"]
+                #     if z not in v1_targets:
+                #         continue
+                #     if z in (u, v1, v2):
+                #         continue
+
+                #     e_v1z = v1_targets[z]
+
+                #     if not _ratio_ok(e_uv2["amount"], e_v2z["amount"], cfg.rho_min, cfg.rho_max):
+                #         continue
+
+                #     # Sort all four edges chronologically for the instance
+                #     all_edges = sorted(
+                #         [e_uv1, e_uv2, e_v1z, e_v2z],
+                #         key=lambda e: e["step"],
+                #     )
+                #     results.append(_make_instance(
+                #         "split_merge",
+                #         all_edges,
+                #         [u, v1, v2, z],
+                #     ))
 
     return results
 

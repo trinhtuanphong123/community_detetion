@@ -88,15 +88,23 @@ def filter_motifs(
     -------
     Filtered list of motif instance dicts.
     """
-    # Per-type minimum support map
+    # # Per-type minimum support map
+    # r_min_map = {
+    #     "fanin":       cfg.r_min_fanin,
+    #     "fanout":      cfg.r_min_fanout,
+    #     "cycle3":      cfg.r_min_cycle,
+    #     "relay4":      cfg.r_min_relay,
+    #     "split_merge": cfg.r_min_split_merge,
+    # }
+    # Types where the matcher already enforces per-instance structure
+    _MATCHER_ENFORCED = {"fanin", "fanout"}
     r_min_map = {
-        "fanin":       cfg.r_min_fanin,
-        "fanout":      cfg.r_min_fanout,
-        "cycle3":      cfg.r_min_cycle,
-        "relay4":      cfg.r_min_relay,
-        "split_merge": cfg.r_min_split_merge,
+    "fanin":       1,                    # ← already enforced; just require ≥1
+    "fanout":      1,
+    "cycle3":      cfg.r_min_cycle,
+    "relay4":      cfg.r_min_relay,
+    "split_merge": cfg.r_min_split_merge,
     }
-
     # Count observed support per type
     support = count_support(instances)
 
@@ -137,12 +145,18 @@ def _shuffle_timestamps(event_df: pd.DataFrame, rng: np.random.Generator) -> pd.
     -------
     DataFrame with shuffled `step`, sorted by [step, event_id].
     """
-    shuffled_steps = rng.permutation(event_df["step"].to_numpy())
-    df_null = event_df.copy()
-    df_null["step"] = shuffled_steps
-    df_null = df_null.sort_values(["step", "event_id"]).reset_index(drop=True)
-    return df_null
+    # shuffled_steps = rng.permutation(event_df["step"].to_numpy())
+    # df_null = event_df.copy()
+    # df_null["step"] = shuffled_steps
+    # df_null = df_null.sort_values(["step", "event_id"]).reset_index(drop=True)
+    # return df_null
 
+    df_null = event_df.copy()
+    # Shuffle step values separately within each source node's edges
+    for src, idx in event_df.groupby("src_node").groups.items():
+        shuffled = rng.permutation(event_df.loc[idx, "step"].to_numpy())
+        df_null.loc[idx, "step"] = shuffled
+    return df_null.sort_values(["step", "event_id"]).reset_index(drop=True)
 
 def _run_matchers_on_df(event_df: pd.DataFrame, cfg: MotifConfig) -> Dict[str, int]:
     """Build indexes from event_df, run all matchers, return support counts."""
