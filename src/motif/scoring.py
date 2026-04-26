@@ -128,40 +128,46 @@ def filter_motifs(
 
 def _shuffle_timestamps(event_df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
     """
-    Return a null-model DataFrame with the `step` column randomly permuted.
+    Create a null-model DataFrame by shuffling timestamps locally per source node.
 
-    Uses numpy in-place shuffle (no full DataFrame copy).
-    Only `step` changes; src_node, dst_node, amount are untouched so
-    degree and amount distributions are preserved.
+    This preserves:
+    1. In-degree, out-degree, and amount distributions for every node.
+    2. The 'burstiness' and temporal activity level of individual entities.
+    
+    By shuffling steps only within each node's own edge list, we break the 
+    sequential patterns (motifs) while maintaining a realistic baseline for 
+    high-activity nodes, leading to more accurate Z-scores.
 
     Parameters
     ----------
     event_df : pd.DataFrame
-        Window of transactions.  Must have a `step` column.
+        The original transaction window.
     rng : np.random.Generator
-        Seeded RNG for reproducibility.
+        Seeded generator for reproducibility.
 
     Returns
     -------
-    DataFrame with shuffled `step`, sorted by [step, event_id].
+    pd.DataFrame: Shuffled data sorted by [step, event_id] to maintain indexer compatibility.
     """
-    # shuffled_steps = rng.permutation(event_df["step"].to_numpy())
-    # df_null = event_df.copy()
-    # df_null["step"] = shuffled_steps
-    # df_null = df_null.sort_values(["step", "event_id"]).reset_index(drop=True)
-    # return df_null
-
+    
     df_null = event_df.copy()
-    # Shuffle step values separately within each source node's edges
+
+    # Apply per-node shuffle to preserve temporal activity distribution
     for src, idx in event_df.groupby("src_node").groups.items():
-        shuffled = rng.permutation(event_df.loc[idx, "step"].to_numpy())
-        df_null.loc[idx, "step"] = shuffled
+        shuffled_steps = rng.permutation(event_df.loc[idx, "step"].to_numpy())
+        df_null.loc[idx, "step"] = shuffled_steps
+
+    # Re-sort is mandatory; matchers and binary search rely on global step order
     return df_null.sort_values(["step", "event_id"]).reset_index(drop=True)
+    
+
 
 def _run_matchers_on_df(event_df: pd.DataFrame, cfg: MotifConfig) -> Dict[str, int]:
     """Build indexes from event_df, run all matchers, return support counts."""
-    out_idx, in_idx, _ = build_event_indexes(event_df)
-    instances = run_all_matchers(out_idx, in_idx, cfg)
+    out_idx, in_idx, _, out_steps = build_event_indexes(event_df)
+    instances = run_all_matchers(out_idx, in_idx, cfg, out_steps)
+    # out_idx, in_idx, _ = build_event_indexes(event_df)
+    # instances = run_all_matchers(out_idx, in_idx, cfg)
     counts = count_support(instances)
     del out_idx, in_idx, instances
     return counts

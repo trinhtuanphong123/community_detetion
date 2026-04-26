@@ -1,332 +1,396 @@
-# src/community/scoring.py
-# Bước 4.5: Feature extraction và soft suspicion scoring.
-#
-# extract_community_features: tính các đặc trưng cho mỗi community
-#   trong một snapshot (directed features + size-normalized).
-#
-# score_communities: tính suspicion_score tổng hợp bằng weighted sum:
-#   S = W_C2·f(C2) + W_C3·f(C3) + W_VELOCITY·velocity
-#     + W_ALERT·alert_ratio + W_STRUCTURE·structural_bonus
-#   Sau đó: size-penalty để tránh ưu thế community lớn.
+"""
+scoring.py — AML-aware community suspicion scoring.
+
+Two public functions:
+
+    extract_community_features(window_df, snap_edges, global_labels, wg, node_roles)
+        Compute AML-relevant features for each community in one window.
+        Called once per window by pipeline.py — never accumulates all windows.
+
+    score_communities(feature_df, cfg, persistence_map)
+        Apply the weighted suspicion formula to the feature table.
+        Returns the same DataFrame with added score columns.
+
+Score formula (community_scoring.md §2):
+    S(C) = w_internal_flow  * InternalFlow(C)
+         + w_reciprocity    * Reciprocity(C)
+         + w_persistence    * Persistence(C)
+         + w_motif          * MotifEnrichment(C)
+         - w_external_noise * ExternalNoise(C)
+
+Feature definitions:
+    internal_flow    : total_internal_weight / total_weight (in window)
+    reciprocity      : bidirectional_volume / total_internal_volume
+    persistence      : n_windows_seen / max_possible_windows (0–1, from tracker)
+    motif_enrichment : motif_count_inside / community_size (0 if no motif table)
+    external_noise   : total_external_weight / total_weight (1 - internal_flow)
+
+Guarantees:
+    - Time      : per-window; no cross-window state inside this module.
+    - Direction : A[i,j] used directly for internal/external flow; no symmetrization.
+    - Memory    : all operations are vectorized pandas groupby; no cuDF/cupy.
+"""
+
+from __future__ import annotations
 
 import gc
+from typing import Dict, List, Optional
 
-from tqdm.auto import tqdm
+import numpy as np
+import pandas as pd
 
 from .config import CommunityConfig
+from .weighting import WindowGraph, compute_degrees
 
 
-def _cudf():
-    import cudf  # noqa: PLC0415
-    return cudf
+# ---------------------------------------------------------------------------
+# Per-window feature extraction
+# ---------------------------------------------------------------------------
 
-
-def _cp():
-    import cupy as cp  # noqa: PLC0415
-    return cp
-
-
-def extract_community_features(snapshots: list, cfg: CommunityConfig):
+def extract_community_features(
+    window_df: pd.DataFrame,
+    global_labels: Dict[int, int],
+    wg: WindowGraph,
+    node_roles: Optional[pd.DataFrame] = None,
+    motif_counts: Optional[Dict[int, float]] = None,
+    window_id: int = 0,
+    step_start: int = 0,
+    step_end: int = 0,
+    src_col: str = "src_node",
+    dst_col: str = "dst_node",
+    amount_col: str = "amount",
+    alert_col: str = "is_sar",
+) -> pd.DataFrame:
     """
-    Trích xuất features cho tất cả community trong tất cả snapshots.
+    Extract AML community features for one time window.
 
-    Mỗi snapshot là dict với keys:
-        window_id, steps, step_start, step_end,
-        edge_feat, node_feat, partition_df, n_edges, n_nodes
+    Parameters
+    ----------
+    window_df : pd.DataFrame
+        Raw transaction rows for this window. Provides amount and alert info.
+    global_labels : Dict[node_id, global_cid]
+        Output of match_communities_jaccard() for this window.
+    wg : WindowGraph
+        Directed weighted adjacency for this window (from build_window_graph).
+    node_roles : pd.DataFrame, optional
+        Output of compute_node_roles(). Must have columns: node, role,
+        flow_consistency, layering_score.
+    motif_counts : Dict[global_cid, float], optional
+        Motif instance count per community (from motif module integration).
+        If None, motif_enrichment is 0 for all communities.
+    window_id, step_start, step_end : int
+        Window metadata stored in the output.
+    src_col, dst_col, amount_col, alert_col : str
+        Column names in window_df.
 
-    Features trích xuất:
-        total_volume, n_internal_edges, alert_ratio,
-        flow_ratio, internal_recirc, sink_concentration,
-        source_concentration, max_single_flow, size,
+    Returns
+    -------
+    pd.DataFrame with one row per active community. Columns:
+        window_id, step_start, step_end, global_cid,
+        size, internal_flow, external_flow, external_noise,
+        reciprocity, internal_recirc,
+        sink_concentration, source_concentration,
         n_sources, n_sinks, n_layering, avg_layering_score,
-        vol_density, edge_density, max_flow_norm
-
-    Returns:
-        cudf.DataFrame — tất cả community records qua tất cả windows
+        total_volume, n_internal_edges,
+        alert_ratio, motif_enrichment, vol_density, edge_density,
+        [persistence is added later by score_communities]
     """
-    cudf = _cudf()
-    records = []
+    # Filter out noise nodes (-1 community)
+    active = {n: c for n, c in global_labels.items() if c != -1}
+    if not active:
+        return pd.DataFrame()
 
-    for snap in tqdm(snapshots, desc="Community feature extraction"):
-        edge_df  = snap["edge_feat"]
-        part_df  = snap["partition_df"]
-        node_df  = snap["node_feat"]
+    node_to_cid = pd.Series(active, name="global_cid")
+    node_to_cid.index.name = "node"
+    node_to_cid = node_to_cid.reset_index()
 
-        if len(part_df) == 0:
-            continue
+    # ── Map edges to communities ─────────────────────────────────────────────
+    has_alert = alert_col in window_df.columns
+    agg_dict = {
+        "weight": (amount_col, "sum"),
+        "n_tx": (amount_col, "count"),
+    }
+    if has_alert:
+        agg_dict["n_alert"] = (alert_col, "sum")
 
-        # Ánh xạ cạnh vào community
-        part_src = part_df[["node", "global_cid"]].rename(
-            columns={"node": "src", "global_cid": "src_cid"}
-        )
-        part_dst = part_df[["node", "global_cid"]].rename(
-            columns={"node": "dst", "global_cid": "dst_cid"}
-        )
+    edges = (
+        window_df.groupby([src_col, dst_col], as_index=False)
+        .agg(**agg_dict)
+        .rename(columns={src_col: "src", dst_col: "dst"})
+    )
 
-        edges_mapped = edge_df.merge(part_src, on="src", how="inner")
-        edges_mapped = edges_mapped.merge(part_dst, on="dst", how="inner")
+    edges = edges.merge(
+        node_to_cid.rename(columns={"node": "src", "global_cid": "src_cid"}),
+        on="src", how="inner",
+    )
+    edges = edges.merge(
+        node_to_cid.rename(columns={"node": "dst", "global_cid": "dst_cid"}),
+        on="dst", how="inner",
+    )
 
-        # Chỉ giữ cạnh nội bộ (src và dst cùng community)
-        internal = edges_mapped[
-            edges_mapped["src_cid"] == edges_mapped["dst_cid"]
-        ].rename(columns={"src_cid": "global_cid"}).drop(columns=["dst_cid"])
+    total_weight = float(edges["weight"].sum()) if len(edges) > 0 else 1.0
 
-        if len(internal) == 0:
-            continue
+    internal = edges[edges["src_cid"] == edges["dst_cid"]].copy()
+    internal = internal.rename(columns={"src_cid": "global_cid"}).drop(columns=["dst_cid"])
 
+    external = edges[edges["src_cid"] != edges["dst_cid"]].copy()
+
+    # ── Basic internal features ───────────────────────────────────────────────
+    if len(internal) == 0:
+        return pd.DataFrame()
+
+    if has_alert:
         internal["is_alert_edge"] = (internal["n_alert"] > 0).astype("float32")
-
-        # ── Basic features ────────────────────────────────────────────────
         comm_basic = internal.groupby("global_cid", as_index=False).agg(
-            total_volume      =("total_amount", "sum"),
-            n_internal_edges  =("total_amount", "count"),
+            total_volume      =("weight",        "sum"),
+            n_internal_edges  =("weight",        "count"),
             alert_ratio       =("is_alert_edge", "mean"),
         )
-
-        # ── Flow ratio (in / out) ─────────────────────────────────────────
-        node_with_cid = part_df[["node", "global_cid"]].merge(
-            node_df[[
-                "node", "total_volume_out", "total_volume_in",
-                "role", "flow_consistency", "layering_score",
-            ]],
-            on="node", how="left"
-        ).fillna(0)
-
-        comm_flow = node_with_cid.groupby("global_cid", as_index=False).agg(
-            comm_total_out=("total_volume_out", "sum"),
-            comm_total_in =("total_volume_in",  "sum"),
+    else:
+        comm_basic = internal.groupby("global_cid", as_index=False).agg(
+            total_volume      =("weight",   "sum"),
+            n_internal_edges  =("weight",   "count"),
         )
-        comm_flow["flow_ratio"] = (
-            comm_flow["comm_total_in"] / (comm_flow["comm_total_out"] + 1e-9)
-        ).astype("float32")
+        comm_basic["alert_ratio"] = 0.0
 
-        comm_basic = comm_basic.merge(
-            comm_flow[["global_cid", "flow_ratio", "comm_total_out", "comm_total_in"]],
-            on="global_cid", how="left"
+    # ── External flow ─────────────────────────────────────────────────────────
+    ext_agg = external.groupby("src_cid", as_index=False).agg(
+        ext_volume=("weight", "sum"),
+    ).rename(columns={"src_cid": "global_cid"})
+    comm_basic = comm_basic.merge(ext_agg, on="global_cid", how="left")
+    comm_basic["ext_volume"] = comm_basic["ext_volume"].fillna(0.0)
+    comm_basic["internal_flow"]   = (comm_basic["total_volume"] / (total_weight + 1e-9)).astype("float32")
+    comm_basic["external_flow"]   = (comm_basic["ext_volume"]   / (total_weight + 1e-9)).astype("float32")
+    comm_basic["external_noise"]  = comm_basic["external_flow"]
+
+    # ── Reciprocity (bidirectional volume ratio) ───────────────────────────────
+    reverse = internal[["src", "dst", "global_cid", "weight"]].rename(
+        columns={"src": "dst_r", "dst": "src_r", "weight": "rev_w"}
+    )
+    recirc = internal[["src", "dst", "global_cid", "weight"]].merge(
+        reverse,
+        left_on=["src", "dst", "global_cid"],
+        right_on=["src_r", "dst_r", "global_cid"],
+        how="inner",
+    )
+    if len(recirc) > 0:
+        recirc_agg = recirc.groupby("global_cid", as_index=False).agg(
+            recirc_volume=("weight", "sum")
         )
+    else:
+        recirc_agg = pd.DataFrame({"global_cid": pd.Series(dtype="int64"),
+                                   "recirc_volume": pd.Series(dtype="float32")})
 
-        # ── Internal recirculation ────────────────────────────────────────
-        # Tỷ lệ volume có cả chiều A→B và B→A trong community
-        reverse = internal[["src", "dst", "global_cid", "total_amount"]].rename(
-            columns={"src": "dst_r", "dst": "src_r", "total_amount": "rev_amt"}
+    comm_basic = comm_basic.merge(recirc_agg, on="global_cid", how="left")
+    comm_basic["recirc_volume"] = comm_basic["recirc_volume"].fillna(0.0)
+    comm_basic["reciprocity"] = (
+        comm_basic["recirc_volume"] / (comm_basic["total_volume"] + 1e-9)
+    ).astype("float32")
+    comm_basic["internal_recirc"] = comm_basic["reciprocity"]
+    comm_basic = comm_basic.drop(columns=["recirc_volume", "ext_volume"])
+
+    # ── Sink / source concentration ───────────────────────────────────────────
+    node_in = internal.groupby(["global_cid", "dst"], as_index=False).agg(in_vol=("weight", "sum"))
+    max_in  = node_in.groupby("global_cid", as_index=False).agg(max_in=("in_vol", "max"))
+    sum_in  = node_in.groupby("global_cid", as_index=False).agg(sum_in=("in_vol", "sum"))
+    sink_c  = max_in.merge(sum_in, on="global_cid")
+    sink_c["sink_concentration"] = (sink_c["max_in"] / (sink_c["sum_in"] + 1e-9)).astype("float32")
+    comm_basic = comm_basic.merge(sink_c[["global_cid", "sink_concentration"]], on="global_cid", how="left")
+
+    node_out  = internal.groupby(["global_cid", "src"], as_index=False).agg(out_vol=("weight", "sum"))
+    max_out   = node_out.groupby("global_cid", as_index=False).agg(max_out=("out_vol", "max"))
+    sum_out   = node_out.groupby("global_cid", as_index=False).agg(sum_out=("out_vol", "sum"))
+    source_c  = max_out.merge(sum_out, on="global_cid")
+    source_c["source_concentration"] = (source_c["max_out"] / (source_c["sum_out"] + 1e-9)).astype("float32")
+    comm_basic = comm_basic.merge(source_c[["global_cid", "source_concentration"]], on="global_cid", how="left")
+
+    # ── Community size ────────────────────────────────────────────────────────
+    sizes = node_to_cid.groupby("global_cid", as_index=False).agg(size=("node", "count"))
+    comm_basic = comm_basic.merge(sizes, on="global_cid", how="left")
+
+    # ── Node roles ────────────────────────────────────────────────────────────
+    if node_roles is not None and len(node_roles) > 0:
+        nr = node_roles[["node", "role", "flow_consistency", "layering_score"]].merge(
+            node_to_cid, on="node", how="inner"
         )
-        recirc = internal[["src", "dst", "global_cid", "total_amount"]].merge(
-            reverse,
-            left_on  =["src", "dst", "global_cid"],
-            right_on =["src_r", "dst_r", "global_cid"],
-            how="inner",
-        )
-        if len(recirc) > 0:
-            recirc_vol = recirc.groupby("global_cid", as_index=False).agg(
-                recirc_volume=("total_amount", "sum")
-            )
-        else:
-            recirc_vol = cudf.DataFrame({
-                "global_cid":   cudf.Series(dtype="int32"),
-                "recirc_volume": cudf.Series(dtype="float32"),
-            })
-
-        comm_basic = comm_basic.merge(recirc_vol, on="global_cid", how="left")
-        comm_basic["recirc_volume"] = comm_basic["recirc_volume"].fillna(0)
-        comm_basic["internal_recirc"] = (
-            comm_basic["recirc_volume"] / (comm_basic["total_volume"] + 1e-9)
-        ).astype("float32")
-        comm_basic = comm_basic.drop(columns=["recirc_volume"])
-
-        # ── Sink concentration ────────────────────────────────────────────
-        node_in_vol = internal.groupby(["global_cid", "dst"], as_index=False).agg(
-            in_vol=("total_amount", "sum")
-        )
-        max_in    = node_in_vol.groupby("global_cid", as_index=False).agg(max_sink_in=("in_vol", "max"))
-        total_in  = node_in_vol.groupby("global_cid", as_index=False).agg(total_in_vol=("in_vol", "sum"))
-        sink_conc = max_in.merge(total_in, on="global_cid")
-        sink_conc["sink_concentration"] = (
-            sink_conc["max_sink_in"] / (sink_conc["total_in_vol"] + 1e-9)
-        ).astype("float32")
-        comm_basic = comm_basic.merge(
-            sink_conc[["global_cid", "sink_concentration"]], on="global_cid", how="left"
-        )
-
-        # ── Source concentration ──────────────────────────────────────────
-        node_out_vol = internal.groupby(["global_cid", "src"], as_index=False).agg(
-            out_vol=("total_amount", "sum")
-        )
-        max_out      = node_out_vol.groupby("global_cid", as_index=False).agg(max_source_out=("out_vol", "max"))
-        total_out    = node_out_vol.groupby("global_cid", as_index=False).agg(total_out_vol=("out_vol", "sum"))
-        source_conc  = max_out.merge(total_out, on="global_cid")
-        source_conc["source_concentration"] = (
-            source_conc["max_source_out"] / (source_conc["total_out_vol"] + 1e-9)
-        ).astype("float32")
-        comm_basic = comm_basic.merge(
-            source_conc[["global_cid", "source_concentration"]], on="global_cid", how="left"
-        )
-
-        # ── Max single flow ───────────────────────────────────────────────
-        max_flow = internal.groupby("global_cid", as_index=False).agg(
-            max_single_flow=("total_amount", "max")
-        )
-        comm_basic = comm_basic.merge(max_flow, on="global_cid", how="left")
-
-        # ── Size + filter ─────────────────────────────────────────────────
-        sizes = part_df.groupby("global_cid", as_index=False).agg(size=("node", "count"))
-        comm_basic = comm_basic.merge(sizes, on="global_cid")
-        comm_basic = comm_basic[comm_basic["size"] >= cfg.MIN_COMM_SIZE]
-
-        # ── Role counts ───────────────────────────────────────────────────
-        node_with_cid["is_source"]   = (node_with_cid["role"] == 1).astype("int32")
-        node_with_cid["is_sink"]     = (node_with_cid["role"] == 2).astype("int32")
-        node_with_cid["is_layering"] = (node_with_cid["role"] == 3).astype("int32")
-
-        role_counts = node_with_cid.groupby("global_cid", as_index=False).agg(
+        nr["is_source"]   = (nr["role"] == 1).astype("int32")
+        nr["is_sink"]     = (nr["role"] == 2).astype("int32")
+        nr["is_layering"] = (nr["role"] == 3).astype("int32")
+        role_agg = nr.groupby("global_cid", as_index=False).agg(
             n_sources          =("is_source",       "sum"),
             n_sinks            =("is_sink",          "sum"),
             n_layering         =("is_layering",      "sum"),
             avg_layering_score =("layering_score",   "mean"),
         )
-        comm_basic = comm_basic.merge(role_counts, on="global_cid", how="left")
+        comm_basic = comm_basic.merge(role_agg, on="global_cid", how="left")
+    else:
+        for col in ["n_sources", "n_sinks", "n_layering", "avg_layering_score"]:
+            comm_basic[col] = 0
 
-        # ── Size-normalized features ──────────────────────────────────────
-        comm_basic["vol_density"]   = (comm_basic["total_volume"]   / (comm_basic["size"] + 1e-9)).astype("float32")
-        comm_basic["edge_density"]  = (
-            comm_basic["n_internal_edges"].astype("float32")
-            / (comm_basic["size"] * (comm_basic["size"] - 1) + 1e-9)
+    # ── Motif enrichment ──────────────────────────────────────────────────────
+    if motif_counts:
+        comm_basic["motif_enrichment"] = comm_basic["global_cid"].map(
+            lambda gcid: motif_counts.get(gcid, 0.0) / max(comm_basic.loc[comm_basic["global_cid"] == gcid, "size"].values[0], 1)
         ).astype("float32")
-        comm_basic["max_flow_norm"] = (comm_basic["max_single_flow"] / (comm_basic["size"] + 1e-9)).astype("float32")
+    else:
+        comm_basic["motif_enrichment"] = 0.0
 
-        # Metadata
-        comm_basic["window_id"]  = snap["window_id"]
-        comm_basic["step_start"] = snap["step_start"]
-        comm_basic["step_end"]   = snap["step_end"]
-
-        # Fill NaN
-        fill_cols = [
-            "flow_ratio", "internal_recirc", "sink_concentration",
-            "source_concentration", "max_single_flow", "n_sources", "n_sinks",
-            "n_layering", "avg_layering_score", "vol_density",
-            "edge_density", "max_flow_norm", "comm_total_out", "comm_total_in",
-        ]
-        for col in fill_cols:
-            if col in comm_basic.columns:
-                comm_basic[col] = comm_basic[col].fillna(0)
-
-        records.append(comm_basic)
-        gc.collect()
-
-    if records:
-        return _cudf().concat(records, ignore_index=True)
-    return _cudf().DataFrame()
-
-
-def score_communities(comm_df, cfg: CommunityConfig, n_alert: int, n_rows: int):
-    """
-    Bước 4.5 — Soft suspicion scoring.
-
-    S = W_C2·c2_score + W_C3·c3_score + W_VELOCITY·velocity_score
-      + W_ALERT·alert_ratio + W_STRUCTURE·structural_score
-    Sau đó: size-penalty = γ·log(|C|)
-
-    Args:
-        comm_df:  cuDF DataFrame từ extract_community_features()
-        cfg:      CommunityConfig
-        n_alert:  số alert rows trong dataset gốc (để tính AER)
-        n_rows:   tổng số rows trong dataset gốc
-
-    Returns:
-        comm_df với thêm các cột:
-            velocity, velocity_score, c2_score, c3_score,
-            structural_score, suspicion_score, is_suspicious,
-            c1_flag, c2_flag, c3_flag
-    """
-    cudf = _cudf()
-    cp   = _cp()
-
-    if len(comm_df) == 0:
-        print("  ⚠️  Không có community để score.")
-        return comm_df
-
-    print("=" * 60)
-    print("  BƯỚC 4.5: Soft Suspicion Scoring")
-    print(f"  Weights: C2={cfg.W_C2}, C3={cfg.W_C3}, Vel={cfg.W_VELOCITY}, "
-          f"Alert={cfg.W_ALERT}, Struct={cfg.W_STRUCTURE}")
-    print(f"  Threshold: {cfg.GLOBAL_SUSP_THRESHOLD}")
-    print("=" * 60)
-
-    # ── Velocity (temporal burstiness) ────────────────────────────────────
-    duration = (comm_df["step_end"] - comm_df["step_start"] + 1).astype("float32")
-    comm_df["velocity"] = comm_df["total_volume"] / (duration + 1e-9)
-    mean_vel = float(comm_df["velocity"].mean())
-    comm_df["velocity_score"] = (
-        comm_df["velocity"] / (mean_vel + 1e-9)
-    ).clip(upper=1.0).astype("float32")
-
-    # ── C2 score (sink concentration trong optimal range) ─────────────────
-    mid_c2 = (cfg.C2_ALLOC_MIN + cfg.C2_ALLOC_MAX) / 2
-    comm_df["c2_score"] = (
-        1 - (comm_df["sink_concentration"] - mid_c2).abs()
-    ).clip(lower=0.0).astype("float32")
-
-    # ── C3 score (max single flow normalized) ─────────────────────────────
-    comm_df["c3_score"] = (
-        comm_df["max_single_flow"] / (cfg.C3_MIN_FLOW + 1e-9)
-    ).clip(upper=1.0).astype("float32")
-
-    # ── Structural score (C1: has source + sink; layering bonus) ──────────
-    has_roles      = ((comm_df["n_sources"] >= 1) & (comm_df["n_sinks"] >= 1)).astype("float32")
-    layering_bonus = (comm_df["n_layering"] >= 1).astype("float32") * 0.5
-    comm_df["structural_score"] = (has_roles * 0.5 + layering_bonus).clip(upper=1.0).astype("float32")
-
-    # ── Suspicion score tổng hợp ──────────────────────────────────────────
-    comm_df["suspicion_score"] = (
-        cfg.W_C2        * comm_df["c2_score"]
-        + cfg.W_C3      * comm_df["c3_score"]
-        + cfg.W_VELOCITY * comm_df["velocity_score"]
-        + cfg.W_ALERT   * comm_df["alert_ratio"]
-        + cfg.W_STRUCTURE * comm_df["structural_score"]
+    # ── Size-normalised features ───────────────────────────────────────────────
+    comm_basic["vol_density"]  = (comm_basic["total_volume"] / (comm_basic["size"] + 1e-9)).astype("float32")
+    comm_basic["edge_density"] = (
+        comm_basic["n_internal_edges"].astype("float32")
+        / (comm_basic["size"] * (comm_basic["size"] - 1) + 1e-9)
     ).astype("float32")
 
-    # Size-penalty: giảm ưu thế community lớn
-    GAMMA = 0.05
-    size_penalty = GAMMA * cudf.Series(
-        cp.log(cp.asarray(comm_df["size"].astype("float32").values) + 1)
-    )
-    comm_df["suspicion_score"] = (
-        comm_df["suspicion_score"] - size_penalty
-    ).clip(lower=0.0)
+    # ── Metadata ──────────────────────────────────────────────────────────────
+    comm_basic["window_id"]  = window_id
+    comm_basic["step_start"] = step_start
+    comm_basic["step_end"]   = step_end
+    comm_basic["persistence"] = 0.0   # filled by score_communities from persistence_map
 
-    # Binary flag
-    comm_df["is_suspicious"] = (
-        comm_df["suspicion_score"] >= cfg.GLOBAL_SUSP_THRESHOLD
-    ).astype("int8")
+    # Fill remaining NaN
+    for col in comm_basic.select_dtypes(include=[np.number]).columns:
+        comm_basic[col] = comm_basic[col].fillna(0.0)
 
-    # Component flags cho explainability
-    comm_df["c1_flag"] = has_roles.astype("int8")
-    comm_df["c2_flag"] = (comm_df["c2_score"] >= 0.3).astype("int8")
-    comm_df["c3_flag"] = (comm_df["c3_score"] >= 0.5).astype("int8")
-
-    # ── Summary ───────────────────────────────────────────────────────────
-    total   = len(comm_df)
-    n_susp  = int(comm_df["is_suspicious"].sum())
-    global_alert_rate = n_alert / n_rows if n_rows > 0 else 0
-    susp_alert_rate   = float(comm_df[comm_df["is_suspicious"] == 1]["alert_ratio"].mean()) if n_susp > 0 else 0
-    AER = susp_alert_rate / (global_alert_rate + 1e-9)
-
-    print(f"\n  Tổng community: {total:,}")
-    print(f"  Suspicious (score ≥ {cfg.GLOBAL_SUSP_THRESHOLD}): {n_susp:,} ({n_susp / total * 100:.1f}%)")
-    print(f"  Mean score: {float(comm_df['suspicion_score'].mean()):.4f}")
-    print(f"  AER: {AER:.2f}×  (global={global_alert_rate * 100:.2f}%, susp={susp_alert_rate * 100:.2f}%)")
-
-    # Unknown unknowns
-    if n_susp > 0:
-        unknown = comm_df[
-            (comm_df["is_suspicious"] == 1)
-            & (comm_df["alert_ratio"] < cfg.ALERT_THRESH)
-        ]
-        if len(unknown) > 0:
-            print(f"  🔍 Unknown unknowns (suspicious nhưng alert_ratio < {cfg.ALERT_THRESH}): {len(unknown)}")
-
-    print(f"  ✅ Scoring hoàn tất.\n")
-    gc.collect()
-    return comm_df
+    # Filter by min community size
+    return comm_basic[comm_basic["size"] >= 1].reset_index(drop=True)
 
 
-__all__ = ["extract_community_features", "score_communities"]
+# ---------------------------------------------------------------------------
+# Suspicion scoring
+# ---------------------------------------------------------------------------
+
+def score_communities(
+    feature_df: pd.DataFrame,
+    cfg: CommunityConfig,
+    persistence_map: Optional[Dict[int, int]] = None,
+    max_windows: int = 1,
+    n_alert: int = 0,
+    n_rows: int = 1,
+) -> pd.DataFrame:
+    """
+    Compute suspicion scores for all communities in feature_df.
+
+    Formula (community_scoring.md §2):
+        S(C) = w_internal_flow  * internal_flow
+             + w_reciprocity    * reciprocity
+             + w_persistence    * persistence_norm
+             + w_motif          * motif_enrichment_norm
+             - w_external_noise * external_noise
+
+    Then apply a log size-penalty to avoid large communities dominating.
+
+    Parameters
+    ----------
+    feature_df : pd.DataFrame
+        Output of extract_community_features() — one or many windows concatenated.
+    cfg : CommunityConfig
+        Score weights and threshold.
+    persistence_map : Dict[global_cid, int], optional
+        {global_cid: n_windows_seen}. If None, persistence = 0 for all.
+    max_windows : int
+        Total number of windows processed — used to normalise persistence to [0, 1].
+    n_alert : int
+        Total SAR-labelled transactions in the dataset (for AER reporting).
+    n_rows : int
+        Total transactions in the dataset (for AER reporting).
+
+    Returns
+    -------
+    pd.DataFrame — same as input, with added columns:
+        persistence, persistence_norm, motif_enrichment_norm,
+        suspicion_score, is_suspicious,
+        flag_internal_flow, flag_reciprocity, flag_persistence, flag_motif
+    """
+    if len(feature_df) == 0:
+        return feature_df
+
+    df = feature_df.copy()
+
+    # ── Persistence normalisation ─────────────────────────────────────────────
+    if persistence_map:
+        df["persistence"] = df["global_cid"].map(
+            lambda gcid: persistence_map.get(gcid, 0)
+        ).astype("float32")
+    # persistence_norm ∈ [0, 1]
+    df["persistence_norm"] = (df["persistence"] / max(max_windows, 1)).clip(0.0, 1.0).astype("float32")
+
+    # ── Motif enrichment normalisation ────────────────────────────────────────
+    max_motif = float(df["motif_enrichment"].max()) if df["motif_enrichment"].max() > 0 else 1.0
+    df["motif_enrichment_norm"] = (df["motif_enrichment"] / max_motif).clip(0.0, 1.0).astype("float32")
+
+    # ── Weighted suspicion score ───────────────────────────────────────────────
+    df["suspicion_score"] = (
+        cfg.w_internal_flow  * df["internal_flow"].clip(0.0, 1.0)
+        + cfg.w_reciprocity  * df["reciprocity"].clip(0.0, 1.0)
+        + cfg.w_persistence  * df["persistence_norm"]
+        + cfg.w_motif        * df["motif_enrichment_norm"]
+        - cfg.w_external_noise * df["external_noise"].clip(0.0, 1.0)
+    ).astype("float32")
+
+    # Size-penalty: log penalty to avoid large communities dominating
+    gamma = 0.05
+    size_penalty = gamma * np.log1p(df["size"].astype("float64")).astype("float32")
+    df["suspicion_score"] = (df["suspicion_score"] - size_penalty).clip(lower=0.0).astype("float32")
+
+    # ── Binary flag ───────────────────────────────────────────────────────────
+    df["is_suspicious"] = (df["suspicion_score"] >= cfg.global_susp_threshold).astype("int8")
+
+    # ── Explainability flags ───────────────────────────────────────────────────
+    df["flag_internal_flow"] = (df["internal_flow"]  >= 0.5).astype("int8")
+    df["flag_reciprocity"]   = (df["reciprocity"]    >= 0.3).astype("int8")
+    df["flag_persistence"]   = (df["persistence_norm"] >= 0.3).astype("int8")
+    df["flag_motif"]         = (df["motif_enrichment"] >= 1.0).astype("int8")
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    total  = len(df)
+    n_susp = int(df["is_suspicious"].sum())
+    global_sar_rate = n_alert / max(n_rows, 1)
+    susp_sar_rate   = float(df[df["is_suspicious"] == 1]["alert_ratio"].mean()) if n_susp > 0 else 0.0
+    aer = susp_sar_rate / max(global_sar_rate, 1e-9)
+
+    print(f"  Communities: {total:,} | Suspicious: {n_susp:,} ({n_susp / max(total, 1) * 100:.1f}%)")
+    print(f"  Mean score: {float(df['suspicion_score'].mean()):.4f}")
+    if n_alert > 0:
+        print(f"  AER: {aer:.2f}×  (global={global_sar_rate * 100:.2f}%, susp={susp_sar_rate * 100:.2f}%)")
+
+    unknown_unknowns = df[
+        (df["is_suspicious"] == 1) & (df["alert_ratio"] < cfg.alert_thresh)
+    ]
+    if len(unknown_unknowns) > 0:
+        print(f"  Unknown-unknowns (suspicious, alert_ratio < {cfg.alert_thresh}): {len(unknown_unknowns)}")
+
+    return df.sort_values("suspicion_score", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Shortlist helper
+# ---------------------------------------------------------------------------
+
+def get_shortlist(
+    scored_df: pd.DataFrame,
+    cfg: CommunityConfig,
+) -> pd.DataFrame:
+    """
+    Return the top-K suspicious communities for investigation.
+
+    Parameters
+    ----------
+    scored_df : pd.DataFrame
+        Output of score_communities().
+    cfg : CommunityConfig
+        top_k_export and global_susp_threshold.
+
+    Returns
+    -------
+    pd.DataFrame — top-K rows from scored_df, filtered to is_suspicious == 1.
+    """
+    suspicious = scored_df[scored_df["is_suspicious"] == 1]
+    return suspicious.head(cfg.top_k_export).reset_index(drop=True)
+
+
+__all__ = [
+    "extract_community_features",
+    "score_communities",
+    "get_shortlist",
+]

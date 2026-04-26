@@ -166,7 +166,8 @@ def find_fanout(
         n = len(outgoing)
         if n < cfg.r_min_fanout:
             continue
-
+        
+        a_prev= a0
         for i in range(n):
             seed   = outgoing[i]
             t0     = seed["step"]
@@ -183,11 +184,12 @@ def find_fanout(
                 if e["dst"] in seen:
                     continue
 
-                if not _ratio_ok(a0, e["amount"], cfg.rho_min, cfg.rho_max):
+                if not _ratio_ok(a_prev, e["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
                 seen.add(e["dst"])
                 group.append(e)
+                a_prev = e["amount"]
 
             if len(group) >= cfg.r_min_fanout:
                 nodes = [x] + [e["dst"] for e in group]
@@ -472,6 +474,7 @@ def run_all_matchers(
     out_index: dict,
     in_index: dict,
     cfg: MotifConfig,
+    out_steps: dict[int, list[dict]]
 ) -> list[dict]:
     """
     Run all five matchers and return a combined instance list.
@@ -487,14 +490,20 @@ def run_all_matchers(
     -------
     Combined list of all matched motif instances across all types.
     """
+    # return (
+    #     find_fanin(in_index, cfg)
+    #     + find_fanout(out_index, cfg)
+    #     + find_cycle3(out_index, cfg)
+    #     + find_relay4(out_index, cfg)
+    #     + find_split_merge(out_index, in_index, cfg)
+    # )
     return (
         find_fanin(in_index, cfg)
-        + find_fanout(out_index, cfg)
-        + find_cycle3(out_index, cfg)
-        + find_relay4(out_index, cfg)
-        + find_split_merge(out_index, in_index, cfg)
+        + find_fanout(out_index, cfg, out_steps)
+        + find_cycle3(out_index, cfg, out_steps)
+        + find_relay4(out_index, cfg, out_steps)
+        + find_split_merge(out_index, in_index, cfg, out_steps)
     )
-
 
 __all__ = [
     "find_fanin",
