@@ -1,108 +1,266 @@
-# src/motif/index.py
-# Xây dựng index cần thiết cho motif matching.
-#
-# Motif matching cần lookup nhanh theo:
-#   - node gửi (out_index)   → tìm tx tiếp theo từ v
-#   - node nhận (in_index)   → tìm tx đến x
-#   - step                   → tìm tx trong một ngày
-#
-# Dùng pandas để build index (không iterrows, dùng groupby + itertuples).
-# Trả về dict thuần Python để matchers không phụ thuộc pandas trong vòng lặp.
+"""
+index.py — Event-level search indexes for motif matching.
+
+Builds lightweight Python dict indexes from a window of transactions.
+Matchers use these indexes instead of scanning the full DataFrame repeatedly.
+
+Indexes produced by build_event_indexes():
+    out_index  : {src_node -> [event_dict, ...]} sorted by step ascending
+    in_index   : {dst_node -> [event_dict, ...]} sorted by step ascending
+    step_index : {step     -> [event_dict, ...]}
+
+Helper:
+    edges_after_step(out_index, node, step) — forward-only edge lookup.
+    filter_window(event_df, step_start, step_end) — slice a time window.
+
+Guarantees:
+- Time      : all buckets are sorted by step; edges_after_step enforces
+              forward-only search (no backward traversal).
+- Direction : out_index keys on src; in_index keys on dst; never merged.
+- Memory    : plain Python dicts after indexing (no DataFrame held);
+              gc.collect() called after build.
+"""
+
+from __future__ import annotations
 
 import gc
+from bisect import bisect_right
 from collections import defaultdict
+from typing import Dict, List
 
 import pandas as pd
 
 
-def build_event_indexes(event_df: pd.DataFrame) -> tuple[dict, dict, dict]:
+# ---------------------------------------------------------------------------
+# Type alias for an event record stored in the index
+# ---------------------------------------------------------------------------
+
+# Each event is a plain dict for zero-overhead lookup in matcher loops.
+# Keys: event_id, step, src, dst, amount, is_sar
+EventDict = Dict[str, object]
+
+
+# ---------------------------------------------------------------------------
+# Main index builder
+# ---------------------------------------------------------------------------
+
+def build_event_indexes(
+    event_df: pd.DataFrame,
+    src_col: str = "src_node",
+    dst_col: str = "dst_node",
+    step_col: str = "step",
+    amount_col: str = "amount",
+    alert_col: str = "is_sar",
+) -> tuple[dict, dict, dict]:
     """
-    Xây dựng 3 index từ bảng giao dịch để motif matchers search nhanh.
+    Build three search indexes from a window of transactions.
 
-    Args:
-        event_df: pandas DataFrame với columns:
-            [event_id, step, src, dst, amount, is_laundering]
-            (src/dst là int32 từ encoder; hoặc nameOrig/nameDest nếu chưa encode)
+    Parameters
+    ----------
+    event_df : pd.DataFrame
+        A single time window of transactions.  Must be sorted by step
+        (loader.py and iter_windows guarantee this).
+        Supported column name variants:
+          - canonical: src_node, dst_node (from loader.py)
+          - legacy:    nameOrig, nameDest  (raw AMLGentex)
+          - short:     src, dst           (old pipeline)
+    src_col, dst_col, step_col, amount_col, alert_col : str
+        Column name overrides.
 
-    Returns:
-        out_index  (dict): {src_node: [event_dict, ...]} sorted by step
-        in_index   (dict): {dst_node: [event_dict, ...]} sorted by step
-        step_index (dict): {step: [event_dict, ...]}
+    Returns
+    -------
+    out_index  : {src_node: [EventDict, ...]}  sorted by step ascending
+    in_index   : {dst_node: [EventDict, ...]}  sorted by step ascending
+    step_index : {step:     [EventDict, ...]}
 
-    event_dict keys: event_id, step, src, dst, amount, is_laundering
+    Notes
+    -----
+    - event_id is auto-assigned as the row index if absent (motif_spec §3.1).
+    - itertuples() is used intentionally: the single-pass loop is O(n) and
+      avoids creating three separate groupby-materialised DataFrames.
+    - All three dicts are populated in one pass to minimise memory pressure.
+    - Buckets are already in step order because event_df is pre-sorted.
     """
-    # Chuẩn hóa tên cột: hỗ trợ cả tên encode (src/dst) và tên gốc
-    col_map = {}
-    cols = set(event_df.columns)
-    if "nameOrig" in cols and "src" not in cols:
-        col_map["nameOrig"] = "src"
-    if "nameDest" in cols and "dst" not in cols:
-        col_map["nameDest"] = "dst"
-    if col_map:
-        event_df = event_df.rename(columns=col_map)
+    # cuDF → pandas: motif index works on plain Python dicts after this point;
+    # converting once here avoids per-row GPU tensor overhead in itertuples.
+    if hasattr(event_df, "to_pandas"):
+        event_df = event_df.to_pandas()
 
-    required = {"event_id", "step", "src", "dst", "amount"}
-    missing = required - set(event_df.columns)
-    if missing:
-        raise ValueError(f"event_df thiếu columns: {sorted(missing)}")
+    df = _normalize_columns(event_df, src_col, dst_col, step_col, amount_col, alert_col)
+    df = _ensure_event_id(df)
+    _validate_required(df)
 
-    has_label = "is_laundering" in event_df.columns
-
-    # Sort một lần, dùng cho tất cả index
-    event_df = event_df.sort_values(["step", "event_id"]).reset_index(drop=True)
-
+    has_alert = "is_sar" in df.columns
     out_index:  dict = defaultdict(list)
     in_index:   dict = defaultdict(list)
     step_index: dict = defaultdict(list)
 
-    # itertuples nhanh hơn iterrows ~10x, không tạo object overhead
-    for row in event_df.itertuples(index=False):
-        e = {
-            "event_id":      int(row.event_id),
-            "step":          int(row.step),
-            "src":           int(row.src),
-            "dst":           int(row.dst),
-            "amount":        float(row.amount),
-            "is_laundering": int(row.is_laundering) if has_label else 0,
+    # Single O(n) pass — itertuples permitted per coding conventions when
+    # building an index that cannot be expressed as a vectorized operation.
+    for row in df.itertuples(index=False):
+        e: EventDict = {
+            "event_id": int(row.event_id),
+            "step":     int(row.step),
+            "src":      int(row.src_node),
+            "dst":      int(row.dst_node),
+            "amount":   float(row.amount),
+            "is_sar":   int(row.is_sar) if has_alert else 0,
         }
         out_index[e["src"]].append(e)
         in_index[e["dst"]].append(e)
         step_index[e["step"]].append(e)
 
-    # Đã sort khi build → không cần sort lại từng bucket
-    # Chuyển defaultdict → dict thường để tránh auto-create key khi lookup
+    # Freeze to regular dicts: prevents accidental key creation on miss
     out_index  = dict(out_index)
     in_index   = dict(in_index)
     step_index = dict(step_index)
-
-    n_nodes = len(out_index)
-    n_steps = len(step_index)
-    n_events = len(event_df)
-    print(f"  Event indexes built: {n_events:,} events, {n_nodes:,} unique src nodes, {n_steps} steps")
 
     gc.collect()
     return out_index, in_index, step_index
 
 
-def filter_events_by_window(
+# ---------------------------------------------------------------------------
+# Forward-only lookup helper
+# ---------------------------------------------------------------------------
+
+def edges_after_step(
+    out_index: dict,
+    node: int,
+    step: int,
+) -> List[EventDict]:
+    """
+    Return all outgoing edges from `node` with step > `step`.
+
+    Used by matchers to expand a relay chain forward in time only.
+    Binary search on the pre-sorted bucket avoids a linear scan.
+
+    Parameters
+    ----------
+    out_index : dict
+        Output of build_event_indexes().
+    node : int
+        Source node ID.
+    step : int
+        All returned edges have step strictly greater than this value.
+
+    Returns
+    -------
+    List of EventDict, empty if node has no outgoing edges after step.
+    """
+    bucket = out_index.get(node)
+    if not bucket:
+        return []
+
+    # Extract step values for binary search (bucket is sorted by step)
+    steps = [e["step"] for e in bucket]
+    idx = bisect_right(steps, step)   # first position where step > cutoff
+    return bucket[idx:]
+
+
+# ---------------------------------------------------------------------------
+# Window slice helper
+# ---------------------------------------------------------------------------
+
+def filter_window(
     event_df: pd.DataFrame,
     step_start: int,
     step_end: int,
 ) -> pd.DataFrame:
     """
-    Lọc event_df theo cửa sổ thời gian [step_start, step_end].
-    Dùng trước build_event_indexes khi chạy windowed search.
+    Slice event_df to [step_start, step_end] (inclusive).
 
-    Args:
-        event_df:   pandas DataFrame đầy đủ
-        step_start: step bắt đầu (inclusive)
-        step_end:   step kết thúc (inclusive)
+    Use before build_event_indexes() when working from a full loaded
+    DataFrame rather than through iter_windows().
 
-    Returns:
-        pandas DataFrame đã lọc, reset_index.
+    Parameters
+    ----------
+    event_df : pd.DataFrame
+        Must have a `step` column.
+    step_start, step_end : int
+        Inclusive step bounds.
+
+    Returns
+    -------
+    Filtered DataFrame with reset index.  Direction and step order preserved.
     """
     mask = (event_df["step"] >= step_start) & (event_df["step"] <= step_end)
     return event_df[mask].reset_index(drop=True)
 
 
-__all__ = ["build_event_indexes", "filter_events_by_window"]
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_columns(
+    df: pd.DataFrame,
+    src_col: str,
+    dst_col: str,
+    step_col: str,
+    amount_col: str,
+    alert_col: str,
+) -> pd.DataFrame:
+    """
+    Rename columns to canonical names (src_node, dst_node, step, amount, is_sar).
+    Supports three naming variants without copying the full DataFrame.
+    """
+    rename: dict = {}
+
+    # Caller-specified override names
+    if src_col != "src_node" and src_col in df.columns:
+        rename[src_col] = "src_node"
+    if dst_col != "dst_node" and dst_col in df.columns:
+        rename[dst_col] = "dst_node"
+    if step_col != "step" and step_col in df.columns:
+        rename[step_col] = "step"
+    if amount_col != "amount" and amount_col in df.columns:
+        rename[amount_col] = "amount"
+    if alert_col != "is_sar" and alert_col in df.columns:
+        rename[alert_col] = "is_sar"
+
+    # Legacy / raw AMLGentex column names
+    cols = set(df.columns)
+    if "src_node" not in cols and "nameOrig" in cols:
+        rename["nameOrig"] = "src_node"
+    if "dst_node" not in cols and "nameDest" in cols:
+        rename["nameDest"] = "dst_node"
+    # Short-form names (old pipeline)
+    if "src_node" not in cols and "src" in cols:
+        rename["src"] = "src_node"
+    if "dst_node" not in cols and "dst" in cols:
+        rename["dst"] = "dst_node"
+    # is_sar / Is Laundering / is_laundering aliases
+    if "is_sar" not in cols:
+        for alias in ("is_laundering", "Is Laundering", "isSAR"):
+            if alias in cols:
+                rename[alias] = "is_sar"
+                break
+
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
+def _ensure_event_id(df: pd.DataFrame) -> pd.DataFrame:
+    """Auto-assign event_id from row index if the column is absent."""
+    if "event_id" not in df.columns:
+        df = df.copy()
+        df["event_id"] = range(len(df))
+    return df
+
+
+def _validate_required(df: pd.DataFrame) -> None:
+    """Raise ValueError if mandatory columns are missing."""
+    required = {"event_id", "step", "src_node", "dst_node", "amount"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"event_df is missing required columns: {sorted(missing)}. "
+            f"Available columns: {sorted(df.columns)}"
+        )
+
+
+__all__ = [
+    "build_event_indexes",
+    "edges_after_step",
+    "filter_window",
+]

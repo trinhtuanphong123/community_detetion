@@ -1,51 +1,52 @@
-# motif_spec.md
+# Motif Specification
 
 ## 1. Purpose
 
-This document describes the implementation standards for **temporal motif mining** within the AML Graph Mining project.
+This document defines the implementation contract for temporal motif mining in the AML Graph Mining project.
 
-In this context, a motif is not a generic geometric pattern. A motif is only meaningful when it simultaneously satisfies:
-- Topology
-- Direction
-- Timing
-- Amount preservation
-- Repetition
+A motif is only meaningful when it satisfies all of the following at the same time:
+- directed topology
+- temporal order
+- latency bound
+- amount preservation
+- repetition threshold
 - AML context
 
-The objectives of motif mining are:
-- To detect concentrated suspicious transaction patterns.
-- To generate features for downstream ML models.
-- To support the differentiation between normal behavior and money laundering behavior.
+The goal of motif mining is to:
+- detect concentrated suspicious transaction patterns
+- generate ML-ready features
+- support later ranking and investigation
 
----
+Motifs are signals, not final labels.
 
 ## 2. Scope
 
-**Applicable to:**
-- Event graphs
-- Local temporal subgraphs
-- Bounded window searches
+### In scope
+- Event-level transaction tables
+- Bounded temporal windows
+- Local temporal subgraph search
+- Pattern counting and scoring
+- Feature extraction from matched motif instances
 
-**Not applicable to:**
-- Full graph brute force
-- Motifs without temporal constraints
-- Motifs based solely on topology while ignoring amount and repetition
+### Out of scope
+- Full-graph brute force search
+- Motifs without time constraints
+- Motifs that ignore direction or amount
+- Unbounded search across the entire history in one pass
 
----
+## 3. Input and output
 
-## 3. Input Schema
+### 3.1 Input
+The motif module should mainly use `event_df`.
 
-### 3.1 Mandatory Input
-- Raw transaction table `event_df`.
-- Each row represents a transaction event.
-- Minimum columns:
-  - `event_id`
-  - `step`
-  - `nameOrig`
-  - `nameDest`
-  - `amount`
+Mandatory columns:
+- `event_id`
+- `step`
+- `nameOrig`
+- `nameDest`
+- `amount`
 
-### 3.2 Recommended Additional Columns
+Recommended optional columns:
 - `type`
 - `bankOrig`
 - `bankDest`
@@ -54,209 +55,114 @@ The objectives of motif mining are:
 - `oldbalanceDest`
 - `newbalanceDest`
 
-### 3.3 Mandatory Chronological Order
 `event_df` must be sorted by:
 - `step`
 - `event_id`
 
----
+### 3.2 Output
+Motif mining should produce two layers of output.
 
-## 4. Motif Library
+#### Layer 1 — motif instances
+Each successful match should store:
+- motif type
+- transaction IDs
+- participating nodes
+- step sequence
+- amount sequence
+- lag sequence
+- ratio sequence
+- window ID
 
-Only templates with AML significance will be mined.
+#### Layer 2 — feature table
+Aggregate by entity, window, or community when needed.
+Typical features:
+- motif count by type
+- motif frequency normalized by degree or transaction volume
+- average latency
+- amount preservation statistics
+- z-score against a null model
+
+## 4. Motif library
+
+Only AML-relevant templates should be implemented.
 
 ### 4.1 Fan-in
-Multiple nodes transferring money into a single central node.
-**AML Significance:**
-- Consolidating funds from multiple unusual sources.
+Many to one.
+Useful for concentrated fund collection from multiple sources.
 
 ### 4.2 Fan-out
-A single node transferring money to multiple nodes.
-**AML Significance:**
-- Dispersing funds to obscure the audit trail.
+One to many.
+Useful for dispersing funds and hiding traces.
 
 ### 4.3 Cycle
 Example:
-$$u \to v \to w \to u$$
-**AML Significance:**
-- Circular flow of funds.
-- Creating fictitious revenue.
-- Closed-loop layering.
+`u -> v -> w -> u`
+Useful for circular flow and closed-loop laundering behavior.
 
 ### 4.4 Relay / Path
 Example:
-$$u \to v \to w \to x$$
-**AML Significance:**
-- Transferring through multiple layers.
+`u -> v -> w -> x`
+Useful for layering across multiple hops.
 
 ### 4.5 Split-merge
-A single source splits into multiple paths and later recombines.
-**AML Significance:**
-- Complex layering techniques.
+A source splits into multiple branches and later recombines.
+Useful for complex layering patterns.
 
----
+## 5. Required pipeline
 
-## 5. Exact Matching Rules
+The motif module should follow this order:
 
-A valid motif instance must simultaneously satisfy:
+1. Normalize event-level data.
+2. Build fast search indexes.
+3. Define motif templates.
+4. Match each template.
+5. Apply pruning.
+6. Count support and filter strong motifs.
+7. Build the feature table.
 
-### 5.1 Direction
-Edge directions must match the template exactly.
+## 6. Indexes required for search
 
-### 5.2 Time Order
-If the template has an order:
-$$e_1 \prec e_2 \prec \dots \prec e_k$$
-Then the actual data must satisfy:
-$$t_1 < t_2 < \dots < t_k$$
+The matcher should not scan the full table repeatedly.
+Create indexes such as:
+- `out_edges_by_node`
+- `in_edges_by_node`
+- `edges_by_step`
+- `edges_after_time`
 
-### 5.3 Latency Bound
-For consecutive edges:
-$$0 < t_{i+1} - t_i \le \Delta$$
+Indexes must support forward-only temporal search.
 
-### 5.4 Money Preservation
-The amount ratio must fall within a specific threshold:
-$$\rho_{\min} \le \frac{a_{i+1}}{a_i} \le \rho_{\max}$$
-Thresholds should be configurable, not hard-coded.
+## 7. Feature targets
 
-### 5.5 Minimum Repetition
-A motif is only considered suspicious if:
-$$\text{support}(M) \ge r_{\min}$$
+Minimum motif features:
+- count by motif type
+- normalized frequency
+- average lag
+- max lag
+- amount ratio mean
+- amount ratio variance
+- repetition count
+- z-score per motif type
 
----
+Feature aggregation targets:
+- entity
+- day or window
+- community if required
 
-## 6. Enumeration Strategy
+## 8. Validation rules
 
-### 6.1 Seed-based Search
-Do not use brute force on the entire graph.
-**Process:**
-1. Select a seed edge.
-2. Search only forward in time.
-3. Extend the branch only if it maintains:
-   - Direction
-   - Lag
-   - Amount ratio
-4. Stop immediately when a condition is violated.
+A motif result is valid only if it satisfies:
+- correct direction
+- correct time order
+- correct latency bound
+- correct amount ratio
+- sufficient repetition
+- meaningful support or z-score
 
-### 6.2 Pruning Rules
-Prune branches when:
-- Direction is incorrect.
-- Lag exceeds $\Delta$.
-- Amount ratio is outside thresholds.
-- Nodes are incorrectly repeated.
-- Motif exceeds defined size.
+## 9. Acceptance criteria
 
-### 6.3 Bounded Windows
-Searches should be performed within:
-- 7 days
-- 14 days
-- 30 days
-Do not search across the entire history in a single pass.
-
----
-
-## 7. Outputs
-
-### 7.1 Motif Instance Table
-Store for each instance:
-- `motif_type`
-- `node_sequence`
-- `edge_sequence`
-- `step_sequence`
-- `amount_sequence`
-- `lag_sequence`
-- `window_id`
-
-### 7.2 Aggregated Feature Table
-By node or window:
-- Motif count by type.
-- Frequency normalized by degree / volume.
-- Average lag.
-- Amount ratio statistics.
-- Z-score against null model.
-
----
-
-## 8. Scoring
-
-A motif is not sufficient just because it "exists." It must be scored.
-
-### 8.1 Raw Support
-Number of occurrences within the window.
-
-### 8.2 Normalized Frequency
-Normalized by:
-- Degree
-- Transaction volume
-- Node activity
-
-### 8.3 Null-model Z-score
-$$z(M)=\frac{C_{obs}(M)-\mu_{null}(M)}{\sigma_{null}(M)}$$
-
-### 8.4 Suspicion Criteria
-A high-quality motif must:
-- Be concentrated in suspicious cases.
-- Not just be generally common.
-- Increase the predictive power of the ML model.
-
----
-
-## 9. Feature Engineering
-
-Minimum motif features should include:
-- Count by motif type.
-- Frequency normalized by transaction volume.
-- Frequency normalized by degree.
-- Average latency.
-- Max latency.
-- Amount preservation mean.
-- Amount preservation variance.
-- Z-score per motif type.
-- Repetition count.
-
-Features should be calculated by:
-- Entity
-- Window
-- Community (if required)
-
----
-
-## 10. Implementation Rules
-
-- Prioritize index-based search.
-- Prioritize local windows.
-- Do not keep the entire instance list in RAM if it is too large.
-- If necessary, write intermediate results to disk.
-- Separate each template into its own function.
-
-**Recommended functions:**
-- `find_fanin`
-- `find_fanout`
-- `find_cycle_3`
-- `find_relay_4`
-- `find_split_merge`
-- `count_support`
-- `compute_null_zscore`
-- `build_motif_features`
-
----
-
-## 11. Validation Rules
-
-A motif result is valid when it has:
-- Correct direction.
-- Correct time order.
-- Correct lag.
-- Correct amount ratio.
-- Sufficient repetition.
-- A meaningful z-score.
-
----
-
-## 12. Acceptance Criteria
-
-Motif mining is considered successful if:
-- It discovers patterns concentrated in known suspicious cases.
-- It generates features that increase the predictive power of the model.
-- It runs within Colab with limited RAM.
-- It avoids full-graph brute force.
-- It preserves the temporal and directional nature of AML.
+Motif mining is successful if it:
+- finds concentrated suspicious patterns
+- produces useful downstream features
+- runs within Colab memory limits
+- avoids full-graph brute force
+- preserves time and direction

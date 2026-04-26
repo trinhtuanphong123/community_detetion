@@ -1,40 +1,71 @@
-# src/motif/matchers.py
-# Motif matchers cho 5 template AML.
-#
-# Nguyên tắc chung cho mọi matcher:
-#   1. Search forward only — không quay lui
-#   2. Stop early khi vi phạm bất kỳ điều kiện nào (pruning)
-#   3. Trả về list[dict] — mỗi dict là một motif instance
-#   4. Không side effects — không modify index
-#
-# Mỗi instance dict có keys:
-#   motif_type, nodes, edges (event_id list), steps, amounts, lags
-#
-# Lưu ý: matchers không import pandas/cuDF —
-# chỉ làm việc với dict và list thuần Python.
+"""
+matchers.py — Temporal motif matching for AML detection.
+
+Five templates:
+    fan_in      : many → one within delta steps
+    fan_out     : one → many within delta steps
+    cycle_3     : u → v → w → u with strict time order
+    relay_4     : u → v → w → x with strict time order
+    split_merge : u → v1 → z and u → v2 → z
+
+General rules for every matcher (guide §4):
+    1. Forward-only — step strictly increases at each hop.
+    2. Early stop — prune immediately when any constraint fails.
+    3. No side effects — indexes are never modified.
+    4. Return list[dict] — each dict is one motif instance.
+
+Instance dict keys (guide §8):
+    motif_type, nodes, edges (event_id list),
+    steps, amounts, lags, ratios, n_alert
+
+No pandas / cuDF imports — only plain Python dicts and lists.
+"""
+
+from __future__ import annotations
 
 from .config import MotifConfig
+from .index import edges_after_step
 
+
+# ---------------------------------------------------------------------------
+# Primitive constraint helpers
+# ---------------------------------------------------------------------------
 
 def _ratio_ok(a_prev: float, a_curr: float, rho_min: float, rho_max: float) -> bool:
-    """Kiểm tra tỷ lệ amount có trong ngưỡng [rho_min, rho_max]."""
+    """True if a_curr / a_prev ∈ [rho_min, rho_max]."""
     if a_prev <= 0:
         return False
-    ratio = a_curr / a_prev
-    return rho_min <= ratio <= rho_max
+    r = a_curr / a_prev
+    return rho_min <= r <= rho_max
 
 
 def _lag_ok(step_prev: int, step_curr: int, delta: int) -> bool:
-    """Kiểm tra step_curr > step_prev và lag <= delta."""
+    """True if 0 < step_curr - step_prev <= delta."""
     lag = step_curr - step_prev
     return 0 < lag <= delta
 
 
-def _make_instance(motif_type: str, edges: list[dict], nodes: list[int]) -> dict:
-    """Tạo instance dict chuẩn từ danh sách edge dicts."""
-    steps   = [e["step"] for e in edges]
+# ---------------------------------------------------------------------------
+# Instance constructor
+# ---------------------------------------------------------------------------
+
+def _make_instance(
+    motif_type: str,
+    edges: list[dict],
+    nodes: list[int],
+) -> dict:
+    """
+    Build a standardised motif instance dict from an ordered edge list.
+
+    `edges` must be in chronological order (step ascending).
+    """
+    steps   = [e["step"]   for e in edges]
     amounts = [e["amount"] for e in edges]
     lags    = [steps[i] - steps[i - 1] for i in range(1, len(steps))]
+    ratios  = [
+        round(amounts[i] / amounts[i - 1], 4) if amounts[i - 1] > 0 else 0.0
+        for i in range(1, len(amounts))
+    ]
     return {
         "motif_type": motif_type,
         "nodes":      nodes,
@@ -42,38 +73,39 @@ def _make_instance(motif_type: str, edges: list[dict], nodes: list[int]) -> dict
         "steps":      steps,
         "amounts":    amounts,
         "lags":       lags,
-        "n_alert":    sum(e["is_laundering"] for e in edges),
+        "ratios":     ratios,
+        "n_alert":    sum(e.get("is_sar", 0) for e in edges),
     }
 
 
-# ── Fan-in ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Fan-in
+# ---------------------------------------------------------------------------
 
 def find_fanin(
     in_index: dict,
     cfg: MotifConfig,
 ) -> list[dict]:
     """
-    Fan-in: nhiều nguồn khác nhau chuyển vào cùng một đích x
-    trong khoảng DELTA steps.
+    Fan-in: r_min_fanin distinct sources → same destination x, within delta steps.
 
         u1 → x
-        u2 → x   (step_u2 - step_u1 <= DELTA)
+        u2 → x   (step_u2 - step_u1 <= delta)
         u3 → x   ...
 
-    Điều kiện:
-        - Các nguồn (u_i) phải khác nhau
-        - Tất cả nằm trong cửa sổ [t0, t0 + DELTA]
-        - Tỷ lệ amount so với seed trong [RHO_MIN, RHO_MAX]
-        - Số nguồn >= R_MIN_FANIN
+    Constraints:
+        - All sources distinct.
+        - All arrivals in [t0, t0 + delta].
+        - Amount ratio of each edge vs seed in [rho_min, rho_max].
+        - At least r_min_fanin sources found.
 
-    Returns:
-        list[dict] — mỗi dict là một fan-in instance.
+    Returns list of instance dicts.
     """
     results = []
 
     for x, incoming in in_index.items():
         n = len(incoming)
-        if n < cfg.R_MIN_FANIN:
+        if n < cfg.r_min_fanin:
             continue
 
         for i in range(n):
@@ -86,56 +118,51 @@ def find_fanin(
             for j in range(i + 1, n):
                 e = incoming[j]
 
-                # Pruning 1: step đã vượt cửa sổ → dừng (đã sort theo step)
-                if e["step"] - t0 > cfg.DELTA:
+                # Prune: window exceeded — bucket is sorted, so break early
+                if e["step"] - t0 > cfg.delta:
                     break
 
-                # Pruning 2: cùng nguồn → bỏ qua
+                # Prune: duplicate source — skip, do not break
                 if e["src"] in seen:
                     continue
 
-                # Pruning 3: amount ratio
-                if not _ratio_ok(a0, e["amount"], cfg.RHO_MIN, cfg.RHO_MAX):
+                # Prune: amount ratio
+                if not _ratio_ok(a0, e["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
                 seen.add(e["src"])
                 group.append(e)
 
-            if len(group) >= cfg.R_MIN_FANIN:
+            if len(group) >= cfg.r_min_fanin:
                 nodes = [e["src"] for e in group] + [x]
                 results.append(_make_instance("fanin", group, nodes))
 
     return results
 
 
-# ── Fan-out ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Fan-out
+# ---------------------------------------------------------------------------
 
 def find_fanout(
     out_index: dict,
     cfg: MotifConfig,
 ) -> list[dict]:
     """
-    Fan-out: một nguồn x gửi đến nhiều đích khác nhau
-    trong khoảng DELTA steps.
+    Fan-out: source x → r_min_fanout distinct destinations, within delta steps.
 
         x → v1
-        x → v2   (step_v2 - step_v1 <= DELTA)
+        x → v2   (step_v2 - step_v1 <= delta)
         x → v3   ...
 
-    Điều kiện:
-        - Các đích (v_i) phải khác nhau
-        - Tất cả nằm trong cửa sổ [t0, t0 + DELTA]
-        - Tỷ lệ amount so với seed trong [RHO_MIN, RHO_MAX]
-        - Số đích >= R_MIN_FANOUT
-
-    Returns:
-        list[dict]
+    Constraints mirror find_fanin (symmetric).
+    Returns list of instance dicts.
     """
     results = []
 
     for x, outgoing in out_index.items():
         n = len(outgoing)
-        if n < cfg.R_MIN_FANOUT:
+        if n < cfg.r_min_fanout:
             continue
 
         for i in range(n):
@@ -148,66 +175,60 @@ def find_fanout(
             for j in range(i + 1, n):
                 e = outgoing[j]
 
-                if e["step"] - t0 > cfg.DELTA:
+                if e["step"] - t0 > cfg.delta:
                     break
 
                 if e["dst"] in seen:
                     continue
 
-                if not _ratio_ok(a0, e["amount"], cfg.RHO_MIN, cfg.RHO_MAX):
+                if not _ratio_ok(a0, e["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
                 seen.add(e["dst"])
                 group.append(e)
 
-            if len(group) >= cfg.R_MIN_FANOUT:
+            if len(group) >= cfg.r_min_fanout:
                 nodes = [x] + [e["dst"] for e in group]
                 results.append(_make_instance("fanout", group, nodes))
 
     return results
 
 
-# ── Cycle-3 ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Cycle-3
+# ---------------------------------------------------------------------------
 
 def find_cycle3(
     out_index: dict,
     cfg: MotifConfig,
 ) -> list[dict]:
     """
-    Cycle-3: tiền đi vòng qua 3 node rồi quay lại điểm đầu.
+    Cycle-3: u → v → w → u with strictly increasing steps.
 
-        u → v → w → u
+    Constraints:
+        - step_e1 < step_e2 < step_e3 (strict)
+        - Each consecutive lag <= delta
+        - Amount ratio at each hop in [rho_min, rho_max]
+        - u, v, w are three distinct nodes
 
-    Điều kiện:
-        - Đúng thứ tự thời gian: step1 < step2 < step3
-        - Lag từng bước <= DELTA
-        - Amount ratio từng bước trong [RHO_MIN, RHO_MAX]
-        - u, v, w phải là 3 node khác nhau
-
-    Returns:
-        list[dict]
+    Uses edges_after_step() for forward-only bucket access.
+    Returns list of instance dicts.
     """
     results = []
 
-    for u, edges_uv in out_index.items():
-        for e1 in edges_uv:
+    for u, edges_u in out_index.items():
+        for e1 in edges_u:
             v  = e1["dst"]
             t1 = e1["step"]
             a1 = e1["amount"]
 
             if v == u:
-                continue  # self-loop không phải cycle
-
-            edges_vw = out_index.get(v)
-            if not edges_vw:
                 continue
 
-            for e2 in edges_vw:
-                # Pruning: thứ tự thời gian + lag
-                if not _lag_ok(t1, e2["step"], cfg.DELTA):
-                    if e2["step"] <= t1:
-                        continue  # chưa đến, tiếp tục
-                    break         # đã vượt DELTA, dừng
+            # e2: v → w, step in (t1, t1 + delta]
+            for e2 in edges_after_step(out_index, v, t1):
+                if e2["step"] - t1 > cfg.delta:
+                    break  # bucket sorted → nothing after is valid
 
                 w  = e2["dst"]
                 a2 = e2["amount"]
@@ -215,28 +236,18 @@ def find_cycle3(
                 if w == u or w == v:
                     continue
 
-                # Pruning: amount ratio bước 1→2
-                if not _ratio_ok(a1, a2, cfg.RHO_MIN, cfg.RHO_MAX):
+                if not _ratio_ok(a1, a2, cfg.rho_min, cfg.rho_max):
                     continue
 
-                edges_wu = out_index.get(w)
-                if not edges_wu:
-                    continue
-
-                for e3 in edges_wu:
-                    if not _lag_ok(e2["step"], e3["step"], cfg.DELTA):
-                        if e3["step"] <= e2["step"]:
-                            continue
+                # e3: w → u, step in (t2, t2 + delta]
+                for e3 in edges_after_step(out_index, w, e2["step"]):
+                    if e3["step"] - e2["step"] > cfg.delta:
                         break
 
-                    # Phải quay về u
                     if e3["dst"] != u:
                         continue
 
-                    a3 = e3["amount"]
-
-                    # Pruning: amount ratio bước 2→3
-                    if not _ratio_ok(a2, a3, cfg.RHO_MIN, cfg.RHO_MAX):
+                    if not _ratio_ok(a2, e3["amount"], cfg.rho_min, cfg.rho_max):
                         continue
 
                     results.append(_make_instance(
@@ -248,29 +259,30 @@ def find_cycle3(
     return results
 
 
-# ── Relay-4 (chain) ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Relay-4 (chain)
+# ---------------------------------------------------------------------------
 
 def find_relay4(
     out_index: dict,
     cfg: MotifConfig,
 ) -> list[dict]:
     """
-    Relay-4 (chain): tiền đi qua 4 node liên tiếp.
+    Relay-4: u → v → w → x with strictly increasing steps.
 
-        u → v → w → x
+    Constraints:
+        - step_e1 < step_e2 < step_e3 (strict)
+        - Each consecutive lag <= delta
+        - Amount ratio at each hop in [rho_min, rho_max]
+        - u, v, w, x are four distinct nodes
 
-    Điều kiện:
-        - Đúng thứ tự thời gian, lag từng bước <= DELTA
-        - Amount ratio từng bước trong [RHO_MIN, RHO_MAX]
-        - u, v, w, x là 4 node khác nhau
-
-    Returns:
-        list[dict]
+    Uses edges_after_step() for forward-only access.
+    Returns list of instance dicts.
     """
     results = []
 
-    for u, edges_uv in out_index.items():
-        for e1 in edges_uv:
+    for u, edges_u in out_index.items():
+        for e1 in edges_u:
             v  = e1["dst"]
             t1 = e1["step"]
             a1 = e1["amount"]
@@ -278,14 +290,8 @@ def find_relay4(
             if v == u:
                 continue
 
-            edges_vw = out_index.get(v)
-            if not edges_vw:
-                continue
-
-            for e2 in edges_vw:
-                if not _lag_ok(t1, e2["step"], cfg.DELTA):
-                    if e2["step"] <= t1:
-                        continue
+            for e2 in edges_after_step(out_index, v, t1):
+                if e2["step"] - t1 > cfg.delta:
                     break
 
                 w  = e2["dst"]
@@ -294,17 +300,11 @@ def find_relay4(
                 if w in (u, v):
                     continue
 
-                if not _ratio_ok(a1, a2, cfg.RHO_MIN, cfg.RHO_MAX):
+                if not _ratio_ok(a1, a2, cfg.rho_min, cfg.rho_max):
                     continue
 
-                edges_wx = out_index.get(w)
-                if not edges_wx:
-                    continue
-
-                for e3 in edges_wx:
-                    if not _lag_ok(e2["step"], e3["step"], cfg.DELTA):
-                        if e3["step"] <= e2["step"]:
-                            continue
+                for e3 in edges_after_step(out_index, w, e2["step"]):
+                    if e3["step"] - e2["step"] > cfg.delta:
                         break
 
                     x  = e3["dst"]
@@ -313,7 +313,7 @@ def find_relay4(
                     if x in (u, v, w):
                         continue
 
-                    if not _ratio_ok(a2, a3, cfg.RHO_MIN, cfg.RHO_MAX):
+                    if not _ratio_ok(a2, a3, cfg.rho_min, cfg.rho_max):
                         continue
 
                     results.append(_make_instance(
@@ -325,7 +325,9 @@ def find_relay4(
     return results
 
 
-# ── Split-merge ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Split-merge
+# ---------------------------------------------------------------------------
 
 def find_split_merge(
     out_index: dict,
@@ -333,30 +335,28 @@ def find_split_merge(
     cfg: MotifConfig,
 ) -> list[dict]:
     """
-    Split-merge: một nguồn tách ra 2 nhánh, cả 2 nhánh nhập lại cùng một đích.
+    Split-merge: source splits to two intermediaries that recombine at one target.
 
         u → v1 → z
         u → v2 → z
 
-    Điều kiện:
-        - u gửi đến v1 và v2 trong cùng DELTA steps
-        - v1 và v2 đều gửi đến z trong DELTA steps sau đó
-        - u, v1, v2, z là 4 node khác nhau
-        - Amount ratio trong [RHO_MIN, RHO_MAX] tại mỗi bước
+    Two-phase:
+        Phase 1: find split pairs (u → v1, u → v2) within delta steps.
+        Phase 2: for each pair, find a common target z that both v1 and v2
+                 reach within 2 * delta steps of the split start.
 
-    Hai-phase:
-        Phase 1: tìm split (u → v1, u → v2)
-        Phase 2: tìm merge (v1 → z, v2 → z)
+    Constraints:
+        - u, v1, v2, z are four distinct nodes
+        - Amount ratio at every hop in [rho_min, rho_max]
+        - All events in chronological order per hop
 
-    Returns:
-        list[dict] — mỗi instance có 4 edges: e_uv1, e_uv2, e_v1z, e_v2z
+    Returns list of instance dicts, each with 4 edges sorted by step.
     """
     results = []
 
     for u, outgoing_u in out_index.items():
         n = len(outgoing_u)
 
-        # Phase 1: tìm tất cả cặp split (v1, v2) từ u
         for i in range(n):
             e_uv1 = outgoing_u[i]
             v1    = e_uv1["dst"]
@@ -366,62 +366,50 @@ def find_split_merge(
             for j in range(i + 1, n):
                 e_uv2 = outgoing_u[j]
 
-                # Pruning: cửa sổ split
-                if e_uv2["step"] - t0 > cfg.DELTA:
+                # Prune: split window exceeded
+                if e_uv2["step"] - t0 > cfg.delta:
                     break
 
                 v2 = e_uv2["dst"]
                 if v2 == v1 or v2 == u:
                     continue
 
-                # Pruning: amount ratio uv1 vs uv2
-                if not _ratio_ok(a_uv1, e_uv2["amount"], cfg.RHO_MIN, cfg.RHO_MAX):
+                # Prune: split amount ratio
+                if not _ratio_ok(a_uv1, e_uv2["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
-                # Phase 2: tìm z nhận từ cả v1 và v2
-                edges_v1 = out_index.get(v1, [])
-                edges_v2 = out_index.get(v2, [])
-
-                # Lấy tập đích của v1 trong [t0, t0 + 2*DELTA]
-                v1_targets: dict = {}  # dst → edge dict
-                for e in edges_v1:
-                    lag = e["step"] - t0
-                    if lag <= 0:
-                        continue
-                    if lag > 2 * cfg.DELTA:
+                # Phase 2: collect targets reachable from v1 in (t0, t0 + 2*delta]
+                v1_targets: dict = {}  # z → edge dict
+                for e in edges_after_step(out_index, v1, t0):
+                    if e["step"] - t0 > 2 * cfg.delta:
                         break
-                    # Pruning: amount ratio uv1 → v1z
-                    if not _ratio_ok(a_uv1, e["amount"], cfg.RHO_MIN, cfg.RHO_MAX):
-                        continue
                     z = e["dst"]
-                    if z not in (u, v1, v2):
-                        v1_targets[z] = e
+                    if z in (u, v1, v2):
+                        continue
+                    if not _ratio_ok(a_uv1, e["amount"], cfg.rho_min, cfg.rho_max):
+                        continue
+                    v1_targets[z] = e
 
                 if not v1_targets:
                     continue
 
-                # Tìm v2 → z với z ∈ v1_targets
-                for e in edges_v2:
-                    lag = e["step"] - t0
-                    if lag <= 0:
-                        continue
-                    if lag > 2 * cfg.DELTA:
+                # Find v2 → z where z ∈ v1_targets
+                for e_v2z in edges_after_step(out_index, v2, t0):
+                    if e_v2z["step"] - t0 > 2 * cfg.delta:
                         break
 
-                    z = e["dst"]
+                    z = e_v2z["dst"]
                     if z not in v1_targets:
                         continue
                     if z in (u, v1, v2):
                         continue
 
                     e_v1z = v1_targets[z]
-                    e_v2z = e
 
-                    # Pruning: amount ratio uv2 → v2z
-                    if not _ratio_ok(e_uv2["amount"], e_v2z["amount"], cfg.RHO_MIN, cfg.RHO_MAX):
+                    if not _ratio_ok(e_uv2["amount"], e_v2z["amount"], cfg.rho_min, cfg.rho_max):
                         continue
 
-                    # Giữ thứ tự thời gian trong instance
+                    # Sort all four edges chronologically for the instance
                     all_edges = sorted(
                         [e_uv1, e_uv2, e_v1z, e_v2z],
                         key=lambda e: e["step"],
@@ -435,10 +423,43 @@ def find_split_merge(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Convenience: run all matchers on a pre-built index set
+# ---------------------------------------------------------------------------
+
+def run_all_matchers(
+    out_index: dict,
+    in_index: dict,
+    cfg: MotifConfig,
+) -> list[dict]:
+    """
+    Run all five matchers and return a combined instance list.
+
+    Parameters
+    ----------
+    out_index, in_index : dict
+        Output of build_event_indexes().
+    cfg : MotifConfig
+        Motif configuration.
+
+    Returns
+    -------
+    Combined list of all matched motif instances across all types.
+    """
+    return (
+        find_fanin(in_index, cfg)
+        + find_fanout(out_index, cfg)
+        + find_cycle3(out_index, cfg)
+        + find_relay4(out_index, cfg)
+        + find_split_merge(out_index, in_index, cfg)
+    )
+
+
 __all__ = [
     "find_fanin",
     "find_fanout",
     "find_cycle3",
     "find_relay4",
     "find_split_merge",
+    "run_all_matchers",
 ]

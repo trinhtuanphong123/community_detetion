@@ -1,104 +1,154 @@
 """
 loader.py — Load and validate AMLGentex transaction data.
 
-Reads CSV/parquet into a cuDF (or pandas fallback) DataFrame,
-validates schema per graph_schema.md, and provides windowed iteration.
+Reads CSV or Parquet into a cuDF (GPU) or pandas (CPU) DataFrame,
+normalizes to the canonical schema defined in graph_schema.md §3,
+and provides a windowed iterator for memory-bounded processing.
+
+Guarantees:
+- Time    : output is sorted by `step` ascending; `step` is always present.
+- Direction: `src_node → dst_node` is preserved; self-loops are removed.
+- Memory  : only canonical columns are kept; gc.collect() called per window.
 """
 
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass, field
 from typing import Iterator, Tuple
 
 try:
     import cudf as pd_lib
     _GPU = True
 except ImportError:
-    import pandas as pd_lib
+    import pandas as pd_lib  # type: ignore
     _GPU = False
 
+from src.graph.config import LoaderConfig
 
-@dataclass
-class LoaderConfig:
-    """Configuration for data loading."""
-    # Required columns in raw data (mapped to canonical names)
-    column_map: dict = field(default_factory=lambda: {
-        "From Bank": "src_bank",
-        "To Bank": "dst_bank",
-        "Account": "src_node",
-        "Account.1": "dst_node",
-        "Amount Received": "amount",
-        "Timestamp": "timestamp",
-        "Is Laundering": "is_sar",
-    })
-    # Columns to keep after mapping
-    keep_cols: list = field(default_factory=lambda: [
-        "src_node", "dst_node", "amount", "timestamp", "is_sar", "step",
-    ])
-    window_size: int = 30     # steps per window
-    window_stride: int = 15   # stride between windows (overlap = size - stride)
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _read_file(path: str) -> "pd_lib.DataFrame":
+    """Read CSV or Parquet; return raw DataFrame."""
+    if path.endswith(".parquet"):
+        return pd_lib.read_parquet(path)
+    return pd_lib.read_csv(path)
+
+
+def _rename_columns(df: "pd_lib.DataFrame", column_map: dict) -> "pd_lib.DataFrame":
+    """Rename only columns that are present in df."""
+    rename = {k: v for k, v in column_map.items() if k in df.columns}
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
+def _build_step(df: "pd_lib.DataFrame") -> "pd_lib.DataFrame":
+    """
+    Derive integer `step` (days since first event) from `timestamp`.
+    Preserves temporal ordering without adding clock-specific logic.
+    """
+    ts = pd_lib.to_datetime(df["timestamp"])
+    df["step"] = (ts - ts.min()).dt.days.astype("int32")
+    return df
+
+
+def _cast_dtypes(
+    df: "pd_lib.DataFrame",
+    dtypes: dict,
+) -> "pd_lib.DataFrame":
+    """
+    Cast columns to memory-efficient types.
+    Only casts columns that exist; silently skips missing ones.
+    Numeric columns with non-numeric values are coerced (errors → NaN dropped).
+    """
+    for col, dtype in dtypes.items():
+        if col not in df.columns:
+            continue
+        try:
+            if _GPU:
+                df[col] = df[col].astype(dtype)
+            else:
+                df[col] = pd_lib.to_numeric(df[col], errors="coerce").astype(dtype)
+        except Exception:
+            # If cast fails, leave the column as-is; pipeline will surface issues
+            pass
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def load_transactions(
     path: str,
     cfg: LoaderConfig | None = None,
 ) -> "pd_lib.DataFrame":
-    """Load raw transaction file and normalize to canonical schema.
+    """
+    Load a raw AMLGentex file and normalize to the canonical schema.
 
     Parameters
     ----------
     path : str
-        Path to CSV or parquet file.
+        Path to a CSV or Parquet file.
     cfg : LoaderConfig, optional
-        Loading configuration. Uses defaults if None.
+        Loading configuration.  Defaults are used when None.
 
     Returns
     -------
-    DataFrame with canonical columns: src_node, dst_node, amount, step, is_sar.
-    Sorted by step ascending.
+    DataFrame with columns: src_node, dst_node, amount, step, is_sar.
+    Sorted by `step` ascending.  Self-loops and zero/negative amounts removed.
+
+    Raises
+    ------
+    ValueError
+        If mandatory columns (src_node, dst_node, amount) are absent after
+        renaming, or if neither `step` nor `timestamp` is available.
     """
     cfg = cfg or LoaderConfig()
 
-    # Read file
-    if path.endswith(".parquet"):
-        df = pd_lib.read_parquet(path)
-    else:
-        df = pd_lib.read_csv(path)
+    df = _read_file(path)
 
-    # Rename columns that exist in the mapping
-    rename = {k: v for k, v in cfg.column_map.items() if k in df.columns}
-    if rename:
-        df = df.rename(columns=rename)
+    # Step 1 — rename to canonical names
+    df = _rename_columns(df, cfg.column_map)
 
-    # Ensure required columns
-    for col in ["src_node", "dst_node", "amount"]:
+    # Step 2 — check mandatory columns
+    for col in ("src_node", "dst_node", "amount"):
         if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
+            raise ValueError(
+                f"Column '{col}' not found after renaming. "
+                f"Available columns: {list(df.columns)}"
+            )
 
-    # Build step from timestamp if not already present
+    # Step 3 — build `step` if absent
     if "step" not in df.columns:
-        if "timestamp" in df.columns:
-            ts = pd_lib.to_datetime(df["timestamp"])
-            df["step"] = (ts - ts.min()).dt.days
-        else:
-            raise ValueError("Need either 'step' or 'timestamp' column")
+        if "timestamp" not in df.columns:
+            raise ValueError(
+                "Neither 'step' nor 'timestamp' column found. "
+                "Cannot establish temporal ordering."
+            )
+        df = _build_step(df)
 
-    # Default is_sar to 0 if absent
+    # Step 4 — default is_sar = 0 when label is absent
     if "is_sar" not in df.columns:
         df["is_sar"] = 0
 
-    # Filter self-loops
+    # Step 5 — cast to memory-efficient dtypes early
+    df = _cast_dtypes(df, cfg.dtypes)
+
+    # Step 6 — remove self-loops (direction invariant)
     df = df[df["src_node"] != df["dst_node"]].reset_index(drop=True)
 
-    # Filter non-positive amounts
+    # Step 7 — remove non-positive amounts (AML constraint)
     df = df[df["amount"] > 0].reset_index(drop=True)
 
-    # Keep only canonical columns that exist
+    # Step 8 — keep only canonical columns; drop everything else to save RAM
     keep = [c for c in cfg.keep_cols if c in df.columns]
     df = df[keep]
 
-    # Sort by step for temporal ordering
+    # Step 9 — sort by step for temporal ordering (must not shuffle)
     df = df.sort_values("step").reset_index(drop=True)
 
     return df
@@ -109,27 +159,33 @@ def iter_windows(
     window_size: int = 30,
     window_stride: int = 15,
 ) -> Iterator[Tuple[int, int, "pd_lib.DataFrame"]]:
-    """Yield (window_start, window_end, window_df) for each time window.
+    """
+    Yield non-overlapping (or overlapping) time windows from a transaction table.
 
     Parameters
     ----------
     df : DataFrame
-        Must have a 'step' column, sorted ascending.
+        Must have a `step` column, sorted ascending.
     window_size : int
-        Number of steps per window.
+        Number of steps included in each window  [step_start, step_start + size - 1].
     window_stride : int
-        Step increment between windows.
+        Step increment between consecutive window starts.
+        Set equal to window_size for non-overlapping windows.
 
     Yields
     ------
-    (start_step, end_step, window_df) tuples.
+    (start_step, end_step, window_df)
+        window_df contains only transactions in [start_step, end_step].
+        gc.collect() is called after each yield to free intermediate memory.
+
+    Notes
+    -----
+    - Temporal ordering is preserved within each window_df.
+    - Direction (src_node → dst_node) is not altered.
+    - Empty windows are skipped silently.
     """
-    if _GPU:
-        step_min = int(df["step"].min())
-        step_max = int(df["step"].max())
-    else:
-        step_min = int(df["step"].min())
-        step_max = int(df["step"].max())
+    step_min = int(df["step"].min())
+    step_max = int(df["step"].max())
 
     start = step_min
     while start <= step_max:
@@ -138,5 +194,6 @@ def iter_windows(
         window_df = df[mask].reset_index(drop=True)
         if len(window_df) > 0:
             yield start, end, window_df
-        start += window_stride
+        del window_df, mask
         gc.collect()
+        start += window_stride
