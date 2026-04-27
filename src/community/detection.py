@@ -334,68 +334,100 @@ def compute_node_roles(
         n_tx, n_alert_tx, alert_rate, net_flow_ratio,
         flow_consistency, layering_score, role
     """
+    """
+    Classify each node in the window as source / sink / layering / neutral.
+
+    Role encoding:
+        0 = Neutral      (balanced or low-activity)
+        1 = Source       (net_flow_ratio > role_threshold)
+        2 = Sink         (net_flow_ratio < -role_threshold)
+        3 = Layering     (flow_consistency > layering_consistency and
+                          |net_flow_ratio| < role_threshold × 0.67)
+
+    Implementation Fix: Uses explicit priority assignment to avoid 
+    undefined role codes from overlapping thresholds.
+    """
     has_alert = alert_col in window_df.columns
 
-    # Vectorized: groupby aggregation (no iterrows)
+    # 1. Aggregation: Compute out-flow statistics per node
     agg_src = {"amt_out": (amount_col, "sum"), "n_out": (amount_col, "count")}
     if has_alert:
         agg_src["n_alert_out"] = (alert_col, "sum")
     src_stats = window_df.groupby(src_col, as_index=False).agg(**agg_src)
     src_stats = src_stats.rename(columns={src_col: "node"})
 
+    # 2. Aggregation: Compute in-flow statistics per node
     agg_dst = {"amt_in": (amount_col, "sum"), "n_in": (amount_col, "count")}
     if has_alert:
-        agg_dst["n_alert_in"] = (alert_col, "sum")
+        agg_dst["n_in_tx"] = (amount_col, "count") # Using count for tx volume
+        if has_alert:
+            agg_dst["n_alert_in"] = (alert_col, "sum")
     dst_stats = window_df.groupby(dst_col, as_index=False).agg(**agg_dst)
     dst_stats = dst_stats.rename(columns={dst_col: "node"})
 
+    # 3. Merge: Align in-flow and out-flow on the same node ID
     nf = src_stats.merge(dst_stats, on="node", how="outer").fillna(0.0)
 
+    # 4. Feature Engineering: Basic metrics
     nf["total_volume_out"] = nf["amt_out"].astype("float32")
     nf["total_volume_in"]  = nf["amt_in"].astype("float32")
     nf["total_volume"]     = nf["total_volume_out"] + nf["total_volume_in"]
-    nf["n_tx"]             = (nf["n_out"] + nf["n_in"]).astype("int32")
+    
+    # Standardize transaction counts
+    n_out_vals = nf["n_out"].astype("int32")
+    n_in_vals = nf.get("n_in", nf.get("n_in_tx", 0)).astype("int32")
+    nf["n_tx"] = n_out_vals + n_in_vals
 
+    # Alert rate calculation
     if has_alert:
         nf["n_alert_tx"] = (nf.get("n_alert_out", 0) + nf.get("n_alert_in", 0)).astype("int32")
     else:
         nf["n_alert_tx"] = 0
-
+        
     nf["alert_rate"] = nf["n_alert_tx"] / (nf["n_tx"] + 1e-9).astype("float32")
 
+    # 5. Feature Engineering: Advanced AML metrics
+    # Net flow ratio: balance between money coming in vs going out
     nf["net_flow_ratio"] = (
         (nf["total_volume_out"] - nf["total_volume_in"])
         / (nf["total_volume_out"] + nf["total_volume_in"] + 1e-9)
     ).astype("float32")
 
+    # Flow consistency: high when in-flow and out-flow are nearly equal
     vol_min = nf[["total_volume_in", "total_volume_out"]].min(axis=1)
     nf["flow_consistency"] = (
         2 * vol_min / (nf["total_volume_in"] + nf["total_volume_out"] + 1e-9)
     ).astype("float32")
 
+    # Layering score: derived from consistency and capital preservation
     nf["layering_score"] = (
         nf["flow_consistency"] * (1 - nf["net_flow_ratio"].abs())
     ).astype("float32")
 
-    # Vectorized role assignment (no .loc loops)
+    # 6. Role Assignment: Explicit Priority Logic (The Fix)
+    # Define boolean masks based on Config thresholds
     is_source   = nf["net_flow_ratio"] >  cfg.role_threshold
     is_sink     = nf["net_flow_ratio"] < -cfg.role_threshold
     is_layering = (
         (nf["flow_consistency"] >  cfg.layering_consistency)
         & (nf["net_flow_ratio"].abs() < cfg.role_threshold * 0.67)
     )
-
-    nf["role"] = (
-        is_layering.astype("int8") * 3
-        + (~is_layering & is_source).astype("int8") * 1
-        + (~is_layering & is_sink).astype("int8")   * 2
-    )
+    
+    # Initialize all as Neutral (0)
+    nf["role"] = 0
+    
+    # Apply labels with clear hierarchy. 
+    # Last assignment wins if a node satisfies multiple conditions.
+    nf.loc[is_source,   "role"] = 1
+    nf.loc[is_sink,     "role"] = 2
+    nf.loc[is_layering, "role"] = 3  # Layering has highest priority in AML context
 
     return nf[[
         "node", "total_volume", "total_volume_out", "total_volume_in",
         "n_tx", "n_alert_tx", "alert_rate", "net_flow_ratio",
         "flow_consistency", "layering_score", "role",
     ]].reset_index(drop=True)
+
 
 
 # ---------------------------------------------------------------------------
@@ -491,17 +523,21 @@ def split_large_communities(
     max_cid = max(labels.values()) + 1
     result = dict(labels)
 
+    # Pre-compute full nonzero coordinates once outside the per-community loop
+    all_rows, all_cols = wg.A.nonzero()
+
     for cid, members in oversized.items():
         node_set = set(members)
         # Extract subgraph CSR for this community
-        rows, cols = wg.A.nonzero()
-        mask = np.isin(rows, list(node_set)) & np.isin(cols, list(node_set))
-        sub_data  = wg.A.data[mask] if hasattr(wg.A, 'data') else np.asarray(wg.A[rows[mask], cols[mask]]).flatten()
-        sub_rows  = rows[mask]
-        sub_cols  = cols[mask]
+        mask = np.isin(all_rows, list(node_set)) & np.isin(all_cols, list(node_set))
+        sub_rows = all_rows[mask]
+        sub_cols = all_cols[mask]
 
         if len(sub_rows) == 0:
             continue
+
+        # Read through matrix interface — safe regardless of CSR internal layout
+        sub_data = np.asarray(wg.A[sub_rows, sub_cols]).flatten().astype(np.float32)
 
         # Remap to local indices
         sorted_members = sorted(members)

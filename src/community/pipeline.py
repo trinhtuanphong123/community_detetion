@@ -134,6 +134,14 @@ def run_community_pipeline(
             print(f"  Window {window_id}: steps [{step_start}, {step_end}] "
                   f"({len(window_df):,} rows)")
 
+        # Guard: fail clearly if the weight column is missing
+        # (build_window_graph would silently produce an all-zero adjacency).
+        if weight_col not in window_df.columns:
+            raise ValueError(
+                f"weight_col='{weight_col}' not found in window_df. "
+                f"Available columns: {list(window_df.columns)}"
+            )
+
         # ── 1. Build directed weighted graph ──────────────────────────────────
         wg = build_window_graph(
             window_df,

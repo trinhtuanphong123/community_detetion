@@ -229,8 +229,11 @@ def extract_community_features(
 
     # ── Motif enrichment ──────────────────────────────────────────────────────
     if motif_counts:
+        # Pre-build size lookup to avoid O(n²) per-row DataFrame filter
+        # and IndexError when a community is in motif_counts but not comm_basic.
+        size_dict = comm_basic.set_index("global_cid")["size"].to_dict()
         comm_basic["motif_enrichment"] = comm_basic["global_cid"].map(
-            lambda gcid: motif_counts.get(gcid, 0.0) / max(comm_basic.loc[comm_basic["global_cid"] == gcid, "size"].values[0], 1)
+            lambda gcid: motif_counts.get(gcid, 0.0) / max(size_dict.get(gcid, 1), 1)
         ).astype("float32")
     else:
         comm_basic["motif_enrichment"] = 0.0
@@ -328,8 +331,9 @@ def score_communities(
         - cfg.w_external_noise * df["external_noise"].clip(0.0, 1.0)
     ).astype("float32")
 
-    # Size-penalty: log penalty to avoid large communities dominating
-    gamma = 0.05
+    # Size-penalty: log penalty to avoid large communities dominating.
+    # gamma is configurable via cfg.size_penalty_gamma (default 0.05).
+    gamma = cfg.size_penalty_gamma
     size_penalty = gamma * np.log1p(df["size"].astype("float64")).astype("float32")
     df["suspicion_score"] = (df["suspicion_score"] - size_penalty).clip(lower=0.0).astype("float32")
 

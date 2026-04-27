@@ -222,9 +222,10 @@ def build_tracking_record(
     overlap_map: Dict[int, float] = {}
     if prev_buffer:
         last = prev_buffer[-1]  # most recent past window
-        prev_lookup: Dict[int, int] = {}
-        for _, row in last.iterrows():
-            prev_lookup[int(row["node"])] = int(row["global_cid"])
+        # dict(zip(...)) is O(n) — avoids iterrows() overhead on large windows
+        prev_lookup: Dict[int, int] = dict(zip(
+            last["node"].astype(int), last["global_cid"].astype(int)
+        ))
 
         prev_sets: Dict[int, set] = {}
         for node, gcid in prev_lookup.items():

@@ -242,12 +242,16 @@ def apply_weighting(
     - A copy of the weight column is made; other columns are not touched.
     - Vectorized with numpy; no loops.
     """
-    w = edges[weight_col].to_numpy().astype(np.float64)
-
-    # Monetary continuity: penalise when in-amount ≠ out-amount
-    # Using weight_col for both sides (snapshot already aggregated per pair);
-    # if avg_gap_col is present use it for temporal; otherwise skip.
-    money_factor = np.ones(len(edges), dtype=np.float64)
+    # w = edges[weight_col].to_numpy().astype(np.float64)
+    # Compute per-node out/in totals from the edge table itself
+    node_out = edges.groupby(src_col)[weight_col].sum().rename("node_out")
+    node_in  = edges.groupby(dst_col)[weight_col].sum().rename("node_in")
+    edges = edges.join(node_out, on=src_col).join(node_in, on=dst_col)
+    money_factor = np.exp(
+        -cfg.alpha * np.abs(
+            np.log((edges["node_out"].to_numpy() / (edges["node_in"].to_numpy() + 1e-9)) + 1e-9)
+        )
+    )
 
     # Temporal decay factor
     if avg_gap_col in edges.columns:

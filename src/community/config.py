@@ -101,6 +101,12 @@ class CommunityConfig:
     global_susp_threshold : float
         Communities with S(C) above this are added to the investigation shortlist.
 
+    size_penalty_gamma : float
+        Log size-penalty coefficient in the suspicion score.
+        Reduces the score of large communities to prevent size-bias.
+        S_penalised = S - gamma * log(1 + |C|).
+        Configurable here so experiments can turn it off (set to 0.0).
+
     Output
     ------
     top_k_export : int
@@ -147,6 +153,7 @@ class CommunityConfig:
 
     # ── Output ────────────────────────────────────────────────────────────────
     top_k_export: int = 50
+    size_penalty_gamma: float = 0.05   # log size-penalty coefficient in score_communities
 
 
 __all__ = ["CommunityConfig"]
