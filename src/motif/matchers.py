@@ -149,6 +149,7 @@ def find_fanin(
 def find_fanout(
     out_index: dict,
     cfg: MotifConfig,
+    out_steps: dict,
 ) -> list[dict]:
     """
     Fan-out: source x → r_min_fanout distinct destinations, within delta steps.
@@ -166,14 +167,14 @@ def find_fanout(
         n = len(outgoing)
         if n < cfg.r_min_fanout:
             continue
-        
-        a_prev= a0
+
         for i in range(n):
             seed   = outgoing[i]
             t0     = seed["step"]
             a0     = seed["amount"]
             seen   = {seed["dst"]}
             group  = [seed]
+            a_prev = a0
 
             for j in range(i + 1, n):
                 e = outgoing[j]
@@ -205,6 +206,7 @@ def find_fanout(
 def find_cycle3(
     out_index: dict,
     cfg: MotifConfig,
+    out_steps: dict,
 ) -> list[dict]:
     """
     Cycle-3: u → v → w → u with strictly increasing steps.
@@ -230,7 +232,7 @@ def find_cycle3(
                 continue
 
             # e2: v → w, step in (t1, t1 + delta]
-            for e2 in edges_after_step(out_index, v, t1):
+            for e2 in edges_after_step(out_index, v, t1, out_steps):
                 if e2["step"] - t1 > cfg.delta:
                     break  # bucket sorted → nothing after is valid
 
@@ -244,7 +246,7 @@ def find_cycle3(
                     continue
 
                 # e3: w → u, step in (t2, t2 + delta]
-                for e3 in edges_after_step(out_index, w, e2["step"]):
+                for e3 in edges_after_step(out_index, w, e2["step"], out_steps):
                     if e3["step"] - e2["step"] > cfg.delta:
                         break
 
@@ -276,6 +278,7 @@ def find_cycle3(
 def find_relay4(
     out_index: dict,
     cfg: MotifConfig,
+    out_steps: dict,
 ) -> list[dict]:
     """
     Relay-4: u → v → w → x with strictly increasing steps.
@@ -300,7 +303,7 @@ def find_relay4(
             if v == u:
                 continue
 
-            for e2 in edges_after_step(out_index, v, t1):
+            for e2 in edges_after_step(out_index, v, t1, out_steps):
                 if e2["step"] - t1 > cfg.delta:
                     break
 
@@ -313,7 +316,7 @@ def find_relay4(
                 if not _ratio_ok(a1, a2, cfg.rho_min, cfg.rho_max):
                     continue
 
-                for e3 in edges_after_step(out_index, w, e2["step"]):
+                for e3 in edges_after_step(out_index, w, e2["step"], out_steps):
                     if e3["step"] - e2["step"] > cfg.delta:
                         break
 
@@ -350,6 +353,8 @@ def find_split_merge(
     out_index: dict,
     in_index: dict,
     cfg: MotifConfig,
+    out_steps: dict,
+    
 ) -> list[dict]:
     """
     Split-merge: source splits to two intermediaries that recombine at one target.
@@ -396,7 +401,7 @@ def find_split_merge(
                     continue
                 # Phase 2: collect targets reachable from v1
                 v1_targets: dict = {}          # z → list[edge]
-                for e in edges_after_step(out_index, v1, t0):
+                for e in edges_after_step(out_index, v1, t0, out_steps):
                     if e["step"] - t0 > 2 * cfg.delta:
                         break
                     z = e["dst"]
@@ -407,7 +412,7 @@ def find_split_merge(
                     v1_targets.setdefault(z, []).append(e)   # ← collect all edges to z
 
                 # Phase 2 match
-                for e_v2z in edges_after_step(out_index, v2, t0):
+                for e_v2z in edges_after_step(out_index, v2, t0, out_steps):
                     if e_v2z["step"] - t0 > 2 * cfg.delta:
                         break
                     z = e_v2z["dst"]

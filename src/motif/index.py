@@ -95,6 +95,8 @@ def build_event_indexes(
                 "Unsorted data will cause binary search (bisect) to return silent failures."
             )
 
+
+
     df = _normalize_columns(event_df, src_col, dst_col, step_col, amount_col, alert_col)
     df = _ensure_event_id(df)
     _validate_required(df)
@@ -130,72 +132,6 @@ def build_event_indexes(
     return out_index, in_index, step_index, out_steps
 
     
-
-   
-def build_event_indexes(
-    event_df: pd.DataFrame,
-    src_col: str = "src_node",
-    dst_col: str = "dst_node",
-    step_col: str = "step",
-    amount_col: str = "amount",
-    alert_col: str = "is_sar",
-) -> tuple[dict, dict, dict, dict]:
-    """
-    Build search indexes and pre-computed step arrays for optimized motif mining.
-
-    This function performs a single O(n) pass to build graph adjacency lists and 
-    pre-calculates step arrays to enable O(log n) binary search in matchers.
-
-    Returns
-    -------
-    out_index  : {node: [EventDict, ...]}
-    in_index   : {node: [EventDict, ...]}
-    step_index : {step: [EventDict, ...]}
-    out_steps  : {node: [int, ...]} - Pre-computed step lists for fast bisect.
-    """
-    
-    # Move to CPU/Pandas immediately to avoid GPU-to-CPU overhead during iteration
-    if hasattr(event_df, "to_pandas"):
-        event_df = event_df.to_pandas()
-
-    # --- FIX WARNING 4: Defensive Integrity Guard ---
-    # Validate monotonicity after pandas conversion but before indexing.
-    if os.getenv("MOTIF_DEBUG") == "1":
-        if not event_df[step_col].is_monotonic_increasing:
-            raise ValueError(
-                f"CRITICAL DATA ERROR: event_df must be sorted by '{step_col}' before indexing. "
-                "Unsorted data will cause binary search (bisect) to return silent failures."
-            )
-
-    df = _normalize_columns(event_df, src_col, dst_col, step_col, amount_col, alert_col)
-    df = _ensure_event_id(df)
-    _validate_required(df)
-
-    has_alert = "is_sar" in df.columns
-    out_index:  dict = defaultdict(list)
-    in_index:   dict = defaultdict(list)
-    step_index: dict = defaultdict(list)
-
-    # Single O(n) pass to build core adjacency structures
-    for row in df.itertuples(index=False):
-        e: EventDict = {
-            "event_id": int(row.event_id),
-            "step":     int(row.step),
-            "src":      int(row.src_node),
-            "dst":      int(row.dst_node),
-            "amount":   float(row.amount),
-            "is_sar":   int(row.is_sar) if has_alert else 0,
-        }
-        out_index[e["src"]].append(e)
-        in_index[e["dst"]].append(e)
-        step_index[e["step"]].append(e)
-
-    # Freeze to regular dicts to avoid accidental key creation/memory leaks
-    out_index  = dict(out_index)
-    in_index   = dict(in_index)
-    step_index = dict(step_index)
-
-
 # ---------------------------------------------------------------------------
 # Forward-only lookup helper
 # ---------------------------------------------------------------------------

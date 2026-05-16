@@ -247,6 +247,7 @@ def apply_weighting(
     node_out = edges.groupby(src_col)[weight_col].sum().rename("node_out")
     node_in  = edges.groupby(dst_col)[weight_col].sum().rename("node_in")
     edges = edges.join(node_out, on=src_col).join(node_in, on=dst_col)
+    w = edges[weight_col].to_numpy().astype(np.float64)   
     money_factor = np.exp(
         -cfg.alpha * np.abs(
             np.log((edges["node_out"].to_numpy() / (edges["node_in"].to_numpy() + 1e-9)) + 1e-9)
