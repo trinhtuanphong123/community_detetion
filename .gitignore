@@ -1,0 +1,18 @@
+# --- Cấu hình cho Vibe Coding / AI Tools ---
+.agents/
+.claude/
+.cursor/
+.windsurf/
+
+# --- Cấu hình cho môi trường Python/Data Science ---
+.venv/
+venv/
+env/
+__pycache__/
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Cấu hình cho Hệ điều hành & IDE ---
+.vscode/
+.DS_Store
+Thumbs.db
