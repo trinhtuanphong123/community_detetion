@@ -1,33 +1,3 @@
-# CELL 0 — Environment setup for 02_motif_pipeline.ipynb
-# Run ONCE, restart the Colab runtime, then run Cells 1-6.
-# Prerequisite: 01_graph_pipeline.ipynb Cell 6 must have saved
-#   temporal_edges.parquet to OUTPUT_DIR on Google Drive.
-
-# 1. Install RAPIDS cuDF for T4 GPU (no-op if already installed)
-try:
-    import cudf  # noqa: F401
-    print('cuDF already available.')
-except ImportError:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet',
-                           'cudf-cu12', '--extra-index-url', 'https://pypi.nvidia.com'])
-    print('cuDF installed. RESTART the Colab runtime now, then re-run all cells.')
-
-# 2. Mount Google Drive (idempotent — skipped if already mounted)
-import os
-if not os.path.isdir('/content/drive/MyDrive'):
-    from google.colab import drive
-    drive.mount('/content/drive')
-    print('Drive mounted.')
-else:
-    print('Drive already mounted.')
-
-
-
-
-cell 1: 
-
-
 from dataclasses import dataclass, field
 from typing import List
 
@@ -180,13 +150,25 @@ class MotifConfig:
         default_factory=lambda: [7]
     )
 
+    # New: explicit matcher execution control
+    enabled_matchers: List[str] = field(
+        default_factory=lambda: ["fanin", "fanout", "relay4"]
+    )
+
+    # New: candidate-window selection control
+    candidate_window_mode: str = "top_k"
+    top_k_windows: int = 10
+    window_score_threshold: float = 0.0
+    max_windows_exact: int = 10
+
+    # New: export policy
+    export_instances: bool = False
+
 
 __all__ = [
     "MotifConfig",
 ]
 
-
-cell 2:
 
 """
 cell 2 — Event indexing + temporal shard loading for selective motif mining.
@@ -612,7 +594,6 @@ __all__ = [
 ]
 
 
-cell 3:
 
 """
 cell 3 — Exact temporal motif matchers for AML detection.
@@ -1123,46 +1104,29 @@ def run_all_matchers(
     cfg: MotifConfig,
     out_steps: dict[int, list[dict]],
 ) -> list[dict]:
-    """
-    Run the currently enabled exact matchers and combine their outputs.
+    enabled = set(getattr(cfg, "enabled_matchers", ["fanin", "fanout", "relay4"]))
 
-    Important
-    ---------
-    Despite the historical function name, this runner does NOT currently
-    execute every matcher defined in this cell.
-
-    Active by default
-    -----------------
-    - fanin
-    - fanout
-    - relay4
-
-    Currently disabled in the orchestration
-    ---------------------------------------
-    - cycle3
-    - split_merge
-
-    Those disabled matchers remain available and can be re-enabled later,
-    but they are excluded here to keep runtime and memory within bounds
-    during selective exact mining.
-
-    Memory guard
-    ------------
-    If cfg.max_instances > 0, each active matcher's output is truncated
-    before concatenation.
-    """
-    matchers = {
-        "fanin": find_fanin(in_index, cfg),
-        "fanout": find_fanout(out_index, cfg, out_steps),
-        # "cycle3": find_cycle3(out_index, cfg, out_steps),
-        "relay4": find_relay4(out_index, cfg, out_steps),
-        # "split_merge": find_split_merge(out_index, in_index, cfg, out_steps),
+    available = {
+        "fanin": lambda: find_fanin(in_index, cfg),
+        "fanout": lambda: find_fanout(out_index, cfg, out_steps),
+        "cycle3": lambda: find_cycle3(out_index, cfg, out_steps),
+        "relay4": lambda: find_relay4(out_index, cfg, out_steps),
+        "split_merge": lambda: find_split_merge(out_index, in_index, cfg, out_steps),
     }
+
+    unknown = enabled - set(available.keys())
+    if unknown:
+        raise ValueError(f"Unknown matchers in cfg.enabled_matchers: {sorted(unknown)}")
 
     combined = []
     cap = cfg.max_instances if cfg.max_instances > 0 else None
 
-    for mtype, instances in matchers.items():
+    for mtype in ["fanin", "fanout", "cycle3", "relay4", "split_merge"]:
+        if mtype not in enabled:
+            continue
+
+        instances = available[mtype]()
+
         if cap and len(instances) > cap:
             print(
                 f"  [WARN] {mtype}: {len(instances):,} instances exceed "
@@ -1175,17 +1139,6 @@ def run_all_matchers(
     return combined
 
 
-__all__ = [
-    "find_fanin",
-    "find_fanout",
-    "find_cycle3",
-    "find_relay4",
-    "find_split_merge",
-    "run_all_matchers",
-]
-
-
-cell 4:
 
 """
 cell 4 — Candidate selection + motif scoring + selective null-model evaluation.
@@ -1222,6 +1175,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1595,119 @@ def mine_candidate_windows(
     summary_df = pd.DataFrame(summaries)
     return all_instances, summary_df
 
+def run_exact_motif_feature_pipeline(
+    cfg: MotifConfig,
+    meta_path: str | Path = WINDOW_META_PATH,
+    temporal_shard_dir: str | Path = TEMPORAL_SHARD_DIR,
+    window_risk_df: pd.DataFrame | None = None,
+    run_null_model: bool = False,
+    null_sample_frac: float = 1.0,
+    null_cap: int = 10_000,
+    export_dir: str | Path | None = None,
+    feature_format: str = "parquet",
+    instance_format: str = "parquet",
+    window_size: int = 7,
+    verbose: bool = True,
+):
+    """
+    Complete Stage B exact motif branch:
+      1. select candidate windows
+      2. run exact motif mining
+      3. convert motif instances into Cell 5 feature outputs
+      4. export feature tables as the primary artifact
+    """
+    all_instances, summary_df = mine_candidate_windows(
+        cfg=cfg,
+        meta_path=meta_path,
+        temporal_shard_dir=temporal_shard_dir,
+        window_risk_df=window_risk_df,
+        run_null_model=run_null_model,
+        null_sample_frac=null_sample_frac,
+        null_cap=null_cap,
+        verbose=verbose,
+    )
+
+    motif_instances_by_window: dict[str, list[dict]] = {}
+    zscore_by_window: dict[str, dict] = {}
+
+    # Re-run summary collection by window for export compatibility
+    selected = select_candidate_windows(
+        load_windows_meta(meta_path),
+        cfg=cfg,
+        window_risk_df=window_risk_df,
+    )
+
+    for row in selected.itertuples(index=False):
+        step_start = int(row.start)
+        step_end = int(row.end)
+        window_key = f"w_{step_start}_{step_end}"
+
+        event_df = load_event_window_from_temporal_shard(
+            step_start=step_start,
+            step_end=step_end,
+            shard_dir=temporal_shard_dir,
+        )
+
+        out_idx, in_idx, _, out_steps = build_event_indexes(event_df)
+        raw_instances = run_all_matchers(out_idx, in_idx, cfg, out_steps)
+        observed_counts = count_support(raw_instances)
+
+        zscore_results = None
+        if run_null_model and observed_counts:
+            zscore_results = compute_null_zscore(
+                observed_counts=observed_counts,
+                event_df=event_df,
+                cfg=cfg,
+                sample_frac=null_sample_frac,
+                null_cap=null_cap,
+                verbose=False,
+            )
+
+        filtered_instances = filter_motifs(
+            raw_instances,
+            cfg,
+            zscore_results=zscore_results,
+        )
+
+        motif_instances_by_window[window_key] = filtered_instances
+        zscore_by_window[window_key] = zscore_results or {}
+
+        del event_df, out_idx, in_idx, out_steps, raw_instances, filtered_instances
+        gc.collect()
+
+    export_paths = export_motif_feature_outputs(
+        window_summary_df=summary_df,
+        motif_instances_by_window=motif_instances_by_window,
+        zscore_by_window=zscore_by_window,
+        node_degree_by_window=None,
+        total_volume_by_window=None,
+        export_dir=export_dir,
+        export_instances=getattr(cfg, "export_instances", False),
+        instance_format=instance_format,
+        feature_format=feature_format,
+        window_size=window_size,
+    )
+
+    return {
+        "all_instances": all_instances,
+        "summary_df": summary_df,
+        "export_paths": export_paths,
+    }
+def narrow_candidate_event_df(
+    event_df: pd.DataFrame,
+    top_nodes: set[int],
+    ) -> pd.DataFrame:
+    """
+    Keep only events touching the selected high-risk nodes.
+    """
+    mask = event_df["src_node"].isin(top_nodes) | event_df["dst_node"].isin(top_nodes)
+    narrowed = event_df.loc[mask].copy()
+
+    if not narrowed.empty:
+        narrowed = narrowed.sort_values(["step", "event_id"]).reset_index(drop=True)
+
+    return narrowed
+
 
 __all__ = [
     "count_support",
@@ -1651,7 +1719,6 @@ __all__ = [
 ]
 
 
-cell 5:
 
 from __future__ import annotations
 
@@ -2038,7 +2105,6 @@ __all__ = [
 ]
 
 
-cell 6:
 
 # ============================================================
 # CELL 6 — Stage A Global Screening + Optional Motif Merge
@@ -2047,10 +2113,11 @@ cell 6:
 # -------
 # This cell is the scalable screening layer of the pipeline.
 #
-# It does three things:
+# It does four things:
 #   1. Build vectorized node-level graph proxy features from transactions.parquet
-#   2. Build window-level risk summaries for candidate-window selection
-#   3. Optionally merge exact motif features from Cell 5 if they exist
+#   2. Train a lightweight Stage A screening model and score node-window rows
+#   3. Build window-level risk summaries for candidate-window selection
+#   4. Optionally merge exact motif features from Cell 5 if they exist
 #
 # Design rule
 # -----------
@@ -2060,6 +2127,7 @@ cell 6:
 # Output
 # ------
 # outputs/screening/
+#   - node_window_features.parquet      <- NEW: needed by Cell 7 Stage B narrowing
 #   - node_proxy_features.parquet
 #   - node_screening_features.parquet
 #   - window_risk_summary.parquet
@@ -2093,7 +2161,6 @@ TX_PATH = OUTPUT_DIR / "transactions.parquet"
 WINDOW_SIZE = 7
 MERGE_MOTIF_FEATURES = True
 
-# Expected optional motif feature export from Cell 5
 MOTIF_WIDE_PATH = MOTIF_FEATURE_DIR / "entity_feature_wide_merged.parquet"
 
 SCREEN_DIR.mkdir(parents=True, exist_ok=True)
@@ -2130,7 +2197,6 @@ print(
     f"sar_rate={tx['is_sar'].mean()*100:.3f}%"
 )
 
-# Keep labels separate so the scalable screening branch stays label-safe.
 labels_src = tx[["src_node", "is_sar"]].copy()
 labels_dst = tx[["dst_node", "is_sar"]].copy()
 df_feats = tx.drop(columns=["is_sar"]).copy()
@@ -2140,25 +2206,15 @@ step_max = int(df_feats["step"].max())
 
 
 # ============================================================
-# Step 2 — Window-level proxy features + window risk summary
+# Step 2 — Window-level proxy features
 # ============================================================
 
 print(f"\n[2/6] Computing scalable proxy features (window={WINDOW_SIZE})...")
 
 all_node_parts = []
-window_rows = []
 
 
-def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataFrame, dict]:
-    """
-    Build one window's node-level proxy features plus one window-level
-    screening summary row.
-
-    This function is intentionally label-free.
-    """
-    # --------------------------------------------------------
-    # Outgoing aggregates
-    # --------------------------------------------------------
+def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> pd.DataFrame:
     out = (
         wdf.groupby("src_node")
         .agg(
@@ -2175,9 +2231,6 @@ def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataF
         .rename(columns={"src_node": "node"})
     )
 
-    # --------------------------------------------------------
-    # Incoming aggregates
-    # --------------------------------------------------------
     inc = (
         wdf.groupby("dst_node")
         .agg(
@@ -2196,12 +2249,8 @@ def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataF
 
     feat = pd.merge(out, inc, on="node", how="outer").fillna(0)
 
-    # --------------------------------------------------------
-    # Structural proxies
-    # --------------------------------------------------------
     feat["fanout_score"] = feat["out_n_unique_dst"] / (feat["out_count"] + 1e-6)
     feat["fanin_score"] = feat["in_n_unique_src"] / (feat["in_count"] + 1e-6)
-
     feat["gather_scatter_score"] = feat["fanin_score"] * feat["fanout_score"]
 
     feat["relay_flag"] = (
@@ -2214,9 +2263,6 @@ def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataF
     feat["out_velocity"] = feat["out_count"] / WINDOW_SIZE
     feat["in_velocity"] = feat["in_count"] / WINDOW_SIZE
 
-    # --------------------------------------------------------
-    # Concentration proxies
-    # --------------------------------------------------------
     out_by_dst = (
         wdf.groupby(["src_node", "dst_node"])["amount"]
         .sum()
@@ -2267,9 +2313,6 @@ def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataF
 
     del inc_by_src, ihhi_num, ihhi_den, ihhi
 
-    # --------------------------------------------------------
-    # Cycle proxy
-    # --------------------------------------------------------
     src_to_dsts = wdf.groupby("src_node")["dst_node"].apply(set)
     dst_to_srcs = wdf.groupby("dst_node")["src_node"].apply(set)
     common_nodes = src_to_dsts.index.intersection(dst_to_srcs.index)
@@ -2285,54 +2328,10 @@ def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataF
         feat["cycle_proxy"] = 0.0
 
     feat["cycle_proxy"] = feat["cycle_proxy"].fillna(0)
-
-    del src_to_dsts, dst_to_srcs
-
-    # --------------------------------------------------------
-    # Window metadata
-    # --------------------------------------------------------
     feat["window_start"] = ws
     feat["window_end"] = we
 
-    # --------------------------------------------------------
-    # Node-level screening score
-    # --------------------------------------------------------
-    # Cheap, label-free heuristic score used for global screening.
-    feat["node_screening_score"] = (
-        1.25 * feat["relay_flag"]
-        + 0.90 * feat["gather_scatter_score"]
-        + 0.60 * feat["cycle_proxy"]
-        + 0.50 * feat["amount_preservation"].clip(lower=-5, upper=1)
-        + 0.40 * feat["out_concentration"]
-        + 0.40 * feat["in_concentration"]
-        + 0.30 * feat["out_velocity"]
-        + 0.30 * feat["in_velocity"]
-    )
-
-    # --------------------------------------------------------
-    # Window-level risk summary
-    # --------------------------------------------------------
-    risk_row = {
-        "start": int(ws),
-        "end": int(we),
-        "n_tx": int(len(wdf)),
-        "n_nodes": int(feat["node"].nunique()),
-        "mean_node_score": float(feat["node_screening_score"].mean()) if len(feat) else 0.0,
-        "max_node_score": float(feat["node_screening_score"].max()) if len(feat) else 0.0,
-        "mean_relay_flag": float(feat["relay_flag"].mean()) if len(feat) else 0.0,
-        "mean_cycle_proxy": float(feat["cycle_proxy"].mean()) if len(feat) else 0.0,
-        "mean_gather_scatter": float(feat["gather_scatter_score"].mean()) if len(feat) else 0.0,
-        "window_risk_score": float(
-            (
-                0.45 * feat["node_screening_score"].mean()
-                + 0.35 * feat["node_screening_score"].quantile(0.95)
-                + 0.20 * np.log1p(len(wdf))
-            )
-            if len(feat) else 0.0
-        ),
-    }
-
-    return feat, risk_row
+    return feat
 
 
 for ws in range(step_min, step_max + 1, WINDOW_SIZE):
@@ -2342,27 +2341,101 @@ for ws in range(step_min, step_max + 1, WINDOW_SIZE):
     if wdf.empty:
         continue
 
-    feat, risk_row = _window_node_features(wdf, ws, we)
-
+    feat = _window_node_features(wdf, ws, we)
     all_node_parts.append(feat)
-    window_rows.append(risk_row)
 
     del wdf, feat
     gc.collect()
     print(f"      processed window [{ws:3d}-{we:3d}]", end="\r")
 
-print(f"\n      windows processed: {len(window_rows):,}")
+print(f"\n      windows processed: {len(all_node_parts):,}")
 
 
 # ============================================================
-# Step 3 — Aggregate node features across windows
+# Step 3 — Train lightweight Stage A screening model first
 # ============================================================
 
-print("\n[3/6] Aggregating node-level screening features across windows...")
+print("\n[3/6] Training lightweight Stage A screening model...")
 
 all_node_feats = pd.concat(all_node_parts, ignore_index=True)
 del all_node_parts
 gc.collect()
+
+labels_src_node = tx[["src_node", "is_sar"]].rename(columns={"src_node": "node"})
+labels_dst_node = tx[["dst_node", "is_sar"]].rename(columns={"dst_node": "node"})
+
+node_labels = (
+    pd.concat([labels_src_node, labels_dst_node], ignore_index=True)
+    .groupby("node", as_index=False)["is_sar"]
+    .max()
+    .rename(columns={"is_sar": "label"})
+)
+
+screen_train_df = all_node_feats.merge(node_labels, on="node", how="left")
+screen_train_df["label"] = screen_train_df["label"].fillna(0).astype(np.int8)
+
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+
+screen_exclude = {"node", "window_start", "window_end", "label"}
+screen_feature_cols = [c for c in screen_train_df.columns if c not in screen_exclude]
+
+X_screen = screen_train_df[screen_feature_cols].values.astype(np.float32)
+y_screen = screen_train_df["label"].values.astype(np.int8)
+
+X_sc_tr, X_sc_va, y_sc_tr, y_sc_va = train_test_split(
+    X_screen,
+    y_screen,
+    test_size=0.20,
+    stratify=y_screen,
+    random_state=42,
+)
+
+n_pos_sc = int(y_sc_tr.sum())
+n_neg_sc = int(len(y_sc_tr) - n_pos_sc)
+scale_pos_sc = float(n_neg_sc) / float(n_pos_sc + 1e-9)
+
+screen_model = xgb.XGBClassifier(
+    n_estimators=250,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.7,
+    colsample_bytree=0.7,
+    min_child_weight=10,
+    scale_pos_weight=scale_pos_sc,
+    eval_metric="aucpr",
+    early_stopping_rounds=20,
+    random_state=42,
+    tree_method="hist",
+    n_jobs=-1,
+    reg_alpha=0.1,
+    reg_lambda=2.0,
+)
+
+screen_model.fit(
+    X_sc_tr,
+    y_sc_tr,
+    eval_set=[(X_sc_va, y_sc_va)],
+    verbose=False,
+)
+
+y_sc_va_prob = screen_model.predict_proba(X_sc_va)[:, 1]
+print(
+    f"      Stage A val ROC-AUC={roc_auc_score(y_sc_va, y_sc_va_prob):.4f} | "
+    f"PR-AUC={average_precision_score(y_sc_va, y_sc_va_prob):.4f}"
+)
+
+all_node_feats["node_screening_score"] = screen_model.predict_proba(
+    all_node_feats[screen_feature_cols].values.astype(np.float32)
+)[:, 1]
+
+
+# ============================================================
+# Step 3.5 — Aggregate node features across windows
+# ============================================================
+
+print("\n[3.5/6] Aggregating node-level screening features across windows...")
 
 agg_exclude = {"node", "window_start", "window_end"}
 agg_cols = [c for c in all_node_feats.columns if c not in agg_exclude]
@@ -2379,10 +2452,9 @@ node_proxy_features.columns = [
 ]
 node_proxy_features = node_proxy_features.reset_index()
 
-# Attach label only at the end
 sar_nodes = set(
-    labels_src[labels_src["is_sar"] == 1]["src_node"].tolist()
-    + labels_dst[labels_dst["is_sar"] == 1]["dst_node"].tolist()
+    labels_src_node[labels_src_node["is_sar"] == 1]["node"].tolist()
+    + labels_dst_node[labels_dst_node["is_sar"] == 1]["node"].tolist()
 )
 node_proxy_features["label"] = (
     node_proxy_features["node"].isin(sar_nodes).astype(np.int8)
@@ -2397,7 +2469,43 @@ print(f"      node_proxy_features shape: {node_proxy_features.shape}")
 
 print("\n[4/6] Building window risk summary...")
 
-window_risk_summary = pd.DataFrame(window_rows).sort_values(["start", "end"]).reset_index(drop=True)
+window_risk_summary = (
+    all_node_feats.groupby(["window_start", "window_end"], as_index=False)
+    .agg(
+        n_nodes=("node", "nunique"),
+        mean_node_score=("node_screening_score", "mean"),
+        max_node_score=("node_screening_score", "max"),
+        p95_node_score=("node_screening_score", lambda x: float(np.quantile(x, 0.95))),
+        mean_relay_flag=("relay_flag", "mean"),
+        mean_cycle_proxy=("cycle_proxy", "mean"),
+        mean_gather_scatter=("gather_scatter_score", "mean"),
+    )
+)
+
+window_tx = (
+    tx.assign(window_start=(tx["step"] // WINDOW_SIZE) * WINDOW_SIZE)
+      .groupby("window_start", as_index=False)
+      .agg(n_tx=("amount", "count"))
+)
+window_tx["window_end"] = window_tx["window_start"] + WINDOW_SIZE - 1
+
+window_risk_summary = window_risk_summary.merge(
+    window_tx[["window_start", "window_end", "n_tx"]],
+    on=["window_start", "window_end"],
+    how="left",
+).fillna({"n_tx": 0})
+
+window_risk_summary["window_risk_score"] = (
+    0.50 * window_risk_summary["mean_node_score"]
+    + 0.35 * window_risk_summary["p95_node_score"]
+    + 0.15 * np.log1p(window_risk_summary["n_tx"])
+)
+
+window_risk_summary = (
+    window_risk_summary.rename(columns={"window_start": "start", "window_end": "end"})
+    .sort_values(["start", "end"])
+    .reset_index(drop=True)
+)
 
 print(f"      window_risk_summary shape: {window_risk_summary.shape}")
 print("      top risk windows:")
@@ -2448,11 +2556,15 @@ else:
 
 print("\n[6/6] Saving screening artifacts...")
 
+# NEW: save per-window node rows for Stage B narrowing in Cell 7
+node_window_path = SCREEN_DIR / "node_window_features.parquet"
+
 node_proxy_path = SCREEN_DIR / "node_proxy_features.parquet"
 node_screening_path = SCREEN_DIR / "node_screening_features.parquet"
 window_risk_path = SCREEN_DIR / "window_risk_summary.parquet"
 feature_cols_path = SCREEN_DIR / "feature_columns_screening.json"
 
+all_node_feats.to_parquet(node_window_path, index=False)
 node_proxy_features.to_parquet(node_proxy_path, index=False)
 node_screening_features.to_parquet(node_screening_path, index=False)
 window_risk_summary.to_parquet(window_risk_path, index=False)
@@ -2466,6 +2578,7 @@ with open(feature_cols_path, "w") as f:
 
 print("Artifacts saved:")
 for lbl, path in [
+    ("node_window_features", node_window_path),
     ("node_proxy_features", node_proxy_path),
     ("node_screening_features", node_screening_path),
     ("window_risk_summary", window_risk_path),
@@ -2474,9 +2587,10 @@ for lbl, path in [
     print(f"   [{lbl:<24}] {path} ({os.path.getsize(path)/1024:.1f} KB)")
 
 print("\nSummary:")
-print(f"   nodes total         : {len(node_screening_features):,}")
-print(f"   positives           : {int(node_screening_features['label'].sum()):,}")
-print(f"   motif merge applied : {motif_merge_done}")
+print(f"   node-window rows     : {len(all_node_feats):,}")
+print(f"   nodes total          : {len(node_screening_features):,}")
+print(f"   positives            : {int(node_screening_features['label'].sum()):,}")
+print(f"   motif merge applied  : {motif_merge_done}")
 
 del tx, df_feats, labels_src, labels_dst
 del all_node_feats, node_proxy_features, node_screening_features, window_risk_summary
@@ -2487,42 +2601,11 @@ print("\nDone.")
 
 
 
-cell 7: 
-
-# ============================================================
-# CELL 7 — Stage A + Optional Motif Support + XGBoost
-#
-# Inputs
-# ------
-# 1. outputs/screening/node_screening_features.parquet
-#    Main scalable screening features from Cell 6
-#
-# 2. outputs/screening/window_risk_summary.parquet
-#    Used upstream by Cell 4; not required for training here
-#
-# 3. outputs/transactions.parquet
-#    Used to derive AMLGentex-style subwindow transaction features
-#
-# 4. outputs/motif_features/entity_feature_wide_merged.parquet  (optional)
-#    Exact motif-derived node features from Cell 5
-#
-# Design
-# ------
-# - Cell 6 = Stage A global screening
-# - Cells 2–5 = Stage B selective exact motif evidence
-# - Cell 7 = final model integration
-#
-# Evaluation
-# ----------
-# - stratified node split
-# - threshold selected on validation only
-# - test used once for final holdout evaluation
-# ============================================================
-
 import gc
 import json
 import os
 import warnings
+from collections import defaultdict
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -2551,83 +2634,105 @@ except ImportError:
 # USER CONFIG
 # ============================================================
 
-OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
-SCREEN_DIR = OUTPUT_DIR / "screening"
-MOTIF_FEATURE_DIR = OUTPUT_DIR / "motif_features"
-MODEL_DIR = OUTPUT_DIR / "model"
+OUTPUT_DIR   = Path("/content/drive/MyDrive/AML/outputs")
+SCREEN_DIR   = OUTPUT_DIR / "screening"
+MOTIF_DIR    = OUTPUT_DIR / "motif_features"
+MODEL_DIR    = OUTPUT_DIR / "model"
 
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-TX_PATH = OUTPUT_DIR / "transactions.parquet"
-SCREEN_FEATURE_PATH = SCREEN_DIR / "node_screening_features.parquet"
-MOTIF_WIDE_PATH = MOTIF_FEATURE_DIR / "entity_feature_wide_merged.parquet"
+TX_PATH                 = OUTPUT_DIR / "transactions.parquet"
+SCREEN_FEATURE_PATH     = SCREEN_DIR / "node_screening_features.parquet"
+WINDOW_RISK_PATH        = SCREEN_DIR / "window_risk_summary.parquet"
+NODE_WINDOW_PATH        = SCREEN_DIR / "node_window_features.parquet"
+MOTIF_WIDE_PATH         = MOTIF_DIR  / "entity_feature_wide_merged.parquet"
 
-USE_MOTIF_FEATURES = True
+# Stage B
+RUN_STAGE_B             = True
+RUN_NULL_MODEL          = False
 
-# AMLGentex-style subwindow setup
-N_SUBWINDOWS = 4
-TOTAL_STEPS = 112
-SUB_WIN_SIZE = TOTAL_STEPS // N_SUBWINDOWS
+# Narrowing controls for Stage B
+TOP_K_WINDOWS_STAGE_B   = 3
+TOP_NODES_PER_WINDOW    = 500
+EXACT_WINDOW_SIZE       = 7
+EXACT_WINDOW_STRIDE     = 7
+
+# Safer matcher execution defaults
+DEFAULT_ENABLED_MATCHERS = ["fanin", "fanout", "relay4"]
+MAX_INSTANCES_STAGE_B    = 3000
+
+# Subwindow config for transaction features
+N_SUBWINDOWS            = 4
 
 # Split
-TEST_SIZE = 0.20
-VAL_SIZE = 0.15
-RANDOM_STATE = 42
+TEST_SIZE               = 0.20
+VAL_SIZE                = 0.15
+RANDOM_STATE            = 42
 
 # XGBoost
-N_ESTIMATORS = 500
-EARLY_STOP = 30
+N_ESTIMATORS            = 500
+EARLY_STOP              = 30
 
-# Operating point target
-RECALL_TARGET = 0.60
-
-
-# ============================================================
-# Step 1 — Load base inputs
-# ============================================================
-
-print("[1/7] Loading inputs...")
-
-tx = pd.read_parquet(TX_PATH)
-tx["src_node"] = tx["src_node"].astype(np.int64)
-tx["dst_node"] = tx["dst_node"].astype(np.int64)
-tx["step"] = tx["step"].astype(np.int32)
-tx["amount"] = tx["amount"].astype(np.float32)
-
-if "is_sar" not in tx.columns:
-    tx["is_sar"] = np.int8(0)
-else:
-    tx["is_sar"] = tx["is_sar"].astype(np.int8)
-
-screen_feats = pd.read_parquet(SCREEN_FEATURE_PATH)
-
-print(f"      transactions   : {len(tx):,}")
-print(f"      screen_feats   : {screen_feats.shape}")
-
-if "node" not in screen_feats.columns:
-    raise ValueError("node_screening_features.parquet must contain a 'node' column")
-
-if "label" not in screen_feats.columns:
-    raise ValueError("node_screening_features.parquet must contain a 'label' column")
-
-df_feats = tx.drop(columns=["is_sar"])
-print("      label column   : isolated from transaction feature construction")
+# Operating point
+RECALL_TARGET           = 0.60
 
 
 # ============================================================
-# Step 2 — AMLGentex-style subwindow transaction features
+# Internal helpers
 # ============================================================
 
-print(f"\n[2/7] Building AMLGentex-style subwindow features "
-      f"(m={N_SUBWINDOWS} × {SUB_WIN_SIZE} steps)...")
+def _partition_instances_by_window(
+    instances: list,
+    summary_df: pd.DataFrame,
+) -> dict:
+    windows = [
+        (f"{int(r.start)}_{int(r.end)}", int(r.start), int(r.end))
+        for r in summary_df.itertuples(index=False)
+    ]
+
+    partitioned = defaultdict(list)
+
+    for inst in instances:
+        steps = inst.get("steps", [])
+        first_step = int(min(steps)) if steps else -1
+        assigned = False
+
+        for wk, ws, we in windows:
+            if ws <= first_step <= we:
+                partitioned[wk].append(inst)
+                assigned = True
+                break
+
+        if not assigned:
+            partitioned["unassigned"].append(inst)
+
+    if partitioned.get("unassigned"):
+        print(
+            f"  [WARN] {len(partitioned['unassigned'])} instances could not be "
+            "assigned to any candidate window and were placed under 'unassigned'."
+        )
+
+    return dict(partitioned)
+
+
+def _node_degree_from_tx(tx_df: pd.DataFrame) -> dict:
+    out_deg = tx_df.groupby("src_node").size().rename("out")
+    in_deg  = tx_df.groupby("dst_node").size().rename("in")
+    deg = (
+        pd.concat([out_deg, in_deg], axis=1)
+        .fillna(0)
+        .assign(degree=lambda d: d["out"] + d["in"])["degree"]
+    )
+    return deg.astype(int).to_dict()
+
 
 def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
+    # 1. Tính toán Outgoing
     out = (
         wdf.groupby("src_node")["amount"]
         .agg(
             sum_spending="sum",
             mean_spending="mean",
-            median_spending="median",
             std_spending="std",
             max_spending="max",
             min_spending="min",
@@ -2637,17 +2742,19 @@ def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
         .rename(columns={"src_node": "node"})
     )
 
-    both_amounts = pd.concat([
-        wdf[["src_node", "amount"]].rename(columns={"src_node": "node"}),
-        wdf[["dst_node", "amount"]].rename(columns={"dst_node": "node"}),
-    ], ignore_index=True)
+    # 2. Tạo both_amounts và giải phóng bộ nhớ
+    src_df = wdf[["src_node", "amount"]].rename(columns={"src_node": "node"})
+    dst_df = wdf[["dst_node", "amount"]].rename(columns={"dst_node": "node"})
+    both_amounts = pd.concat([src_df, dst_df], ignore_index=True)
+    del src_df, dst_df
+    gc.collect()
 
+    # 3. Tính toán Total
     total_stats = (
         both_amounts.groupby("node")["amount"]
         .agg(
             total_sum="sum",
             total_mean="mean",
-            total_median="median",
             total_std="std",
             total_max="max",
             total_min="min",
@@ -2655,79 +2762,483 @@ def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
         .reset_index()
     )
 
-    count_in = (
-        wdf.groupby("dst_node")
-        .size()
-        .rename("count_in")
-        .reset_index()
-        .rename(columns={"dst_node": "node"})
-    )
-
-    count_out = (
-        wdf.groupby("src_node")
-        .size()
-        .rename("count_out")
-        .reset_index()
-        .rename(columns={"src_node": "node"})
-    )
-
-    uniq_in = (
-        wdf.groupby("dst_node")["src_node"]
-        .nunique()
-        .rename("count_unique_in")
-        .reset_index()
-        .rename(columns={"dst_node": "node"})
-    )
-
-    uniq_out = (
-        wdf.groupby("src_node")["dst_node"]
-        .nunique()
-        .rename("count_unique_out")
-        .reset_index()
-        .rename(columns={"src_node": "node"})
-    )
-
-    step_range = (
-        pd.concat([
-            wdf[["src_node", "step"]].rename(columns={"src_node": "node"}),
-            wdf[["dst_node", "step"]].rename(columns={"dst_node": "node"}),
-        ])
-        .groupby("node")["step"]
-        .agg(step_first="min", step_last="max")
-        .reset_index()
-    )
-    step_range["days_active"] = step_range["step_last"] - step_range["step_first"] + 1
-
+    # 4. Lấy danh sách Node duy nhất
     node_ids = pd.DataFrame({"node": both_amounts["node"].unique()}, dtype=np.int64)
+    del both_amounts
+    gc.collect()
 
-    merged = (
-        node_ids
-        .merge(out, on="node", how="left")
-        .merge(total_stats, on="node", how="left")
-        .merge(count_in, on="node", how="left")
-        .merge(count_out, on="node", how="left")
-        .merge(uniq_in, on="node", how="left")
-        .merge(uniq_out, on="node", how="left")
-        .merge(step_range[["node", "days_active"]], on="node", how="left")
-        .fillna(0)
-    )
+    # 5. Đếm và Unique
+    count_in = wdf.groupby("dst_node").size().rename("count_in").reset_index().rename(columns={"dst_node": "node"})
+    count_out = wdf.groupby("src_node").size().rename("count_out").reset_index().rename(columns={"src_node": "node"})
+    uniq_in = wdf.groupby("dst_node")["src_node"].nunique().rename("count_unique_in").reset_index().rename(columns={"dst_node": "node"})
+    uniq_out = wdf.groupby("src_node")["dst_node"].nunique().rename("count_unique_out").reset_index().rename(columns={"src_node": "node"})
 
-    merged["in_out_count_ratio"] = merged["count_in"] / (merged["count_out"] + 1e-6)
-    merged["spend_total_ratio"] = merged["sum_spending"] / (merged["total_sum"] + 1e-6)
+    # 6. Phạm vi thời gian
+    src_step = wdf[["src_node", "step"]].rename(columns={"src_node": "node"})
+    dst_step = wdf[["dst_node", "step"]].rename(columns={"dst_node": "node"})
+    step_range = pd.concat([src_step, dst_step]).groupby("node")["step"].agg(step_first="min", step_last="max").reset_index()
+    step_range["days_active"] = step_range["step_last"] - step_range["step_first"] + 1
+    del src_step, dst_step
+    gc.collect()
+
+    # 7. Hợp nhất (Merge) từ từ để tránh dồn RAM
+    merged = node_ids.merge(out, on="node", how="left")
+    del out; gc.collect()
+    
+    merged = merged.merge(total_stats, on="node", how="left")
+    del total_stats; gc.collect()
+    
+    merged = merged.merge(count_in, on="node", how="left")
+    del count_in; gc.collect()
+    
+    merged = merged.merge(count_out, on="node", how="left")
+    del count_out; gc.collect()
+    
+    merged = merged.merge(uniq_in, on="node", how="left")
+    del uniq_in; gc.collect()
+    
+    merged = merged.merge(uniq_out, on="node", how="left")
+    del uniq_out; gc.collect()
+    
+    merged = merged.merge(step_range[["node", "days_active"]], on="node", how="left")
+    del step_range; gc.collect()
+    
+    merged = merged.fillna(0)
+
+    # 8. Tính tỷ lệ
+    merged["in_out_count_ratio"]  = merged["count_in"] / (merged["count_out"] + 1e-6)
+    merged["spend_total_ratio"]   = merged["sum_spending"] / (merged["total_sum"] + 1e-6)
     merged["unique_in_out_ratio"] = merged["count_unique_in"] / (merged["count_unique_out"] + 1e-6)
 
+    # 9. Đổi tên cột
     rename = {c: f"{c}{suffix}" for c in merged.columns if c != "node"}
+    
+    # Ép kiểu float32 để giảm một nửa dung lượng
+    for col in rename.values():
+        if col in merged.columns and merged[col].dtype == 'float64':
+             merged[col] = merged[col].astype(np.float32)
+
     return merged.rename(columns=rename)
 
 
+def _threshold_at_recall(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    recall_target: float = 0.60,
+) -> tuple[float, float, float]:
+    prec, rec, thr = precision_recall_curve(y_true, y_prob)
+
+    if len(thr) == 0:
+        return 0.5, 0.0, 0.0
+
+    mask = rec[:-1] >= recall_target
+
+    if not np.any(mask):
+        print(
+            f"  [WARN] Recall target {recall_target:.2f} is unreachable. "
+            "Falling back to the threshold that maximizes recall."
+        )
+        best = int(np.argmax(rec[:-1]))
+        best = min(best, len(thr) - 1)
+        return float(thr[best]), float(prec[:-1][best]), float(rec[:-1][best])
+
+    valid = np.where(mask)[0]
+    best  = valid[np.argmax(prec[:-1][valid])]
+    return float(thr[best]), float(prec[:-1][best]), float(rec[:-1][best])
+
+
+def _compute_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    recall_target: float = 0.60,
+) -> dict:
+    prec, rec, _ = precision_recall_curve(y_true, y_prob)
+    mask = rec[:-1] >= recall_target
+    p_at_r = float(np.max(prec[:-1][mask])) if np.any(mask) else 0.0
+    return {
+        "roc_auc": float(roc_auc_score(y_true, y_prob)),
+        "pr_auc":  float(average_precision_score(y_true, y_prob)),
+        f"p_at_r{int(recall_target*100)}": p_at_r,
+    }
+
+
+def _select_top_nodes_for_window(
+    screen_window_df: pd.DataFrame,
+    top_n: int = 500,
+) -> set[int]:
+    if screen_window_df.empty:
+        return set()
+
+    ranked = (
+        screen_window_df
+        .sort_values("node_screening_score", ascending=False)
+        .head(top_n)
+    )
+
+    return set(ranked["node"].astype(int).tolist())
+
+
+def _narrow_candidate_event_df(
+    event_df: pd.DataFrame,
+    top_nodes: set[int],
+) -> pd.DataFrame:
+    if not top_nodes:
+        return pd.DataFrame(columns=event_df.columns)
+
+    mask = event_df["src_node"].isin(top_nodes) | event_df["dst_node"].isin(top_nodes)
+    narrowed = event_df.loc[mask].copy()
+
+    if not narrowed.empty:
+        narrowed = narrowed.sort_values(["step", "event_id"]).reset_index(drop=True)
+
+    return narrowed
+
+
+def _iter_exact_subwindows(
+    event_df: pd.DataFrame,
+    exact_window_size: int = 7,
+    exact_stride: int = 7,
+):
+    if event_df.empty:
+        return
+
+    step_min = int(event_df["step"].min())
+    step_max = int(event_df["step"].max())
+
+    for ws in range(step_min, step_max + 1, exact_stride):
+        we = ws + exact_window_size - 1
+        sub = event_df[(event_df["step"] >= ws) & (event_df["step"] <= we)]
+        if not sub.empty:
+            yield ws, we, sub.reset_index(drop=True)
+
+
+def _get_super_hubs(event_df: pd.DataFrame, max_degree: int = 1500) -> set[int]:
+    """Tìm các nút siêu trung tâm (ví sàn, cổng thanh toán) có số lượng giao dịch quá lớn."""
+    if event_df.empty:
+        return set()
+    # Đếm số giao dịch gửi đi và nhận về
+    out_counts = event_df["src_node"].value_counts()
+    in_counts = event_df["dst_node"].value_counts()
+    total_counts = out_counts.add(in_counts, fill_value=0)
+    
+    # Trả về các nút có tổng giao dịch vượt ngưỡng max_degree
+    return set(total_counts[total_counts > max_degree].index)
+
+
+# ============================================================
+# Step 1 — Load base inputs
+# ============================================================
+
+print("[1/8] Loading base inputs...")
+
+tx = pd.read_parquet(TX_PATH)
+tx["src_node"] = tx["src_node"].astype(np.int64)
+tx["dst_node"] = tx["dst_node"].astype(np.int64)
+tx["step"]     = tx["step"].astype(np.int32)
+tx["amount"]   = tx["amount"].astype(np.float32)
+
+if "is_sar" not in tx.columns:
+    tx["is_sar"] = np.int8(0)
+else:
+    tx["is_sar"] = tx["is_sar"].astype(np.int8)
+
+screen_feats = pd.read_parquet(SCREEN_FEATURE_PATH)
+
+if "node" not in screen_feats.columns:
+    raise ValueError("node_screening_features.parquet must contain a 'node' column.")
+if "label" not in screen_feats.columns:
+    raise ValueError("node_screening_features.parquet must contain a 'label' column.")
+
+screen_X  = screen_feats.drop(columns=["label"])
+label_map = screen_feats[["node", "label"]].drop_duplicates()
+df_feats  = tx.drop(columns=["is_sar"]).copy()
+
+step_min  = int(df_feats["step"].min())
+step_max  = int(df_feats["step"].max())
+total_vol = float(tx["amount"].sum())
+
+print(f"      transactions        : {len(tx):,} rows")
+print(f"      step range          : {step_min} – {step_max}")
+print(f"      SAR rate            : {tx['is_sar'].mean()*100:.3f}%")
+print(f"      screen_feats shape  : {screen_feats.shape}")
+
+
+# ============================================================
+# Step 2 — Stage B: narrowed exact motif mining
+# ============================================================
+
+print(f"\n[2/8] Stage B — exact motif mining (RUN_STAGE_B={RUN_STAGE_B})...")
+
+motif_wide = None
+stage_b_used = False
+
+if RUN_STAGE_B:
+    if not WINDOW_RISK_PATH.exists():
+        raise FileNotFoundError(
+            f"window_risk_summary.parquet not found: {WINDOW_RISK_PATH}. "
+            "Run Cell 6 before Cell 7."
+        )
+
+    if not NODE_WINDOW_PATH.exists():
+        raise FileNotFoundError(
+            f"node_window_features.parquet not found: {NODE_WINDOW_PATH}. "
+            "Cell 6 should save per-window node screening rows."
+        )
+
+    window_risk_df = pd.read_parquet(WINDOW_RISK_PATH)
+    node_window_df = pd.read_parquet(NODE_WINDOW_PATH)
+
+    print(f"      window_risk_df loaded : {len(window_risk_df)} windows")
+    print(f"      node_window_df loaded : {len(node_window_df):,} node-window rows")
+
+    cfg = MotifConfig()
+    cfg.candidate_window_mode = "top_k"
+    cfg.top_k_windows         = TOP_K_WINDOWS_STAGE_B
+    cfg.max_windows_exact     = TOP_K_WINDOWS_STAGE_B
+    cfg.enabled_matchers      = DEFAULT_ENABLED_MATCHERS
+    cfg.export_instances      = False
+    cfg.max_instances         = MAX_INSTANCES_STAGE_B
+    cfg.n_permutations        = 5 if RUN_NULL_MODEL else 0
+
+    selected = select_candidate_windows(
+        load_windows_meta(WINDOW_META_PATH),
+        cfg=cfg,
+        window_risk_df=window_risk_df,
+    )
+
+    print(f"      Selected {len(selected)} candidate windows")
+
+    all_instances = []
+    summary_rows = []
+
+    for row in selected.itertuples(index=False):
+        step_start = int(row.start)
+        step_end   = int(row.end)
+
+        print(f"\n[Candidate window {int(row.window)}] {step_start}-{step_end} "
+              f"| score={float(row.candidate_score):.3f} | n_temporal={int(row.n_temporal)}")
+
+        event_df = load_event_window_from_temporal_shard(
+            step_start=step_start,
+            step_end=step_end,
+            shard_dir=TEMPORAL_SHARD_DIR,
+        )
+
+
+        # 1. Nhận diện và cô lập các Siêu trung tâm (> 1500 giao dịch/cửa sổ)
+        super_hubs = _get_super_hubs(event_df, max_degree=1500)
+
+        # 2. Lấy dữ liệu screening cho khoảng thời gian này
+        screen_slice = node_window_df[
+            (node_window_df["window_start"] >= step_start) &
+            (node_window_df["window_end"] <= step_end)
+        ]
+
+        if not screen_slice.empty:
+            # Gom nhóm tính điểm trung bình (tránh trùng nút vì 1 candidate window chứa nhiều subwindow 7 bước)
+            agg_screen = screen_slice.groupby("node")["node_screening_score"].mean().reset_index()
+            
+            # KIỂM DUYỆT TÀN NHẪN: Bắn bỏ các siêu trung tâm khỏi danh sách nghi ngờ
+            agg_screen = agg_screen[~agg_screen["node"].isin(super_hubs)]
+            
+            # Chọn top nodes thực sự
+            top_nodes = _select_top_nodes_for_window(agg_screen, top_n=TOP_NODES_PER_WINDOW)
+        else:
+            top_nodes = set()
+
+        # 3. Thu hẹp sự kiện dựa trên top_nodes đã làm sạch
+        narrowed_df = _narrow_candidate_event_df(event_df, top_nodes)
+
+        # 4. CHỐT CHẶN AN TOÀN CUỐI CÙNG (Hard Cap)
+        MAX_SAFE_EVENTS = 50_000
+        if len(narrowed_df) > MAX_SAFE_EVENTS:
+            print(f"      [WARN] narrowed_df quá lớn ({len(narrowed_df):,} edges). Bỏ qua để tránh nổ RAM.")
+            narrowed_df = pd.DataFrame(columns=narrowed_df.columns) # Làm rỗng để skip bên dưới
+
+        print(
+            f"      original events={len(event_df):,} | "
+            f"narrowed events={len(narrowed_df):,} | "
+            f"top_nodes={len(top_nodes):,}"
+        )
+ 
+        # screen_slice = node_window_df[
+        #     (node_window_df["window_start"] >= step_start) &
+        #      (node_window_df["window_end"] <= step_end)
+        # ]
+
+        # top_nodes = _select_top_nodes_for_window(
+        #     screen_slice,
+        #     top_n=TOP_NODES_PER_WINDOW,
+        # )
+
+        # narrowed_df = _narrow_candidate_event_df(event_df, top_nodes)
+
+        # print(
+        #     f"      original events={len(event_df):,} | "
+        #     f"narrowed events={len(narrowed_df):,} | "
+        #     f"top_nodes={len(top_nodes):,}"
+        # )
+
+        if narrowed_df.empty:
+            summary_rows.append({
+                "window": int(row.window),
+                "start": step_start,
+                "end": step_end,
+                "candidate_score": float(row.candidate_score),
+                "n_events_original": int(len(event_df)),
+                "n_events_narrowed": 0,
+                "n_instances": 0,
+                "zscores": {},
+            })
+            del event_df, screen_slice, top_nodes, narrowed_df
+            gc.collect()
+            continue
+
+        window_instances = []
+        window_zscores = {}
+
+        for sub_start, sub_end, sub_df in _iter_exact_subwindows(
+            narrowed_df,
+            exact_window_size=EXACT_WINDOW_SIZE,
+            exact_stride=EXACT_WINDOW_STRIDE,
+        ):
+            out_idx, in_idx, _, out_steps = build_event_indexes(sub_df)
+            raw_instances = run_all_matchers(out_idx, in_idx, cfg, out_steps)
+            observed_counts = count_support(raw_instances)
+
+            zscore_results = None
+            if RUN_NULL_MODEL and observed_counts:
+                zscore_results = compute_null_zscore(
+                    observed_counts=observed_counts,
+                    event_df=sub_df,
+                    cfg=cfg,
+                    sample_frac=1.0,
+                    null_cap=MAX_INSTANCES_STAGE_B,
+                    verbose=False,
+                )
+
+            filtered_instances = filter_motifs(
+                raw_instances,
+                cfg,
+                zscore_results=zscore_results,
+            )
+
+            if filtered_instances:
+                window_instances.extend(filtered_instances)
+
+            if zscore_results:
+                for mt, val in zscore_results.items():
+                    window_zscores[mt] = val
+
+            del out_idx, in_idx, out_steps, sub_df, raw_instances, filtered_instances
+            gc.collect()
+
+        summary_rows.append({
+            "window": int(row.window),
+            "start": step_start,
+            "end": step_end,
+            "candidate_score": float(row.candidate_score),
+            "n_events_original": int(len(event_df)),
+            "n_events_narrowed": int(len(narrowed_df)),
+            "n_instances": int(len(window_instances)),
+            "zscores": window_zscores,
+        })
+
+        all_instances.extend(window_instances)
+
+        del event_df, screen_slice, top_nodes, narrowed_df, window_instances
+        gc.collect()
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    print(f"\n      Total motif instances: {len(all_instances):,}")
+    print(f"      Candidate windows processed: {len(summary_df)}")
+
+    if len(all_instances) > 0:
+        instances_by_window = _partition_instances_by_window(
+            all_instances,
+            summary_df.rename(columns={"n_events_original": "n_events"})
+        )
+
+        node_degree = _node_degree_from_tx(tx)
+
+        zscore_by_window = {
+            f"{int(r.start)}_{int(r.end)}": r.zscores
+            for r in summary_df.itertuples(index=False)
+            if isinstance(r.zscores, dict) and len(r.zscores) > 0
+        }
+
+        volume_by_window = {
+            f"{int(r.start)}_{int(r.end)}": total_vol
+            for r in summary_df.itertuples(index=False)
+        }
+
+        print("      Exporting motif features...")
+        export_paths = export_motif_feature_outputs(
+            window_summary_df=summary_df,
+            motif_instances_by_window=instances_by_window,
+            zscore_by_window=zscore_by_window if zscore_by_window else None,
+            node_degree_by_window={wk: node_degree for wk in instances_by_window},
+            total_volume_by_window=volume_by_window,
+            export_dir=str(MOTIF_DIR),
+            export_instances=False,
+            feature_format="parquet",
+        )
+
+        for k, v in export_paths.items():
+            print(f"         {k:<30} -> {v}")
+
+        if MOTIF_WIDE_PATH.exists():
+            motif_wide = pd.read_parquet(MOTIF_WIDE_PATH)
+            if "node" not in motif_wide.columns:
+                raise ValueError("entity_feature_wide_merged.parquet must contain a 'node' column.")
+            print(f"      motif_wide loaded: {motif_wide.shape}")
+            stage_b_used = True
+        else:
+            print("      [WARN] motif_wide export missing after Stage B.")
+    else:
+        print("      No motif instances found. Proceeding with Stage A only.")
+
+    del window_risk_df, node_window_df
+    gc.collect()
+
+else:
+    if MOTIF_WIDE_PATH.exists():
+        motif_wide = pd.read_parquet(MOTIF_WIDE_PATH)
+        if "node" not in motif_wide.columns:
+            raise ValueError("entity_feature_wide_merged.parquet must contain a 'node' column.")
+        print(f"      Stage B skipped. Loaded pre-existing motif_wide: {motif_wide.shape}")
+        stage_b_used = True
+    else:
+        print("      Stage B skipped. No pre-existing motif features found.")
+
+import gc
+gc.collect()
+# ============================================================
+# Step 3 — Subwindow transaction features
+# ============================================================
+
+print(f"\n[3/8] Building subwindow transaction features...")
+
+TOTAL_STEPS  = step_max - step_min + 1
+SUB_WIN_SIZE = max(1, TOTAL_STEPS // N_SUBWINDOWS)
+
+print(
+    f"      TOTAL_STEPS={TOTAL_STEPS} | "
+    f"N_SUBWINDOWS={N_SUBWINDOWS} | "
+    f"SUB_WIN_SIZE={SUB_WIN_SIZE}"
+)
+
 all_sw = []
+
 for sw in range(N_SUBWINDOWS):
-    ws = sw * SUB_WIN_SIZE
+    ws = step_min + sw * SUB_WIN_SIZE
     we = ws + SUB_WIN_SIZE - 1
     suffix = f"_w{sw}"
 
     wdf = df_feats[(df_feats["step"] >= ws) & (df_feats["step"] <= we)]
     if wdf.empty:
+        print(f"      sub-window {sw} [{ws}-{we}]: empty, skipped")
         continue
 
     sw_feat = _subwindow_features(wdf, suffix)
@@ -2735,58 +3246,41 @@ for sw in range(N_SUBWINDOWS):
 
     del wdf, sw_feat
     gc.collect()
-    print(f"      sub-window {sw} [{ws}-{we}] done", end="\r")
+    print(f"      sub-window {sw} [{ws}-{we}]: done", end="\r")
 
 print()
+
+if not all_sw:
+    raise RuntimeError("All subwindows were empty. Check step range and N_SUBWINDOWS.")
 
 sw_combined = all_sw[0]
 for frame in all_sw[1:]:
     sw_combined = sw_combined.merge(frame, on="node", how="outer")
 sw_combined = sw_combined.fillna(0)
 
+print(f"      subwindow features shape: {sw_combined.shape}")
+
 del all_sw, df_feats
 gc.collect()
 
-print(f"      sub-window features shape: {sw_combined.shape}")
-
 
 # ============================================================
-# Step 3 — Optional motif feature load
+# Step 4 — Assemble node-level feature matrix
 # ============================================================
 
-print("\n[3/7] Loading optional motif-derived features...")
+print("\n[4/8] Assembling feature matrix...")
 
-motif_wide = None
-if USE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists():
-    motif_wide = pd.read_parquet(MOTIF_WIDE_PATH)
-    if "node" not in motif_wide.columns:
-        raise ValueError("entity_feature_wide_merged.parquet must contain a 'node' column")
-    print(f"      motif_wide loaded: {motif_wide.shape}")
-else:
-    print("      motif_wide skipped.")
-
-
-# ============================================================
-# Step 4 — Merge all node-level features and attach label
-# ============================================================
-
-print("\n[4/7] Merging screening + subwindow + optional motif features...")
-
-# Keep screen_feats label as source of truth for node labels
-screen_X = screen_feats.drop(columns=["label"], errors="ignore")
-
-node_matrix = (
-    screen_X
-    .merge(sw_combined, on="node", how="outer")
-)
+node_matrix = screen_X.merge(sw_combined, on="node", how="left")
 
 if motif_wide is not None:
     node_matrix = node_matrix.merge(motif_wide, on="node", how="left")
+    print(
+        f"      motif columns added: "
+        f"{len([c for c in motif_wide.columns if c != 'node'])}"
+    )
 
 node_matrix = node_matrix.fillna(0)
 
-# Reattach label from Stage A screening output
-label_map = screen_feats[["node", "label"]].drop_duplicates()
 node_matrix = node_matrix.merge(label_map, on="node", how="left")
 node_matrix["label"] = node_matrix["label"].fillna(0).astype(np.int8)
 
@@ -2796,27 +3290,30 @@ n_tot = len(node_matrix)
 print(f"      node_matrix shape : {node_matrix.shape}")
 print(f"      SAR nodes         : {n_pos:,} ({n_pos/n_tot*100:.2f}%)")
 print(f"      Normal nodes      : {n_tot-n_pos:,} ({(n_tot-n_pos)/n_tot*100:.2f}%)")
+print(
+    f"      Feature sources   : screening={screen_X.shape[1]-1} cols | "
+    f"subwindow={sw_combined.shape[1]-1} cols | "
+    f"motif={motif_wide.shape[1]-1 if motif_wide is not None else 0} cols"
+)
 
-del sw_combined, screen_X, label_map
-if motif_wide is not None:
-    del motif_wide
+del sw_combined, screen_X
 gc.collect()
 
 
 # ============================================================
-# Step 5 — Train / validation / test split with node tracking
+# Step 5 — Train / validation / test split
 # ============================================================
 
-print("\n[5/7] Stratified train/val/test split...")
+print("\n[5/8] Stratified train / val / test split...")
 
 EXCLUDE = {"node", "label"}
 feature_cols = [c for c in node_matrix.columns if c not in EXCLUDE]
 
-X = node_matrix[feature_cols].values.astype(np.float32)
-y = node_matrix["label"].values.astype(np.int8)
+X        = node_matrix[feature_cols].values.astype(np.float32)
+y        = node_matrix["label"].values.astype(np.int8)
 node_ids = node_matrix["node"].values.astype(np.int64)
 
-X_train_full, X_test, y_train_full, y_test, nodes_train_full, nodes_test = train_test_split(
+X_trainval, X_test, y_trainval, y_test, nodes_trainval, nodes_test = train_test_split(
     X, y, node_ids,
     test_size=TEST_SIZE,
     stratify=y,
@@ -2824,27 +3321,34 @@ X_train_full, X_test, y_train_full, y_test, nodes_train_full, nodes_test = train
 )
 
 X_train, X_val, y_train, y_val, nodes_train, nodes_val = train_test_split(
-    X_train_full, y_train_full, nodes_train_full,
+    X_trainval, y_trainval, nodes_trainval,
     test_size=VAL_SIZE,
-    stratify=y_train_full,
+    stratify=y_trainval,
     random_state=RANDOM_STATE,
 )
 
 print(f"      Train : {len(X_train):,} (pos={int(y_train.sum()):,}, {y_train.mean()*100:.2f}%)")
 print(f"      Val   : {len(X_val):,} (pos={int(y_val.sum()):,}, {y_val.mean()*100:.2f}%)")
 print(f"      Test  : {len(X_test):,} (pos={int(y_test.sum()):,}, {y_test.mean()*100:.2f}%)")
+print(f"      Features: {len(feature_cols)}")
+
+del X_trainval, y_trainval, nodes_trainval
+gc.collect()
 
 
 # ============================================================
-# Step 6 — Train XGBoost and select operating threshold on validation
+# Step 6 — Train XGBoost
 # ============================================================
 
-print("\n[6/7] Training XGBoost...")
+print("\n[6/8] Training XGBoost...")
 
 n_pos_tr = int(y_train.sum())
 n_neg_tr = int(len(y_train) - n_pos_tr)
-scale_pos = float(n_neg_tr) / float(n_pos_tr + 1e-9)
 
+if n_pos_tr == 0:
+    raise RuntimeError("Training fold contains no positive samples.")
+
+scale_pos = float(n_neg_tr) / float(n_pos_tr)
 print(f"      scale_pos_weight = {scale_pos:.2f}")
 
 model = xgb.XGBClassifier(
@@ -2866,125 +3370,102 @@ model = xgb.XGBClassifier(
 )
 
 model.fit(
-    X_train,
-    y_train,
+    X_train, y_train,
     eval_set=[(X_val, y_val)],
     verbose=50,
 )
 
-print(f"\n      Best iteration: {model.best_iteration}")
-
-
-def precision_at_recall(y_true, y_prob, recall_target=0.60):
-    prec, rec, thr = precision_recall_curve(y_true, y_prob)
-    if len(thr) == 0:
-        return 0.0
-    mask = rec[:-1] >= recall_target
-    if not np.any(mask):
-        return 0.0
-    return float(np.max(prec[:-1][mask]))
-
-
-def threshold_at_recall(y_true, y_prob, recall_target=0.60):
-    prec, rec, thr = precision_recall_curve(y_true, y_prob)
-
-    if len(thr) == 0:
-        return 0.5, 0.0, 0.0
-
-    mask = rec[:-1] >= recall_target
-    if not np.any(mask):
-        j = int(np.argmax(rec[:-1]))
-        j = min(j, len(thr) - 1)
-        return float(thr[j]), float(prec[:-1][j]), float(rec[:-1][j])
-
-    valid_idx = np.where(mask)[0]
-    best_idx = valid_idx[np.argmax(prec[:-1][valid_idx])]
-    return float(thr[best_idx]), float(prec[:-1][best_idx]), float(rec[:-1][best_idx])
-
-
-def compute_metrics(y_true, y_prob, recall_target=0.60):
-    return {
-        "roc_auc": float(roc_auc_score(y_true, y_prob)),
-        "pr_auc": float(average_precision_score(y_true, y_prob)),
-        "p_at_r_target": float(precision_at_recall(y_true, y_prob, recall_target)),
-    }
-
+print(f"\n      Best iteration : {model.best_iteration}")
 
 y_prob_train = model.predict_proba(X_train)[:, 1]
-y_prob_val = model.predict_proba(X_val)[:, 1]
-y_prob_test = model.predict_proba(X_test)[:, 1]
+y_prob_val   = model.predict_proba(X_val)[:, 1]
+y_prob_test  = model.predict_proba(X_test)[:, 1]
 
-val_threshold, val_precision, val_recall = threshold_at_recall(
+val_threshold, val_prec, val_rec = _threshold_at_recall(
     y_val, y_prob_val, recall_target=RECALL_TARGET
 )
 
 print(f"\n      Validation threshold = {val_threshold:.4f}")
-print(f"      Validation precision = {val_precision:.4f}")
-print(f"      Validation recall    = {val_recall:.4f}")
+print(f"      Validation precision = {val_prec:.4f}")
+print(f"      Validation recall    = {val_rec:.4f}")
 
-train_metrics = compute_metrics(y_train, y_prob_train, RECALL_TARGET)
-val_metrics = compute_metrics(y_val, y_prob_val, RECALL_TARGET)
-test_metrics = compute_metrics(y_test, y_prob_test, RECALL_TARGET)
+train_metrics = _compute_metrics(y_train, y_prob_train, RECALL_TARGET)
+val_metrics   = _compute_metrics(y_val,   y_prob_val,   RECALL_TARGET)
+test_metrics  = _compute_metrics(y_test,  y_prob_test,  RECALL_TARGET)
+
+p_key = f"p_at_r{int(RECALL_TARGET*100)}"
 
 print(f"\n      {'Metric':<22} {'Train':>8} {'Val':>8} {'Test':>8}")
 print(f"      {'-'*52}")
 for k, label in [
     ("roc_auc", "ROC-AUC"),
-    ("pr_auc", "PR-AUC"),
-    ("p_at_r_target", f"P@R≥{RECALL_TARGET:.1f}"),
+    ("pr_auc",  "PR-AUC"),
+    (p_key,     f"P@R≥{RECALL_TARGET:.0%}"),
 ]:
     print(
         f"      {label:<22} "
-        f"{train_metrics[k]:>8.4f} "
-        f"{val_metrics[k]:>8.4f} "
-        f"{test_metrics[k]:>8.4f}"
+        f"{train_metrics.get(k, 0):>8.4f} "
+        f"{val_metrics.get(k, 0):>8.4f} "
+        f"{test_metrics.get(k, 0):>8.4f}"
     )
+
+
+# ============================================================
+# Step 7 — Test-set evaluation
+# ============================================================
+
+print(f"\n[7/8] Test-set evaluation (threshold={val_threshold:.4f})...")
 
 y_pred_test = (y_prob_test >= val_threshold).astype(np.int8)
 
-print(f"\n      Classification report (test, threshold={val_threshold:.4f}):")
-print(classification_report(y_test, y_pred_test, target_names=["normal", "SAR"], digits=4))
+print(classification_report(
+    y_test, y_pred_test,
+    target_names=["normal", "SAR"],
+    digits=4,
+))
 
 cm = confusion_matrix(y_test, y_pred_test)
 print("      Confusion matrix [TN FP; FN TP]:")
 print(cm)
 
 if HAS_PLT:
-    p, r, _ = precision_recall_curve(y_test, y_prob_test)
+    p_curve, r_curve, _ = precision_recall_curve(y_test, y_prob_test)
     ap = average_precision_score(y_test, y_prob_test)
 
     plt.figure(figsize=(7, 5))
-    plt.plot(r, p, label=f"Test (AP={ap:.3f})")
-    plt.axvline(RECALL_TARGET, linestyle="--", alpha=0.6, label="Recall target")
+    plt.plot(r_curve, p_curve, label=f"Test (AP={ap:.3f})")
+    plt.axvline(RECALL_TARGET, linestyle="--", alpha=0.6,
+                label=f"Recall target = {RECALL_TARGET:.0%}")
+    plt.scatter([val_rec], [val_prec], zorder=5,
+                label=f"Operating point (P={val_prec:.2f}, R={val_rec:.2f})")
     plt.xlabel("Recall")
     plt.ylabel("Precision")
-    plt.title("PR Curve — Stage A + Optional Motif Support")
+    plt.title("Precision–Recall Curve — Stage A + Stage B")
     plt.legend()
     plt.tight_layout()
-
-    pr_path = MODEL_DIR / "pr_curve_stageA_motif.png"
+    pr_path = MODEL_DIR / "pr_curve.png"
     plt.savefig(pr_path, dpi=150)
     plt.show()
-
     print(f"      PR curve -> {pr_path}")
 
 
 # ============================================================
-# Step 7 — Save model artifacts
+# Step 8 — Save model artifacts
 # ============================================================
 
-print("\n[7/7] Saving model artifacts...")
+print("\n[8/8] Saving model artifacts...")
 
-model_path = MODEL_DIR / "xgb_stageA_motif.json"
+model_path = MODEL_DIR / "xgb_model.json"
 model.save_model(model_path)
 
 score_dict = model.get_booster().get_score(importance_type="gain")
-imp_df = pd.DataFrame([
-    {"feature": feature_cols[int(k[1:])], "gain": v}
-    for k, v in score_dict.items()
-]).sort_values("gain", ascending=False).reset_index(drop=True)
-
-imp_path = MODEL_DIR / "feature_importance_stageA_motif.parquet"
+gain_values = [score_dict.get(f"f{i}", 0.0) for i in range(len(feature_cols))]
+imp_df = (
+    pd.DataFrame({"feature": feature_cols, "gain": gain_values})
+    .sort_values("gain", ascending=False)
+    .reset_index(drop=True)
+)
+imp_path = MODEL_DIR / "feature_importance.parquet"
 imp_df.to_parquet(imp_path, index=False)
 
 preds_df = pd.DataFrame({
@@ -2993,15 +3474,15 @@ preds_df = pd.DataFrame({
     "prob_sar": y_prob_test,
     "pred_sar": y_pred_test,
 })
-preds_path = MODEL_DIR / "test_predictions_stageA_motif.parquet"
+preds_path = MODEL_DIR / "test_predictions.parquet"
 preds_df.to_parquet(preds_path, index=False)
 
 metrics = {
     "recall_target": RECALL_TARGET,
     "threshold_from_validation": float(val_threshold),
     "validation_operating_point": {
-        "precision": float(val_precision),
-        "recall": float(val_recall),
+        "precision": float(val_prec),
+        "recall": float(val_rec),
     },
     "train": train_metrics,
     "val": val_metrics,
@@ -3014,11 +3495,26 @@ metrics = {
     "n_pos_val": int(y_val.sum()),
     "n_pos_test": int(y_test.sum()),
     "best_iteration": int(model.best_iteration),
-    "use_motif_features": bool(USE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists()),
+    "stage_b_ran": bool(RUN_STAGE_B and stage_b_used),
+    "stage_b_config": {
+        "top_k_windows": TOP_K_WINDOWS_STAGE_B,
+        "top_nodes_per_window": TOP_NODES_PER_WINDOW,
+        "exact_window_size": EXACT_WINDOW_SIZE,
+        "exact_window_stride": EXACT_WINDOW_STRIDE,
+        "enabled_matchers": DEFAULT_ENABLED_MATCHERS,
+        "max_instances_stage_b": MAX_INSTANCES_STAGE_B,
+    },
+    "subwindow_config": {
+        "n_subwindows": N_SUBWINDOWS,
+        "total_steps": TOTAL_STEPS,
+        "sub_win_size": SUB_WIN_SIZE,
+        "step_min": step_min,
+        "step_max": step_max,
+    },
     "feature_sources": {
         "screening": str(SCREEN_FEATURE_PATH),
         "transactions": str(TX_PATH),
-        "motif_wide": str(MOTIF_WIDE_PATH) if (USE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists()) else None,
+        "motif_wide": str(MOTIF_WIDE_PATH) if stage_b_used else None,
     },
     "test_confusion_matrix": {
         "tn": int(cm[0, 0]),
@@ -3028,37 +3524,33 @@ metrics = {
     },
 }
 
-metrics_path = MODEL_DIR / "metrics_stageA_motif.json"
+metrics_path = MODEL_DIR / "metrics.json"
 with open(metrics_path, "w") as f:
     json.dump(metrics, f, indent=2)
 
-feature_cols_path = MODEL_DIR / "feature_columns_stageA_motif.json"
+feature_cols_path = MODEL_DIR / "feature_columns.json"
 with open(feature_cols_path, "w") as f:
     json.dump(feature_cols, f, indent=2)
 
-print("\nArtifacts saved:")
-for lbl, path in [
+print("\nArtifacts written:")
+for label, path in [
     ("model", model_path),
-    ("predictions", preds_path),
+    ("test_predictions", preds_path),
     ("metrics", metrics_path),
     ("feature_importance", imp_path),
     ("feature_columns", feature_cols_path),
 ]:
-    print(f"   [{lbl:<18}] {path} ({os.path.getsize(path)/1024:.1f} KB)")
+    size_kb = os.path.getsize(path) / 1024
+    print(f"   [{label:<22}] {path} ({size_kb:.1f} KB)")
 
 print("\nTop 20 features by gain:")
 print(imp_df.head(20).to_string(index=False))
 
 del tx, screen_feats, node_matrix
 del X, y, node_ids
-del X_train_full, X_train, X_val, X_test
-del y_train_full, y_train, y_val, y_test
-del nodes_train_full, nodes_train, nodes_val, nodes_test
+del X_train, X_val, X_test
+del y_train, y_val, y_test
+del nodes_train, nodes_val, nodes_test
 gc.collect()
 
 print("\nDone.")
-
-
-
-
-
