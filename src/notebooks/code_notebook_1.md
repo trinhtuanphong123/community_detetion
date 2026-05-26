@@ -40,7 +40,53 @@ if not os.path.exists(DRIVE_PATH):
     except Exception as e:
         print(f"❌ Không thể kết nối Google Drive: {e}")
 else:
+    print("ℹ️ Google Drive đã được kết nối từ trước.")# ============================================================
+# CELL 0 — Environment setup
+#
+# HƯỚNG DẪN: 
+# 1. Chạy Cell này DUY NHẤT một lần.
+# 2. Nếu thông báo "RESTART" hiện ra, chọn Runtime > Restart runtime.
+# 3. Sau khi restart, chạy các Cell từ 1 đến 6 theo thứ tự.
+# ============================================================
+
+import os
+import sys
+import subprocess
+
+# 1. Kiểm tra và cài đặt RAPIDS cuDF cho T4 GPU
+try:
+    import cudf
+    print("✅ cuDF đã sẵn sàng, bỏ qua bước cài đặt.")
+except ImportError:
+    print("⏳ Đang cài đặt cuDF (RAPIDS)... Việc này có thể mất 1-2 phút.")
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "cudf-cu12", 
+            "--extra-index-url", "https://pypi.nvidia.com"
+        ])
+        print("✅ Cài đặt cuDF thành công!")
+        print("⚠️ VUI LÒNG RESTART RUNTIME (Runtime > Restart runtime) ngay bây giờ.")
+        print("Sau đó chạy lại từ Cell 1.")
+    except Exception as e:
+        print(f"❌ Lỗi khi cài đặt cuDF: {e}")
+
+# 2. Kết nối Google Drive
+print("\n--- Kiểm tra Google Drive ---")
+DRIVE_PATH = "/content/drive"
+if not os.path.exists(DRIVE_PATH):
+    try:
+        from google.colab import drive
+        drive.mount(DRIVE_PATH)
+        print("✅ Google Drive đã được kết nối.")
+    except Exception as e:
+        print(f"❌ Không thể kết nối Google Drive: {e}")
+else:
     print("ℹ️ Google Drive đã được kết nối từ trước.")
+
+
+cell 1: 
+
 
 from __future__ import annotations
 
@@ -126,6 +172,11 @@ class LoaderConfig:
 
     window_size: int = 30
     window_stride: int = 15
+
+
+
+cell 2: 
+
 
 
 from __future__ import annotations
@@ -299,6 +350,11 @@ def iter_windows(
         del window_df, mask
         gc.collect()
         start += window_stride
+
+
+
+
+cell 3: 
 
 
 from __future__ import annotations
@@ -495,6 +551,9 @@ def encode_series(
 
 
 
+cell 4: 
+
+
 from __future__ import annotations
 
 try:
@@ -546,7 +605,53 @@ def build_temporal_edges(
 
     return te.reset_index(drop=True)
 
+def build_snapshot_edges(
+    df: "pd_lib.DataFrame",
+    src_col: str = "src_node",
+    dst_col: str = "dst_node",
+    amount_col: str = "amount",
+    step_col: str = "step",
+) -> "pd_lib.DataFrame":
+    """
+    Aggregate raw transactions into a directed weighted edge table.
 
+    Groups all transactions in the window by (src_node, dst_node) and sums
+    amounts.  This is the input required by build_snapshot_graph() and by
+    community detection algorithms.
+
+    Per graph_schema.md §6.2:
+        W^(t)_{uv} = sum of all amounts from u to v within the window.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Single time-window of transactions.  Must have src_col, dst_col,
+        amount_col.  step_col is used to record the window's step range.
+    src_col, dst_col, amount_col, step_col : str
+        Column names in df.
+
+    Returns
+    -------
+    DataFrame with columns:
+        src_node, dst_node, weight, tx_count, step_min, step_max
+
+    Notes
+    -----
+    - Direction is preserved: (u, v) and (v, u) remain separate rows.
+    - No symmetrization is applied.
+    - Self-loops should have been removed upstream by load_transactions().
+    """
+    agg = df.groupby([src_col, dst_col], as_index=False).agg(
+        weight=(amount_col, "sum"),
+        tx_count=(amount_col, "count"),
+        step_min=(step_col, "min"),
+        step_max=(step_col, "max"),
+    )
+
+    # Normalize column names to canonical form
+    agg = agg.rename(columns={src_col: "src_node", dst_col: "dst_node"})
+
+    return agg.reset_index(drop=True)
 # Snapshot edge table (community detection input)
 
 def build_second_order_edges(te):
@@ -577,6 +682,8 @@ def build_second_order_edges(te):
     return grouped
 
 
+
+cell 5:
 
 """
 second_order.py — Second-order (line graph) construction and sparse adjacency.
@@ -757,6 +864,366 @@ def build_snapshot_graph(
 
     A = csr_matrix((data, (row, col)), shape=(n_nodes, n_nodes), dtype=np.float32)
     return A, n_nodes
+
+
+
+cell 6: 
+
+# ============================================================
+# CELL 6 — Graph Pipeline: stream all windows and save artifacts
+# ============================================================
+
+import gc
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as _pd
+from scipy.sparse import csr_matrix
+
+
+# ---------------------------------------------------------------------------
+# Drive guard
+# ---------------------------------------------------------------------------
+
+if not os.path.isdir("/content/drive/MyDrive"):
+    raise RuntimeError(
+        "Google Drive is not mounted. "
+        "Run Cell 0 first and mount /content/drive."
+    )
+
+
+# ---------------------------------------------------------------------------
+# USER CONFIG
+# ---------------------------------------------------------------------------
+
+AML_DATA_PATH = "/content/drive/MyDrive/AML/dataset/tx_log.csv"
+OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
+
+WINDOW_SIZE = 30
+WINDOW_STRIDE = 15
+DELTA_W = 5
+
+TEMPORAL_DIR = OUTPUT_DIR / "temporal_edges"
+SECOND_ORDER_DIR = OUTPUT_DIR / "second_order_edges"
+SNAPSHOT_DIR = OUTPUT_DIR / "snapshot_edges"
+META_PATH = OUTPUT_DIR / "windows_meta.parquet"
+
+for d in [OUTPUT_DIR, TEMPORAL_DIR, SECOND_ORDER_DIR, SNAPSHOT_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _to_np(s):
+    if hasattr(s, "to_pandas"):
+        return s.to_pandas().to_numpy()
+    return s.to_numpy()
+
+
+# ---------------------------------------------------------------------------
+# Section 1 — Load and validate transactions
+# ---------------------------------------------------------------------------
+
+print("[1/7] Loading transactions...")
+tx_df = load_transactions(AML_DATA_PATH)
+
+print(f"      Rows: {len(tx_df):,}")
+print(f"      Columns: {list(tx_df.columns)}")
+
+_expected_cols = {"src_node", "dst_node", "amount", "step", "is_sar"}
+if set(tx_df.columns) != _expected_cols:
+    raise ValueError(
+        f"Unexpected columns after load_transactions(): {set(tx_df.columns)}"
+    )
+
+assert str(tx_df["step"].dtype) == "int32", f"step dtype: {tx_df['step'].dtype}"
+assert str(tx_df["amount"].dtype) == "float32", f"amount dtype: {tx_df['amount'].dtype}"
+assert str(tx_df["is_sar"].dtype) == "int8", f"is_sar dtype: {tx_df['is_sar'].dtype}"
+
+print("      Schema OK.")
+
+
+# ---------------------------------------------------------------------------
+# Section 2 — Global node encoding
+# ---------------------------------------------------------------------------
+
+print("\n[2/7] Encoding nodes globally...")
+
+_raw_src = _to_np(tx_df["src_node"]).copy()
+_raw_dst = _to_np(tx_df["dst_node"]).copy()
+unique_raw = np.unique(np.concatenate([_raw_src, _raw_dst]))
+
+encoder = NodeEncoder()
+encoder.fit_transform(tx_df)
+
+assert encoder.n_nodes == len(unique_raw), (
+    f"Expected {len(unique_raw)} nodes, got {encoder.n_nodes}"
+)
+print(f"      Unique nodes: {encoder.n_nodes:,}")
+
+# Round-trip sanity check
+_enc = encoder.encode_column(_pd.Series(_raw_src))
+_dec = encoder.decode(_to_np(_enc).tolist())
+assert list(_dec) == _raw_src.tolist(), "Round-trip encode->decode failed."
+print("      Round-trip encode->decode: OK")
+
+del _raw_src, _raw_dst, _enc, _dec, unique_raw
+gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Section 3 — Save global artifacts needed by downstream notebooks
+# ---------------------------------------------------------------------------
+
+print("\n[3/7] Saving global transaction artifacts...")
+
+tx_path = OUTPUT_DIR / "transactions.parquet"
+tx_df.to_parquet(tx_path, index=False)
+
+node_map_df = _pd.DataFrame(
+    [{"raw_id": k, "node_id": v} for k, v in encoder._label_to_id.items()]
+)
+node_map_path = OUTPUT_DIR / "node_map.parquet"
+node_map_df.to_parquet(node_map_path, index=False)
+
+print(f"      transactions.parquet -> {tx_path}")
+print(f"      node_map.parquet     -> {node_map_path}")
+
+del node_map_df
+gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Section 4 — Stream all windows and build graph artifacts
+# ---------------------------------------------------------------------------
+
+print(f"\n[4/7] Streaming windows (size={WINDOW_SIZE}, stride={WINDOW_STRIDE})...")
+
+window_stats = []
+n_windows = 0
+
+for window_id, (step_start, step_end, window_df) in enumerate(
+    iter_windows(tx_df, window_size=WINDOW_SIZE, window_stride=WINDOW_STRIDE)
+):
+    n_windows += 1
+    n_tx = len(window_df)
+
+    if n_tx == 0:
+        continue
+
+    print(
+        f"      Window {window_id:03d} [{step_start}, {step_end}] "
+        f"rows={n_tx:,}",
+        end="\r",
+    )
+
+    # --------------------------------------------------------
+    # A. Temporal relay edges (exact motif substrate)
+    # --------------------------------------------------------
+    temporal_edges = build_temporal_edges(window_df, delta_w=DELTA_W)
+
+    # Validate temporal edges if non-empty
+    if len(temporal_edges) > 0:
+        expected_te = {
+            "src_1", "dst_1", "step_1", "amount_1", "alert_1",
+            "src_2", "dst_2", "step_2", "amount_2", "alert_2",
+        }
+        missing_te = expected_te - set(temporal_edges.columns)
+        if missing_te:
+            raise ValueError(
+                f"Temporal edges missing columns: {sorted(missing_te)}"
+            )
+
+        gaps = _to_np(temporal_edges["step_2"] - temporal_edges["step_1"])
+        assert (gaps > 0).all(), "Temporal ordering violated in temporal_edges."
+        assert (gaps <= DELTA_W).all(), f"Temporal gap exceeds DELTA_W={DELTA_W}."
+
+    # --------------------------------------------------------
+    # B. Snapshot edges (community/global graph use)
+    # --------------------------------------------------------
+    snapshot_edges = build_snapshot_edges(window_df)
+
+    if len(snapshot_edges) > 0:
+        expected_se = {
+            "src_node", "dst_node", "weight", "tx_count", "step_min", "step_max"
+        }
+        missing_se = expected_se - set(snapshot_edges.columns)
+        if missing_se:
+            raise ValueError(
+                f"Snapshot edges missing columns: {sorted(missing_se)}"
+            )
+
+        assert (
+            _to_np(snapshot_edges["src_node"]) != _to_np(snapshot_edges["dst_node"])
+        ).all(), "Self-loops found in snapshot_edges."
+
+        assert (_to_np(snapshot_edges["weight"]) > 0).all(), (
+            "Non-positive weights found in snapshot_edges."
+        )
+
+    # --------------------------------------------------------
+    # C. Second-order edges (feature engineering only)
+    # --------------------------------------------------------
+    second_order_edges = build_second_order_edges(temporal_edges)
+
+    if len(second_order_edges) > 0:
+        expected_so = {
+            "src_2nd", "dst_2nd", "count",
+            "weight_src", "weight_dst", "avg_gap", "n_alert",
+        }
+        missing_so = expected_so - set(second_order_edges.columns)
+        if missing_so:
+            raise ValueError(
+                f"Second-order edges missing columns: {sorted(missing_so)}"
+            )
+
+        assert (
+            _to_np(second_order_edges["src_2nd"]) != _to_np(second_order_edges["dst_2nd"])
+        ).all(), "Self-relays found in second_order_edges."
+
+    # --------------------------------------------------------
+    # D. Snapshot adjacency check (do not save matrix per window)
+    # --------------------------------------------------------
+    A, n_dim = build_snapshot_graph(snapshot_edges, n_nodes=encoder.n_nodes)
+
+    assert isinstance(A, csr_matrix)
+    assert A.shape == (encoder.n_nodes, encoder.n_nodes)
+    assert n_dim == encoder.n_nodes
+
+    # --------------------------------------------------------
+    # E. Save shards
+    # --------------------------------------------------------
+    shard_name = f"w_{step_start}_{step_end}.parquet"
+
+    temporal_path = TEMPORAL_DIR / shard_name
+    second_order_path = SECOND_ORDER_DIR / shard_name
+    snapshot_path = SNAPSHOT_DIR / shard_name
+
+    temporal_edges.to_parquet(temporal_path, index=False)
+    second_order_edges.to_parquet(second_order_path, index=False)
+    snapshot_edges.to_parquet(snapshot_path, index=False)
+
+    # --------------------------------------------------------
+    # F. Window metadata for notebook 2 candidate selection
+    # --------------------------------------------------------
+    window_stats.append({
+        "window": int(window_id),
+        "start": int(step_start),
+        "end": int(step_end),
+        "n_tx": int(n_tx),
+        "n_temporal": int(len(temporal_edges)),
+        "n_second": int(len(second_order_edges)),
+        "n_snapshot": int(len(snapshot_edges)),
+        "adj_nnz": int(A.nnz),
+        "adj_sparsity": float(A.nnz / (encoder.n_nodes ** 2)) if encoder.n_nodes > 0 else 0.0,
+    })
+
+    del window_df, temporal_edges, snapshot_edges, second_order_edges, A
+    gc.collect()
+
+print(f"\n      Total non-empty windows processed: {len(window_stats):,}")
+
+
+# ---------------------------------------------------------------------------
+# Section 5 — Save metadata
+# ---------------------------------------------------------------------------
+
+print("\n[5/7] Saving windows metadata...")
+
+windows_meta_df = _pd.DataFrame(window_stats).sort_values(
+    ["start", "end"]
+).reset_index(drop=True)
+windows_meta_df.to_parquet(META_PATH, index=False)
+
+print(f"      windows_meta.parquet -> {META_PATH}")
+print(f"      shape: {windows_meta_df.shape}")
+
+if len(windows_meta_df) > 0:
+    print("\n      Top windows by temporal relay count:")
+    print(
+        windows_meta_df.sort_values("n_temporal", ascending=False)
+        .head(10)
+        .to_string(index=False)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — Save light pipeline config / manifest
+# ---------------------------------------------------------------------------
+
+print("\n[6/7] Saving graph manifest...")
+
+manifest = {
+    "aml_data_path": AML_DATA_PATH,
+    "output_dir": str(OUTPUT_DIR),
+    "window_size": int(WINDOW_SIZE),
+    "window_stride": int(WINDOW_STRIDE),
+    "delta_w": int(DELTA_W),
+    "n_nodes": int(encoder.n_nodes),
+    "n_windows": int(len(window_stats)),
+    "artifacts": {
+        "transactions": str(tx_path),
+        "node_map": str(node_map_path),
+        "temporal_edges_dir": str(TEMPORAL_DIR),
+        "second_order_edges_dir": str(SECOND_ORDER_DIR),
+        "snapshot_edges_dir": str(SNAPSHOT_DIR),
+        "windows_meta": str(META_PATH),
+    },
+}
+
+manifest_path = OUTPUT_DIR / "graph_manifest.json"
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+
+print(f"      graph_manifest.json -> {manifest_path}")
+
+
+# ---------------------------------------------------------------------------
+# Section 7 — Final summary
+# ---------------------------------------------------------------------------
+
+print("\n[7/7] Done.")
+
+for path in [
+    tx_path,
+    node_map_path,
+    META_PATH,
+    manifest_path,
+]:
+    print(f"   {path} ({os.path.getsize(path)/1024:.1f} KB)")
+
+print("\nShard directories:")
+for d in [TEMPORAL_DIR, SECOND_ORDER_DIR, SNAPSHOT_DIR]:
+    n_files = len(list(d.glob("*.parquet")))
+    print(f"   {d}  files={n_files:,}")
+
+del tx_df, windows_meta_df, window_stats
+gc.collect()
+print("\nAll graph artifacts saved successfully.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

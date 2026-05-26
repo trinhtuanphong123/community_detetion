@@ -1,71 +1,28 @@
-# ============================================================
 # CELL 0 — Environment setup for 02_motif_pipeline.ipynb
-#
 # Run ONCE, restart the Colab runtime, then run Cells 1-6.
-#
-# Prerequisite:
-#   01_graph_pipeline.ipynb Cell 6 must have saved
+# Prerequisite: 01_graph_pipeline.ipynb Cell 6 must have saved
 #   temporal_edges.parquet to OUTPUT_DIR on Google Drive.
-# ============================================================
 
-
-# 1. Install RAPIDS cuDF for T4 GPU
-
+# 1. Install RAPIDS cuDF for T4 GPU (no-op if already installed)
 try:
     import cudf  # noqa: F401
-    print("cuDF already available.")
-
+    print('cuDF already available.')
 except ImportError:
-    import subprocess
-    import sys
+    import subprocess, sys
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet',
+                           'cudf-cu12', '--extra-index-url', 'https://pypi.nvidia.com'])
+    print('cuDF installed. RESTART the Colab runtime now, then re-run all cells.')
 
-    print("Installing cuDF (CUDA 12 build)...")
-
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--quiet",
-        "cudf-cu12",
-        "--extra-index-url",
-        "https://pypi.nvidia.com"
-    ])
-
-    print("\ncuDF installation completed.")
-    print("IMPORTANT: Restart the Colab runtime now.")
-    print("After restarting, re-run all notebook cells from the beginning.")
-
-
-# ============================================================
-# 2. Mount Google Drive
-# ============================================================
-
+# 2. Mount Google Drive (idempotent — skipped if already mounted)
 import os
-
-if not os.path.isdir("/content/drive/MyDrive"):
-
+if not os.path.isdir('/content/drive/MyDrive'):
     from google.colab import drive
-
-    drive.mount("/content/drive")
-
-    print("Google Drive mounted successfully.")
-
+    drive.mount('/content/drive')
+    print('Drive mounted.')
 else:
-    print("Google Drive already mounted.")
+    print('Drive already mounted.')
 
 
-# ============================================================
-# 3. Optional sanity checks
-# ============================================================
-
-print("\nEnvironment check:")
-print(f"Current working directory: {os.getcwd()}")
-
-if os.path.isdir("/content/drive/MyDrive"):
-    print("Drive access: OK")
-else:
-    print("Drive access: FAILED")
 
 
 cell 1: 
@@ -78,158 +35,145 @@ from typing import List
 @dataclass
 class MotifConfig:
     """
-    Hyperparameters for temporal motif mining.
+    Runtime configuration for selective temporal motif mining.
 
-    Temporal constraints
-    --------------------
+    This config now serves two purposes:
+
+    1. Motif definition
+       Controls the temporal and amount-based constraints used by the
+       exact matchers.
+
+    2. Motif execution policy
+       Controls how aggressively the exact branch is allowed to run,
+       including support thresholds, statistical filtering, and memory caps.
+
+    Notes
+    -----
+    - Exact motif mining is intended to run on candidate windows only,
+      not on the full dataset globally.
+    - `temporal_edges` from notebook 1 are the correct upstream substrate
+      for exact or semi-exact motifs.
+    - Aggregated graph objects such as snapshot edges or second-order edges
+      are not substitutes for event-level motif search.
+
+    Parameters
+    ----------
     delta : int
-        Maximum step gap between two consecutive transactions in a motif.
+        Maximum allowed step gap between consecutive events in one motif.
 
-        AML relay chains typically close within a few days.
-        Default = 3 is intentionally tight.
+        Smaller values enforce tighter temporal continuity.
+        Increase only if one step in the dataset is smaller than the
+        intended business time unit.
 
-        Widen only if dataset step != 1 day.
-
-    Amount ratio constraints
-    ------------------------
     rho_min, rho_max : float
-        Allowed ratio:
+        Allowed range for consecutive amount ratios:
 
             a(i+1) / a(i)
 
-        for consecutive transactions.
+        This is used to reject chains whose transferred amounts change too
+        sharply from one hop to the next.
 
-        Layering keeps amounts close to 1.0.
-        Structuring splits downward (ratio < 1).
+    r_min_fanin : int
+        Minimum number of distinct incoming sources required for a fan-in motif.
 
-        [0.5, 2.0] is a reasonable starting range.
+    r_min_fanout : int
+        Minimum number of distinct outgoing targets required for a fan-out motif.
 
-        Tighten toward:
-            [0.7, 1.4]
+    r_min_cycle : int
+        Minimum support required to keep cycle motifs after matching.
 
-        for capital-preservation behavior typical of layering.
+    r_min_relay : int
+        Minimum support required to keep relay motifs after matching.
 
-    Minimum support (repetition)
-    ----------------------------
-    r_min_fanin
-        Minimum number of incoming sources
-        for a fan-in node.
+    r_min_split_merge : int
+        Minimum support required to keep split-merge motifs after matching.
 
-    r_min_fanout
-        Minimum number of outgoing targets
-        for a fan-out node.
-
-    r_min_cycle
-        Minimum occurrences of a cycle
-        before it is flagged.
-
-    r_min_relay
-        Minimum occurrences of a relay chain.
-
-    r_min_split_merge
-        Minimum occurrences of a split-merge path.
-
-    Statistical filtering
-    ---------------------
     n_permutations : int
-        Number of shuffles used for
-        null-model z-score estimation.
+        Number of null-model permutations used when computing motif z-scores.
 
-        30:
-            sufficient for early screening
-
-        100+:
-            recommended for final experiments
+        Use small values for pipeline debugging.
+        Increase only after the selective execution path is stable.
 
     z_min : float
-        Minimum z-score threshold.
-        Motifs below this value are discarded.
+        Minimum z-score required to keep a motif type when null-model
+        filtering is enabled.
 
-    Search limits
-    -------------
     max_nodes : int
-        Maximum nodes in a single motif instance.
+        Soft design limit for the size of one motif instance.
 
     max_edges : int
-        Maximum edges in a single motif instance.
+        Soft design limit for the number of edges in one motif instance.
 
     max_instances : int
-        Hard cap on total matched instances
-        kept in RAM.
+        Hard cap on total matched instances retained in memory per matcher run.
 
-        Prevents OOM on large windows.
+        This is a safety guard against RAM blow-up on dense candidate windows.
+        Set to 0 to disable the cap.
 
-        0 = disabled.
-
-    Window sizes
-    ------------
     window_sizes : List[int]
-        Step counts for windowed search.
+        Window sizes retained for compatibility with older notebook logic.
 
-        Aligned with:
-            - graph_schema §6.3
-            - community_spec §6
-
-        Default:
-            [7, 14, 30]
+        In the redesigned pipeline, notebook 1 is responsible for graph
+        windowing and shard generation. Notebook 2 should usually inherit
+        that windowing rather than redefining it here.
     """
 
     # =========================================================
-    # Temporal
+    # Temporal constraint
     # =========================================================
 
     delta: int = 2
 
     # =========================================================
-    # Amount ratio constraints
+    # Amount ratio constraint
     # =========================================================
 
     rho_min: float = 0.3
     rho_max: float = 3.0
 
     # =========================================================
-    # Support thresholds (per motif type)
+    # Minimum support by motif type
     # =========================================================
 
-    # at least 3 distinct sources into one node
+    # Require at least 3 distinct sources into one destination.
     r_min_fanin: int = 3
 
-    # at least 3 distinct targets from one node
+    # Require at least 3 distinct targets from one source.
     r_min_fanout: int = 3
 
-    # a single observed cycle is already suspicious
+    # A single observed cycle can already be suspicious.
     r_min_cycle: int = 1
 
+    # A single observed relay chain can already be suspicious.
     r_min_relay: int = 1
 
+    # A single observed split-merge can already be suspicious.
     r_min_split_merge: int = 1
 
     # =========================================================
     # Statistical filtering
     # =========================================================
 
-    n_permutations: int = 5 # start here; raise to 30 only after pipeline completes
-
+    # Start small for debugging; increase only after the selective motif
+    # pipeline is stable.
+    n_permutations: int = 5
 
     z_min: float = 2.0
 
     # =========================================================
-    # Search limits / prune guards
+    # Search limits / memory guards
     # =========================================================
 
     max_nodes: int = 4
-
     max_edges: int = 5
 
-    # total matched instance cap across all matchers
-    # prevents unbounded RAM growth
-    # 0 = disabled
-
-    max_instances: int = 10_000   # đổi từ 50_000
-
+    # Hard cap on retained instances across one matcher run.
+    # Prevents unbounded RAM growth on dense candidate windows.
+    # 0 = disabled.
+    max_instances: int = 10_000
 
     # =========================================================
-    # Window sizes
+    # Legacy / compatibility window settings
     # =========================================================
 
     window_sizes: List[int] = field(
@@ -245,48 +189,54 @@ __all__ = [
 cell 2:
 
 """
-index -  Event-level search indexes for motif matching.
+cell 2 — Event indexing + temporal shard loading for selective motif mining.
 
-Builds lightweight Python dict indexes from a window of transactions.
-Matchers use these indexes instead of scanning the full DataFrame repeatedly.
+Redesign goals
+--------------
+1. Link notebook 2 to notebook 1's graph outputs.
+2. Treat temporal_edges shards as the ONLY upstream object for exact / semi-exact motifs.
+3. Reconstruct per-window canonical event tables from temporal relay shards.
+4. Build local event indexes only for one selected candidate window at a time.
 
-Indexes produced by build_event_indexes():
-    out_index  : {src_node -> [event_dict, ...]} sorted by step ascending
-    in_index   : {dst_node -> [event_dict, ...]} sorted by step ascending
-    step_index : {step     -> [event_dict, ...]}
+Expected upstream artifacts from notebook 1
+-------------------------------------------
+- windows_meta.parquet
+- temporal_edges/w_{start}_{end}.parquet
 
-Helper:
-    edges_after_step(out_index, node, step) — forward-only edge lookup.
-    filter_window(event_df, step_start, step_end) — slice a time window.
-
-Guarantees:
-- Time      : all buckets are sorted by step; edges_after_step enforces
-              forward-only search (no backward traversal).
-- Direction : out_index keys on src; in_index keys on dst; never merged.
-- Memory    : plain Python dicts after indexing (no DataFrame held);
-              gc.collect() called after build.
+This cell no longer assumes one monolithic temporal_edges.parquet file.
+It works window-by-window from sharded graph outputs.
 """
 
 from __future__ import annotations
 
 import gc
+import os
+import re
 from bisect import bisect_right
 from collections import defaultdict
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
-import os
 
-# Type alias for an event record stored in the index
+# ---------------------------------------------------------------------------
+# Type alias
+# ---------------------------------------------------------------------------
 
-
-# Each event is a plain dict for zero-overhead lookup in matcher loops.
-# Keys: event_id, step, src, dst, amount, is_sar
 EventDict = Dict[str, object]
 
 
 # ---------------------------------------------------------------------------
-# Main index builder
+# Defaults for graph-shard locations
+# ---------------------------------------------------------------------------
+
+GRAPH_OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
+TEMPORAL_SHARD_DIR = GRAPH_OUTPUT_DIR / "temporal_edges"
+WINDOW_META_PATH = GRAPH_OUTPUT_DIR / "windows_meta.parquet"
+
+
+# ---------------------------------------------------------------------------
+# Canonical event index builder
 # ---------------------------------------------------------------------------
 
 def build_event_indexes(
@@ -296,91 +246,74 @@ def build_event_indexes(
     step_col: str = "step",
     amount_col: str = "amount",
     alert_col: str = "is_sar",
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """
-    Build three search indexes from a window of transactions.
+    Build local search indexes from ONE event window.
 
     Parameters
     ----------
     event_df : pd.DataFrame
-        A single time window of transactions.  Must be sorted by step
-        (loader.py and iter_windows guarantee this).
-        Supported column name variants:
-          - canonical: src_node, dst_node (from loader.py)
-          - legacy:    nameOrig, nameDest  (raw AMLGentex)
-          - short:     src, dst           (old pipeline)
+        Canonical per-window event table with one row per transaction event.
+        Must be sorted by step ascending.
     src_col, dst_col, step_col, amount_col, alert_col : str
         Column name overrides.
 
     Returns
     -------
-    out_index  : {src_node: [EventDict, ...]}  sorted by step ascending
-    in_index   : {dst_node: [EventDict, ...]}  sorted by step ascending
-    step_index : {step:     [EventDict, ...]}
+    out_index  : {src_node -> [EventDict, ...]}
+    in_index   : {dst_node -> [EventDict, ...]}
+    step_index : {step -> [EventDict, ...]}
+    out_steps  : {src_node -> [step, ...]}
 
     Notes
     -----
-    - event_id is auto-assigned as the row index if absent (motif_spec §3.1).
-    - itertuples() is used intentionally: the single-pass loop is O(n) and
-      avoids creating three separate groupby-materialised DataFrames.
-    - All three dicts are populated in one pass to minimise memory pressure.
-    - Buckets are already in step order because event_df is pre-sorted.
+    - This function now explicitly returns FOUR outputs.
+    - It is intended for local candidate-window motif mining only.
+    - It accepts pandas or cuDF input, but converts once to pandas.
     """
-    # cuDF → pandas: motif index works on plain Python dicts after this point;
-    # converting once here avoids per-row GPU tensor overhead in itertuples.
-
     if hasattr(event_df, "to_pandas"):
         event_df = event_df.to_pandas()
-
-    # --- FIX WARNING 4: Defensive Integrity Guard ---
-    # Validate monotonicity after pandas conversion but before indexing.
-    if os.getenv("MOTIF_DEBUG") == "1":
-        if not event_df[step_col].is_monotonic_increasing:
-            raise ValueError(
-                f"CRITICAL DATA ERROR: event_df must be sorted by '{step_col}' before indexing. "
-                "Unsorted data will cause binary search (bisect) to return silent failures."
-            )
-
-
 
     df = _normalize_columns(event_df, src_col, dst_col, step_col, amount_col, alert_col)
     df = _ensure_event_id(df)
     _validate_required(df)
 
+    if os.getenv("MOTIF_DEBUG") == "1":
+        if not df["step"].is_monotonic_increasing:
+            raise ValueError(
+                "event_df must be sorted by 'step' before indexing. "
+                "Binary search in edges_after_step() assumes monotonic order."
+            )
+
     has_alert = "is_sar" in df.columns
-    out_index:  dict = defaultdict(list)
-    in_index:   dict = defaultdict(list)
+
+    out_index: dict = defaultdict(list)
+    in_index: dict = defaultdict(list)
     step_index: dict = defaultdict(list)
 
-    # Single O(n) pass — itertuples permitted per coding conventions when
-    # building an index that cannot be expressed as a vectorized operation.
     for row in df.itertuples(index=False):
         e: EventDict = {
             "event_id": int(row.event_id),
-            "step":     int(row.step),
-            "src":      int(row.src_node),
-            "dst":      int(row.dst_node),
-            "amount":   float(row.amount),
-            "is_sar":   int(row.is_sar) if has_alert else 0,
+            "step": int(row.step),
+            "src": int(row.src_node),
+            "dst": int(row.dst_node),
+            "amount": float(row.amount),
+            "is_sar": int(row.is_sar) if has_alert else 0,
         }
         out_index[e["src"]].append(e)
         in_index[e["dst"]].append(e)
         step_index[e["step"]].append(e)
 
-    # Freeze to regular dicts: prevents accidental key creation on miss
-    out_index  = dict(out_index)
-    in_index   = dict(in_index)
+    out_index = dict(out_index)
+    in_index = dict(in_index)
     step_index = dict(step_index)
-    # At the end of build_event_indexes, after populating out_index:
-    out_steps = {node: [e["step"] for e in edges]
-             for node, edges in out_index.items()}
+    out_steps = {
+        node: [e["step"] for e in edges]
+        for node, edges in out_index.items()
+    }
+
     gc.collect()
     return out_index, in_index, step_index, out_steps
-
-
-# ---------------------------------------------------------------------------
-# Forward-only lookup helper
-# ---------------------------------------------------------------------------
 
 
 def edges_after_step(
@@ -391,22 +324,6 @@ def edges_after_step(
 ) -> List[EventDict]:
     """
     Return all outgoing edges from `node` with step > `step`.
-
-    Used by matchers to expand a relay chain forward in time only.
-    Binary search on the pre-sorted bucket avoids a linear scan.
-
-    Parameters
-    ----------
-    out_index : dict
-        Output of build_event_indexes().
-    node : int
-        Source node ID.
-    step : int
-        All returned edges have step strictly greater than this value.
-
-    Returns
-    -------
-    List of EventDict, empty if node has no outgoing edges after step.
     """
     bucket = out_index.get(node)
     if not bucket:
@@ -415,9 +332,184 @@ def edges_after_step(
     return bucket[idx:]
 
 
+# ---------------------------------------------------------------------------
+# Temporal-edge shard loading
+# ---------------------------------------------------------------------------
+
+def load_windows_meta(meta_path: str | Path = WINDOW_META_PATH) -> pd.DataFrame:
+    """
+    Load notebook 1 window metadata.
+
+    Expected columns
+    ----------------
+    window, start, end, n_tx, n_temporal, n_second, n_snapshot
+    """
+    meta_path = Path(meta_path)
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"windows_meta not found: {meta_path}. "
+            "Run notebook 1 graph pipeline first."
+        )
+
+    meta = pd.read_parquet(meta_path)
+    required = {"window", "start", "end"}
+    missing = required - set(meta.columns)
+    if missing:
+        raise ValueError(
+            f"windows_meta is missing required columns: {sorted(missing)}. "
+            f"Available columns: {sorted(meta.columns)}"
+        )
+    return meta.sort_values(["start", "end"]).reset_index(drop=True)
+
+
+def temporal_shard_path(
+    step_start: int,
+    step_end: int,
+    shard_dir: str | Path = TEMPORAL_SHARD_DIR,
+) -> Path:
+    """
+    Resolve shard path for one temporal_edges window.
+    """
+    shard_dir = Path(shard_dir)
+    return shard_dir / f"w_{step_start}_{step_end}.parquet"
+
+
+def load_temporal_shard(
+    step_start: int,
+    step_end: int,
+    shard_dir: str | Path = TEMPORAL_SHARD_DIR,
+) -> pd.DataFrame:
+    """
+    Load one temporal_edges shard from notebook 1.
+    """
+    path = temporal_shard_path(step_start, step_end, shard_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Temporal shard not found: {path}. "
+            "Check notebook 1 outputs and shard naming."
+        )
+    te = pd.read_parquet(path)
+    _validate_temporal_edge_schema(te)
+    return te
+
+
+def iter_temporal_shards(
+    meta_df: pd.DataFrame,
+    shard_dir: str | Path = TEMPORAL_SHARD_DIR,
+    min_temporal_edges: int = 1,
+) -> Iterator[tuple[dict, pd.DataFrame]]:
+    """
+    Iterate over temporal_edges shards using windows_meta.
+
+    Yields
+    ------
+    (window_info, temporal_edges_df)
+    """
+    shard_dir = Path(shard_dir)
+
+    for row in meta_df.itertuples(index=False):
+        n_temporal = int(getattr(row, "n_temporal", 0))
+        if n_temporal < min_temporal_edges:
+            continue
+
+        step_start = int(row.start)
+        step_end = int(row.end)
+        te = load_temporal_shard(step_start, step_end, shard_dir)
+
+        yield (
+            {
+                "window": int(row.window),
+                "start": step_start,
+                "end": step_end,
+                "n_tx": int(getattr(row, "n_tx", 0)),
+                "n_temporal": n_temporal,
+                "n_second": int(getattr(row, "n_second", 0)),
+                "n_snapshot": int(getattr(row, "n_snapshot", 0)),
+            },
+            te,
+        )
+
 
 # ---------------------------------------------------------------------------
-# Window slice helper
+# Convert temporal_edges shard -> canonical event window
+# ---------------------------------------------------------------------------
+
+def temporal_edges_to_event_df(temporal_edges: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reconstruct a canonical event table from one temporal_edges shard.
+
+    Why this exists
+    ---------------
+    Notebook 1 emits temporal relay pairs, not one-row-per-event transaction
+    windows. Exact matchers in notebook 2 expect canonical event rows with:
+
+        event_id, src_node, dst_node, step, amount, is_sar
+
+    This function recovers unique event rows from the pair table.
+
+    Output columns
+    --------------
+    event_id, src_node, dst_node, step, amount, is_sar
+    """
+    _validate_temporal_edge_schema(temporal_edges)
+
+    left = temporal_edges[
+        ["src_1", "dst_1", "step_1", "amount_1", "alert_1"]
+    ].rename(columns={
+        "src_1": "src_node",
+        "dst_1": "dst_node",
+        "step_1": "step",
+        "amount_1": "amount",
+        "alert_1": "is_sar",
+    })
+
+    right = temporal_edges[
+        ["src_2", "dst_2", "step_2", "amount_2", "alert_2"]
+    ].rename(columns={
+        "src_2": "src_node",
+        "dst_2": "dst_node",
+        "step_2": "step",
+        "amount_2": "amount",
+        "alert_2": "is_sar",
+    })
+
+    events = pd.concat([left, right], ignore_index=True)
+
+    # Deduplicate identical event rows recovered from multiple relay pairs.
+    events = (
+        events
+        .drop_duplicates(subset=["src_node", "dst_node", "step", "amount", "is_sar"])
+        .sort_values(["step", "src_node", "dst_node", "amount"])
+        .reset_index(drop=True)
+    )
+
+    events["event_id"] = range(len(events))
+    events["src_node"] = events["src_node"].astype("int64")
+    events["dst_node"] = events["dst_node"].astype("int64")
+    events["step"] = events["step"].astype("int32")
+    events["amount"] = events["amount"].astype("float32")
+    events["is_sar"] = events["is_sar"].astype("int8")
+
+    return events[
+        ["event_id", "src_node", "dst_node", "step", "amount", "is_sar"]
+    ]
+
+
+def load_event_window_from_temporal_shard(
+    step_start: int,
+    step_end: int,
+    shard_dir: str | Path = TEMPORAL_SHARD_DIR,
+) -> pd.DataFrame:
+    """
+    One-step helper:
+        temporal_edges shard -> canonical event window
+    """
+    te = load_temporal_shard(step_start, step_end, shard_dir)
+    return temporal_edges_to_event_df(te)
+
+
+# ---------------------------------------------------------------------------
+# Legacy helper retained for compatibility
 # ---------------------------------------------------------------------------
 
 def filter_window(
@@ -426,29 +518,29 @@ def filter_window(
     step_end: int,
 ) -> pd.DataFrame:
     """
-    Slice event_df to [step_start, step_end] (inclusive).
-
-    Use before build_event_indexes() when working from a full loaded
-    DataFrame rather than through iter_windows().
-
-    Parameters
-    ----------
-    event_df : pd.DataFrame
-        Must have a `step` column.
-    step_start, step_end : int
-        Inclusive step bounds.
-
-    Returns
-    -------
-    Filtered DataFrame with reset index.  Direction and step order preserved.
+    Legacy slice helper retained for compatibility.
+    Prefer notebook 1 shard loading over slicing a monolithic dataframe.
     """
     mask = (event_df["step"] >= step_start) & (event_df["step"] <= step_end)
     return event_df[mask].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal validators / normalizers
 # ---------------------------------------------------------------------------
+
+def _validate_temporal_edge_schema(te: pd.DataFrame) -> None:
+    required = {
+        "src_1", "dst_1", "step_1", "amount_1", "alert_1",
+        "src_2", "dst_2", "step_2", "amount_2", "alert_2",
+    }
+    missing = required - set(te.columns)
+    if missing:
+        raise ValueError(
+            f"temporal_edges shard is missing required columns: {sorted(missing)}. "
+            f"Available columns: {sorted(te.columns)}"
+        )
+
 
 def _normalize_columns(
     df: pd.DataFrame,
@@ -458,13 +550,8 @@ def _normalize_columns(
     amount_col: str,
     alert_col: str,
 ) -> pd.DataFrame:
-    """
-    Rename columns to canonical names (src_node, dst_node, step, amount, is_sar).
-    Supports three naming variants without copying the full DataFrame.
-    """
     rename: dict = {}
 
-    # Caller-specified override names
     if src_col != "src_node" and src_col in df.columns:
         rename[src_col] = "src_node"
     if dst_col != "dst_node" and dst_col in df.columns:
@@ -476,18 +563,15 @@ def _normalize_columns(
     if alert_col != "is_sar" and alert_col in df.columns:
         rename[alert_col] = "is_sar"
 
-    # Legacy / raw AMLGentex column names
     cols = set(df.columns)
     if "src_node" not in cols and "nameOrig" in cols:
         rename["nameOrig"] = "src_node"
     if "dst_node" not in cols and "nameDest" in cols:
         rename["nameDest"] = "dst_node"
-    # Short-form names (old pipeline)
     if "src_node" not in cols and "src" in cols:
         rename["src"] = "src_node"
     if "dst_node" not in cols and "dst" in cols:
         rename["dst"] = "dst_node"
-    # is_sar / Is Laundering / is_laundering aliases
     if "is_sar" not in cols:
         for alias in ("is_laundering", "Is Laundering", "isSAR"):
             if alias in cols:
@@ -500,7 +584,6 @@ def _normalize_columns(
 
 
 def _ensure_event_id(df: pd.DataFrame) -> pd.DataFrame:
-    """Auto-assign event_id from row index if the column is absent."""
     if "event_id" not in df.columns:
         df = df.copy()
         df["event_id"] = range(len(df))
@@ -508,7 +591,6 @@ def _ensure_event_id(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _validate_required(df: pd.DataFrame) -> None:
-    """Raise ValueError if mandatory columns are missing."""
     required = {"event_id", "step", "src_node", "dst_node", "amount"}
     missing = required - set(df.columns)
     if missing:
@@ -521,42 +603,65 @@ def _validate_required(df: pd.DataFrame) -> None:
 __all__ = [
     "build_event_indexes",
     "edges_after_step",
+    "load_windows_meta",
+    "load_temporal_shard",
+    "iter_temporal_shards",
+    "temporal_edges_to_event_df",
+    "load_event_window_from_temporal_shard",
     "filter_window",
 ]
 
 
+cell 3:
 
 """
-matchers — Temporal motif matching for AML detection.
+cell 3 — Exact temporal motif matchers for AML detection.
 
-Five templates:
-    fan_in      : many -> one within delta steps
-    fan_out     : one -> many within delta steps
-    cycle_3     : u -> v -> w -> u with strict time order
-    relay_4     : u -> v -> w -> x with strict time order
-    split_merge : u -> v1 -> z and u -> v2 -> z
+This cell contains the exact matcher logic used AFTER candidate-window
+selection. It is not intended to mine the full dataset globally.
 
-General rules for every matcher (guide §4):
-    1. Forward-only — step strictly increases at each hop.
-    2. Early stop — prune immediately when any constraint fails.
-    3. No side effects — indexes are never modified.
-    4. Return list[dict] — each dict is one motif instance.
+Implemented motif families
+--------------------------
+- fanin       : many -> one within a tight time span
+- fanout      : one -> many within a tight time span
+- cycle3      : u -> v -> w -> u
+- relay4      : u -> v -> w -> x
+- split_merge : u -> v1 -> z and u -> v2 -> z
 
-Instance dict keys (guide §8):
-    motif_type, nodes, edges (event_id list),
-    steps, amounts, lags, ratios, n_alert
+General design rules
+--------------------
+1. Forward-only:
+   steps must strictly increase along the motif path.
 
-No pandas / cuDF imports — only plain Python dicts and lists.
+2. Early pruning:
+   stop as soon as any temporal, structural, or amount constraint fails.
+
+3. No side effects:
+   matchers treat indexes as read-only.
+
+4. Standardized output:
+   each matcher returns `list[dict]`, one dict per motif instance.
+
+Expected instance keys
+----------------------
+motif_type, nodes, edges, steps, amounts, lags, ratios, n_alert
+
+Dependencies
+------------
+These matchers assume Cell 2 already built local event indexes from one
+candidate event window. They should not be run directly on aggregated
+graph objects such as second-order edges or snapshot graphs.
 """
 
 from __future__ import annotations
+
 
 # ---------------------------------------------------------------------------
 # Primitive constraint helpers
 # ---------------------------------------------------------------------------
 
 def _ratio_ok(a_prev: float, a_curr: float, rho_min: float, rho_max: float) -> bool:
-    """True if a_curr / a_prev is in [rho_min, rho_max]."""
+    """Return True when a_curr / a_prev lies in [rho_min, rho_max]."""
     if a_prev <= 0:
         return False
     r = a_curr / a_prev
@@ -564,13 +669,13 @@ def _ratio_ok(a_prev: float, a_curr: float, rho_min: float, rho_max: float) -> b
 
 
 def _lag_ok(step_prev: int, step_curr: int, delta: int) -> bool:
-    """True if 0 < step_curr - step_prev <= delta."""
+    """Return True when 0 < step_curr - step_prev <= delta."""
     lag = step_curr - step_prev
     return 0 < lag <= delta
 
 
 # ---------------------------------------------------------------------------
-# Instance constructor
+# Standard motif instance constructor
 # ---------------------------------------------------------------------------
 
 def _make_instance(
@@ -579,11 +684,23 @@ def _make_instance(
     nodes: list[int],
 ) -> dict:
     """
-    Build a standardised motif instance dict from an ordered edge list.
+    Build one standardized motif instance.
 
-    `edges` must be in chronological order (step ascending).
+    Parameters
+    ----------
+    motif_type : str
+        Name of the matched motif family.
+    edges : list[dict]
+        Edge records in chronological order.
+    nodes : list[int]
+        Ordered node sequence representing the motif.
+
+    Returns
+    -------
+    dict
+        Standardized motif instance payload.
     """
-    steps   = [e["step"]   for e in edges]
+    steps   = [e["step"] for e in edges]
     amounts = [e["amount"] for e in edges]
     lags    = [steps[i] - steps[i - 1] for i in range(1, len(steps))]
     ratios  = [
@@ -592,18 +709,18 @@ def _make_instance(
     ]
     return {
         "motif_type": motif_type,
-        "nodes":      nodes,
-        "edges":      [e["event_id"] for e in edges],
-        "steps":      steps,
-        "amounts":    amounts,
-        "lags":       lags,
-        "ratios":     ratios,
-        "n_alert":    sum(e.get("is_sar", 0) for e in edges),
+        "nodes": nodes,
+        "edges": [e["event_id"] for e in edges],
+        "steps": steps,
+        "amounts": amounts,
+        "lags": lags,
+        "ratios": ratios,
+        "n_alert": sum(e.get("is_sar", 0) for e in edges),
     }
 
 
 # ---------------------------------------------------------------------------
-# Fan-in  — FIX R3: add seen-set dedup
+# Fan-in matcher
 # ---------------------------------------------------------------------------
 
 def find_fanin(
@@ -611,46 +728,48 @@ def find_fanin(
     cfg: MotifConfig,
 ) -> list[dict]:
     """
-    Fan-in: r_min_fanin distinct sources -> same destination x, within delta steps.
+    Match fan-in patterns:
 
         u1 -> x
-        u2 -> x   (step_u2 - step_u1 <= delta)
-        u3 -> x   ...
+        u2 -> x
+        u3 -> x
+        ...
 
-    Constraints:
-        - All sources distinct.
-        - All arrivals in [t0, t0 + delta].
-        - Amount ratio of each edge vs seed in [rho_min, rho_max].
-        - At least r_min_fanin sources found.
+    subject to:
+    - distinct sources
+    - arrivals within cfg.delta steps of the seed edge
+    - consecutive accepted amounts within [rho_min, rho_max]
 
-    FIX R3: A seen-set keyed by (frozenset(source_ids), destination) prevents
-    the O(n^2) duplicate groups produced by seed-shifting without dedup.
+    Deduplication
+    -------------
+    A seen-set keyed by (frozenset(source_ids), destination) prevents
+    the same source group from being emitted multiple times under
+    different seed edges.
     """
     results = []
-    # seen: prevents re-emitting the same group under a different seed edge.
     seen: set = set()
 
     for x, incoming in in_index.items():
         n = len(incoming)
         if n < cfg.r_min_fanin:
-            continue    # prune: not enough edges to form a group
+            continue
 
         for i in range(n):
-            seed   = incoming[i]
-            t0     = seed["step"]
+            seed = incoming[i]
+            t0 = seed["step"]
             a_prev = seed["amount"]
             seen_src = {seed["src"]}
-            group  = [seed]
+            group = [seed]
 
             for j in range(i + 1, n):
                 e = incoming[j]
-                # Prune: window exceeded — bucket is sorted, so break early
+
                 if e["step"] - t0 > cfg.delta:
                     break
-                # Prune: duplicate source — skip, do not break
+
                 if e["src"] in seen_src:
                     continue
-                # Prune: amount ratio
+
                 if not _ratio_ok(a_prev, e["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
@@ -659,11 +778,9 @@ def find_fanin(
                 a_prev = e["amount"]
 
             if len(group) >= cfg.r_min_fanin:
-                # Canonical key: frozenset of participating source IDs + destination.
-                # This collapses all seed permutations of the same source group.
                 key = (frozenset(e["src"] for e in group), x)
                 if key in seen:
-                    continue        # already emitted this exact group
+                    continue
                 seen.add(key)
 
                 nodes = [e["src"] for e in group] + [x]
@@ -673,7 +790,7 @@ def find_fanin(
 
 
 # ---------------------------------------------------------------------------
-# Fan-out  — unchanged; correct as-is
+# Fan-out matcher
 # ---------------------------------------------------------------------------
 
 def find_fanout(
@@ -682,14 +799,17 @@ def find_fanout(
     out_steps: dict,
 ) -> list[dict]:
     """
-    Fan-out: source x -> r_min_fanout distinct destinations, within delta steps.
+    Match fan-out patterns:
 
         x -> v1
-        x -> v2   (step_v2 - step_v1 <= delta)
-        x -> v3   ...
+        x -> v2
+        x -> v3
+        ...
 
-    Constraints mirror find_fanin (symmetric).
-    Returns list of instance dicts.
+    subject to:
+    - distinct destinations
+    - departures within cfg.delta steps of the seed edge
+    - consecutive accepted amounts within [rho_min, rho_max]
     """
     results = []
 
@@ -699,11 +819,11 @@ def find_fanout(
             continue
 
         for i in range(n):
-            seed   = outgoing[i]
-            t0     = seed["step"]
-            a0     = seed["amount"]
-            seen   = {seed["dst"]}
-            group  = [seed]
+            seed = outgoing[i]
+            t0 = seed["step"]
+            a0 = seed["amount"]
+            seen = {seed["dst"]}
+            group = [seed]
             a_prev = a0
 
             for j in range(i + 1, n):
@@ -730,7 +850,7 @@ def find_fanout(
 
 
 # ---------------------------------------------------------------------------
-# Cycle-3  — unchanged; has seen-set dedup
+# Cycle-3 matcher
 # ---------------------------------------------------------------------------
 
 def find_cycle3(
@@ -739,34 +859,33 @@ def find_cycle3(
     out_steps: dict,
 ) -> list[dict]:
     """
-    Cycle-3: u -> v -> w -> u with strictly increasing steps.
+    Match 3-cycle patterns:
 
-    Constraints:
-        - step_e1 < step_e2 < step_e3 (strict)
-        - Each consecutive lag <= delta
-        - Amount ratio at each hop in [rho_min, rho_max]
-        - u, v, w are three distinct nodes
+        u -> v -> w -> u
 
-    Uses edges_after_step() for forward-only bucket access.
-    Returns list of instance dicts.
+    subject to:
+    - strict forward time order
+    - each hop lag <= cfg.delta
+    - hop-to-hop amount ratios within [rho_min, rho_max]
+    - u, v, w all distinct
     """
     results = []
     seen = set()
+
     for u, edges_u in out_index.items():
         for e1 in edges_u:
-            v  = e1["dst"]
+            v = e1["dst"]
             t1 = e1["step"]
             a1 = e1["amount"]
 
             if v == u:
                 continue
 
-            # e2: v -> w, step in (t1, t1 + delta]
             for e2 in edges_after_step(out_index, v, t1, out_steps):
                 if e2["step"] - t1 > cfg.delta:
-                    break   # bucket sorted -> nothing after is valid
+                    break
 
-                w  = e2["dst"]
+                w = e2["dst"]
                 a2 = e2["amount"]
 
                 if w == u or w == v:
@@ -775,7 +894,6 @@ def find_cycle3(
                 if not _ratio_ok(a1, a2, cfg.rho_min, cfg.rho_max):
                     continue
 
-                # e3: w -> u, step in (t2, t2 + delta]
                 for e3 in edges_after_step(out_index, w, e2["step"], out_steps):
                     if e3["step"] - e2["step"] > cfg.delta:
                         break
@@ -785,9 +903,12 @@ def find_cycle3(
 
                     if not _ratio_ok(a2, e3["amount"], cfg.rho_min, cfg.rho_max):
                         continue
-                    key = frozenset([e1["event_id"],
-                                     e2["event_id"],
-                                     e3["event_id"]])
+
+                    key = frozenset([
+                        e1["event_id"],
+                        e2["event_id"],
+                        e3["event_id"],
+                    ])
                     if key in seen:
                         continue
                     seen.add(key)
@@ -802,7 +923,7 @@ def find_cycle3(
 
 
 # ---------------------------------------------------------------------------
-# Relay-4  — unchanged; has seen-set dedup
+# Relay-4 matcher
 # ---------------------------------------------------------------------------
 
 def find_relay4(
@@ -811,22 +932,22 @@ def find_relay4(
     out_steps: dict,
 ) -> list[dict]:
     """
-    Relay-4: u -> v -> w -> x with strictly increasing steps.
+    Match relay-4 patterns:
 
-    Constraints:
-        - step_e1 < step_e2 < step_e3 (strict)
-        - Each consecutive lag <= delta
-        - Amount ratio at each hop in [rho_min, rho_max]
-        - u, v, w, x are four distinct nodes
+        u -> v -> w -> x
 
-    Uses edges_after_step() for forward-only access.
-    Returns list of instance dicts.
+    subject to:
+    - strict forward time order
+    - each hop lag <= cfg.delta
+    - hop-to-hop amount ratios within [rho_min, rho_max]
+    - u, v, w, x all distinct
     """
     results = []
     seen = set()
+
     for u, edges_u in out_index.items():
         for e1 in edges_u:
-            v  = e1["dst"]
+            v = e1["dst"]
             t1 = e1["step"]
             a1 = e1["amount"]
 
@@ -837,7 +958,7 @@ def find_relay4(
                 if e2["step"] - t1 > cfg.delta:
                     break
 
-                w  = e2["dst"]
+                w = e2["dst"]
                 a2 = e2["amount"]
 
                 if w in (u, v):
@@ -850,7 +971,7 @@ def find_relay4(
                     if e3["step"] - e2["step"] > cfg.delta:
                         break
 
-                    x  = e3["dst"]
+                    x = e3["dst"]
                     a3 = e3["amount"]
 
                     if x in (u, v, w):
@@ -859,9 +980,11 @@ def find_relay4(
                     if not _ratio_ok(a2, a3, cfg.rho_min, cfg.rho_max):
                         continue
 
-                    key = frozenset([e1["event_id"],
-                                     e2["event_id"],
-                                     e3["event_id"]])
+                    key = frozenset([
+                        e1["event_id"],
+                        e2["event_id"],
+                        e3["event_id"],
+                    ])
                     if key in seen:
                         continue
                     seen.add(key)
@@ -876,7 +999,7 @@ def find_relay4(
 
 
 # ---------------------------------------------------------------------------
-# Split-merge  — FIX R2: single-best-edge + dedup + remove dead code
+# Split-merge matcher
 # ---------------------------------------------------------------------------
 
 def find_split_merge(
@@ -886,68 +1009,60 @@ def find_split_merge(
     out_steps: dict,
 ) -> list[dict]:
     """
-    Split-merge: source splits to two intermediaries that recombine at one target.
+    Match split-merge patterns:
 
         u -> v1 -> z
         u -> v2 -> z
 
-    Two-phase:
-        Phase 1: find split pairs (u -> v1, u -> v2) within delta steps.
-        Phase 2: for each pair, find a common target z that both v1 and v2
-                 reach within 2 * delta steps of the split start.
+    Matching strategy
+    -----------------
+    Phase 1:
+        find split pairs (u -> v1, u -> v2) within cfg.delta
 
-    Constraints:
-        - u, v1, v2, z are four distinct nodes
-        - Amount ratio at every hop in [rho_min, rho_max]
-        - All events in chronological order per hop
+    Phase 2:
+        find a shared target z reachable from both v1 and v2 within
+        2 * cfg.delta of the split start
 
-    FIX R2a — single-best-edge: v1_targets keeps only the FIRST (earliest)
-        edge from v1 to each z, not all edges.  This avoids the Cartesian
-        product explosion in the original code where v1_targets[z] was a list
-        and every (e_v1z, e_v2z) combo was emitted as a separate instance.
-
-    FIX R2b — seen-set: a frozenset over all four event_ids prevents the same
-        (u, v1, v2, z) quad from being re-emitted via different traversal paths.
-
-    FIX R2c — v1_targets cached per (u, v1): computed once before the v2 loop,
-        not rebuilt for every (v1, v2) pair.
+    Important implementation notes
+    ------------------------------
+    - For each (u, v1), keep only the earliest v1 -> z edge.
+    - Deduplicate using all four event_ids.
+    - This is intentionally more restrictive than a full Cartesian expansion,
+      to control runtime and duplicate explosion.
     """
     results = []
-    seen: set = set()   # frozenset of 4 event_ids to deduplicate quads
+    seen: set = set()
 
     for u, outgoing_u in out_index.items():
         n = len(outgoing_u)
 
         for i in range(n):
             e_uv1 = outgoing_u[i]
-            v1    = e_uv1["dst"]
-            t0    = e_uv1["step"]
+            v1 = e_uv1["dst"]
+            t0 = e_uv1["step"]
             a_uv1 = e_uv1["amount"]
 
-            # FIX R2c — build v1_targets once per (u, v1) before the v2 loop.
-            # Maps z -> the single earliest v1->z edge within 2*delta of t0.
             v1_targets: dict = {}
             for e in edges_after_step(out_index, v1, t0, out_steps):
                 if e["step"] - t0 > 2 * cfg.delta:
                     break
+
                 z = e["dst"]
                 if z in (u, v1):
                     continue
+
                 if not _ratio_ok(a_uv1, e["amount"], cfg.rho_min, cfg.rho_max):
                     continue
-                # FIX R2a — keep only the first (earliest) edge to z.
+
                 if z not in v1_targets:
                     v1_targets[z] = e
 
-            # Skip this v1 entirely if it reaches no valid targets
             if not v1_targets:
                 continue
 
-            # Phase 1: iterate v2 candidates (outgoing edges from u after e_uv1)
             for j in range(i + 1, n):
                 e_uv2 = outgoing_u[j]
 
-                # Prune: split window exceeded
                 if e_uv2["step"] - t0 > cfg.delta:
                     break
 
@@ -955,30 +1070,33 @@ def find_split_merge(
                 if v2 == v1 or v2 == u:
                     continue
 
-                # Prune: split amount ratio
                 if not _ratio_ok(a_uv1, e_uv2["amount"], cfg.rho_min, cfg.rho_max):
                     continue
 
-                # Phase 2: find v2 -> z where z is already reachable from v1
                 for e_v2z in edges_after_step(out_index, v2, t0, out_steps):
                     if e_v2z["step"] - t0 > 2 * cfg.delta:
                         break
-                    z = e_v2z["dst"]
 
-                    # z must be in v1_targets and must be a new node
+                    z = e_v2z["dst"]
                     if z not in v1_targets or z in (u, v1, v2):
                         continue
 
-                    # Amount ratio on the v2->z leg
-                    if not _ratio_ok(e_uv2["amount"], e_v2z["amount"],
-                                     cfg.rho_min, cfg.rho_max):
+                    if not _ratio_ok(
+                        e_uv2["amount"],
+                        e_v2z["amount"],
+                        cfg.rho_min,
+                        cfg.rho_max,
+                    ):
                         continue
 
-                    e_v1z = v1_targets[z]   # single best edge
+                    e_v1z = v1_targets[z]
 
-                    # FIX R2b — dedup by the four event_ids
-                    key = frozenset([e_uv1["event_id"], e_uv2["event_id"],
-                                     e_v1z["event_id"], e_v2z["event_id"]])
+                    key = frozenset([
+                        e_uv1["event_id"],
+                        e_uv2["event_id"],
+                        e_v1z["event_id"],
+                        e_v2z["event_id"],
+                    ])
                     if key in seen:
                         continue
                     seen.add(key)
@@ -987,6 +1105,7 @@ def find_split_merge(
                         [e_uv1, e_uv2, e_v1z, e_v2z],
                         key=lambda e: e["step"],
                     )
+
                     results.append(
                         _make_instance("split_merge", all_edges, [u, v1, v2, z])
                     )
@@ -994,10 +1113,9 @@ def find_split_merge(
     return results
 
 
-
-# Convenience: run all matchers on a pre-built index set
-# FIX R1: max_instances cap prevents unbounded RAM accumulation.
-
+# ---------------------------------------------------------------------------
+# Convenience runner
+# ---------------------------------------------------------------------------
 
 def run_all_matchers(
     out_index: dict,
@@ -1006,39 +1124,52 @@ def run_all_matchers(
     out_steps: dict[int, list[dict]],
 ) -> list[dict]:
     """
-    Run all five matchers and return a combined instance list.
+    Run the currently enabled exact matchers and combine their outputs.
 
-    Parameters
-    ----------
-    out_index, in_index : dict
-        Output of build_event_indexes().
-    cfg : MotifConfig
-        Motif configuration.  cfg.max_instances caps the total list size
-        (0 = disabled).
+    Important
+    ---------
+    Despite the historical function name, this runner does NOT currently
+    execute every matcher defined in this cell.
 
-    Returns
-    -------
-    Combined list of all matched motif instances across all types.
-    If cfg.max_instances > 0, each matcher's result is truncated to
-    cfg.max_instances before concatenation, and a warning is printed.
+    Active by default
+    -----------------
+    - fanin
+    - fanout
+    - relay4
+
+    Currently disabled in the orchestration
+    ---------------------------------------
+    - cycle3
+    - split_merge
+
+    Those disabled matchers remain available and can be re-enabled later,
+    but they are excluded here to keep runtime and memory within bounds
+    during selective exact mining.
+
+    Memory guard
+    ------------
+    If cfg.max_instances > 0, each active matcher's output is truncated
+    before concatenation.
     """
-    # Run each matcher independently so we can apply the cap per type.
     matchers = {
-        "fanin":       find_fanin(in_index, cfg),
-        "fanout":      find_fanout(out_index, cfg, out_steps),
-        #"cycle3":      find_cycle3(out_index, cfg, out_steps),
-        "relay4":      find_relay4(out_index, cfg, out_steps),
-        #"split_merge": find_split_merge(out_index, in_index, cfg, out_steps),
+        "fanin": find_fanin(in_index, cfg),
+        "fanout": find_fanout(out_index, cfg, out_steps),
+        # "cycle3": find_cycle3(out_index, cfg, out_steps),
+        "relay4": find_relay4(out_index, cfg, out_steps),
+        # "split_merge": find_split_merge(out_index, in_index, cfg, out_steps),
     }
 
     combined = []
     cap = cfg.max_instances if cfg.max_instances > 0 else None
+
     for mtype, instances in matchers.items():
         if cap and len(instances) > cap:
-            # Warn and truncate; do NOT silently skip — the signal is still present.
-            print(f"  [WARN] {mtype}: {len(instances):,} instances exceed "
-                  f"max_instances={cap:,}; truncating to {cap:,}.")
+            print(
+                f"  [WARN] {mtype}: {len(instances):,} instances exceed "
+                f"max_instances={cap:,}; truncating to {cap:,}."
+            )
             instances = instances[:cap]
+
         combined.extend(instances)
 
     return combined
@@ -1054,48 +1185,62 @@ __all__ = [
 ]
 
 
+cell 4:
 
-# scoring — support counting, filtering, null-model z-score.
-# FIX R4a: _run_matchers_on_df truncates instances per null pass (cap arg).
-# FIX R4b: compute_null_zscore subsamples event_df per perm (sample_frac).
-# FIX R4c: compute_null_zscore returns {} when observed_counts is empty.
+"""
+cell 4 — Candidate selection + motif scoring + selective null-model evaluation.
+
+Redesign goals
+--------------
+1. Stage 3:
+   Exact motif mining is no longer run on every window by default.
+   We score windows cheaply first, then run exact search only on candidates.
+
+2. Stage 4:
+   Motifs are supporting structural evidence.
+   This cell prepares support counts, optional z-score filtering,
+   and candidate-window mining outputs that feed feature extraction downstream.
+
+Assumptions
+-----------
+- Cell 1 defines MotifConfig
+- Cell 2 defines:
+    load_windows_meta
+    load_event_window_from_temporal_shard
+    build_event_indexes
+- Cell 3 defines:
+    run_all_matchers
+"""
 
 from __future__ import annotations
 
 import copy
 import gc
-
 from collections import Counter
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 
-# ============================================================
+# ---------------------------------------------------------------------------
 # Support counting
-# ============================================================
+# ---------------------------------------------------------------------------
 
 def count_support(motif_instances: List[dict]) -> Dict[str, int]:
     """
     Count matched instances by motif type.
-
-    Returns
-    -------
-    Dict[str, int]
-        {motif_type: count}
     """
     c: Counter = Counter()
-
     for inst in motif_instances:
         c[inst["motif_type"]] += 1
-
     return dict(c)
 
 
-# ============================================================
+# ---------------------------------------------------------------------------
 # Filtering
-# ============================================================
+# ---------------------------------------------------------------------------
 
 def filter_motifs(
     instances: List[dict],
@@ -1103,31 +1248,31 @@ def filter_motifs(
     zscore_results: Dict[str, dict] | None = None,
 ) -> List[dict]:
     """
-    Apply per-type r_min and optional z-score threshold.
+    Apply per-type support and optional z-score filtering.
 
-    fan-in / fan-out r_min is enforced by the matchers;
-    require >=1 here.
+    Notes
+    -----
+    fanin / fanout minimum support is mostly enforced structurally by the matchers,
+    but we still keep a consistent per-type gate here.
     """
-
     r_min_map = {
-        "fanin":       1,
-        "fanout":      1,
-        "cycle3":      cfg.r_min_cycle,
-        "relay4":      cfg.r_min_relay,
+        "fanin": 1,
+        "fanout": 1,
+        "cycle3": cfg.r_min_cycle,
+        "relay4": cfg.r_min_relay,
         "split_merge": cfg.r_min_split_merge,
     }
 
     support = count_support(instances)
-
     keep_types = set()
 
     for mtype, count in support.items():
-
         if count < r_min_map.get(mtype, 1):
             continue
 
         if zscore_results is not None:
-            if zscore_results.get(mtype, {}).get("zscore", 0.0) < cfg.z_min:
+            z = zscore_results.get(mtype, {}).get("zscore", 0.0)
+            if z < cfg.z_min:
                 continue
 
         keep_types.add(mtype)
@@ -1139,9 +1284,117 @@ def filter_motifs(
     ]
 
 
-# ============================================================
+# ---------------------------------------------------------------------------
+# Candidate window scoring
+# ---------------------------------------------------------------------------
+
+def score_candidate_windows(
+    meta_df: pd.DataFrame,
+    window_risk_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Compute cheap candidate scores BEFORE exact motif mining.
+
+    Base score uses notebook 1 metadata only:
+        - n_temporal
+        - n_tx
+
+    Optional extra signal:
+        window_risk_df with columns:
+            start, end, window_risk_score
+
+    Returns
+    -------
+    DataFrame with columns:
+        window, start, end, n_tx, n_temporal, candidate_score
+    """
+    df = meta_df.copy()
+
+    if "n_temporal" not in df.columns:
+        df["n_temporal"] = 0
+    if "n_tx" not in df.columns:
+        df["n_tx"] = 0
+
+    # Base score:
+    # favor windows with many relay pairs, lightly adjusted by tx volume
+    df["candidate_score"] = (
+        np.log1p(df["n_temporal"].astype(float))
+        + 0.25 * np.log1p(df["n_tx"].astype(float))
+    )
+
+    if window_risk_df is not None and len(window_risk_df) > 0:
+        required = {"start", "end", "window_risk_score"}
+        missing = required - set(window_risk_df.columns)
+        if missing:
+            raise ValueError(
+                f"window_risk_df is missing required columns: {sorted(missing)}"
+            )
+
+        df = df.merge(
+            window_risk_df[["start", "end", "window_risk_score"]],
+            on=["start", "end"],
+            how="left",
+        )
+        df["window_risk_score"] = df["window_risk_score"].fillna(0.0)
+        df["candidate_score"] = df["candidate_score"] + df["window_risk_score"]
+
+    return df.sort_values(
+        ["candidate_score", "n_temporal", "n_tx"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+def select_candidate_windows(
+    meta_df: pd.DataFrame,
+    cfg: MotifConfig,
+    window_risk_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Select candidate windows for exact motif mining.
+
+    Selection policy is controlled by config-like attributes.
+    Uses getattr() so the code remains backward-compatible if older
+    MotifConfig does not yet define these fields.
+
+    Supported modes
+    ---------------
+    candidate_window_mode:
+        - "top_k"
+        - "threshold"
+        - "all"
+
+    Other config fields used if present
+    -----------------------------------
+    top_k_windows
+    window_score_threshold
+    max_windows_exact
+    """
+    scored = score_candidate_windows(meta_df, window_risk_df)
+
+    mode = getattr(cfg, "candidate_window_mode", "top_k")
+    top_k = int(getattr(cfg, "top_k_windows", 10))
+    score_threshold = float(getattr(cfg, "window_score_threshold", 0.0))
+    max_windows_exact = int(getattr(cfg, "max_windows_exact", top_k))
+
+    # Always exclude windows with zero temporal relay pairs for exact motifs
+    scored = scored[scored["n_temporal"] > 0].reset_index(drop=True)
+
+    if mode == "all":
+        selected = scored
+    elif mode == "threshold":
+        selected = scored[scored["candidate_score"] >= score_threshold]
+    else:
+        selected = scored.head(top_k)
+
+    if max_windows_exact > 0:
+        selected = selected.head(max_windows_exact)
+
+    return selected.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
 # Null-model helpers
-# ============================================================
+# ---------------------------------------------------------------------------
 
 def _shuffle_timestamps(
     event_df: pd.DataFrame,
@@ -1157,11 +1410,9 @@ def _shuffle_timestamps(
     Breaks:
         - sequential motif patterns
     """
-
     df_null = event_df.copy()
 
     for src, idx in event_df.groupby("src_node").groups.items():
-
         df_null.loc[idx, "step"] = rng.permutation(
             event_df.loc[idx, "step"].to_numpy()
         )
@@ -1179,23 +1430,13 @@ def _run_matchers_on_df(
     cap: int = 0,
 ) -> Dict[str, int]:
     """
-    FIX R4a:
-        Build indexes, run matchers with per-type cap,
-        and return support counts.
-
-    Parameters
-    ----------
-    cap : int
-        Overrides cfg.max_instances for null runs,
-        bounding RAM usage per permutation.
+    Build local indexes, run enabled matchers, return support counts.
     """
-
     out_idx, in_idx, _, out_steps = build_event_indexes(event_df)
 
-    cfg_null = copy.copy(cfg)
-
+    cfg_local = copy.copy(cfg)
     if cap > 0:
-        cfg_null.max_instances = (
+        cfg_local.max_instances = (
             min(cap, cfg.max_instances)
             if cfg.max_instances > 0
             else cap
@@ -1204,20 +1445,17 @@ def _run_matchers_on_df(
     instances = run_all_matchers(
         out_idx,
         in_idx,
-        cfg_null,
+        cfg_local,
         out_steps,
     )
 
     counts = count_support(instances)
 
     del out_idx, in_idx, instances
+    gc.collect()
 
     return counts
 
-
-# ============================================================
-# Null-model z-score
-# ============================================================
 
 def compute_null_zscore(
     observed_counts: Dict[str, int],
@@ -1233,87 +1471,35 @@ def compute_null_zscore(
 
         z(M) = (C_obs - mean_null) / (std_null + eps)
 
-    FIXES
-    -----
-    R4a:
-        null_cap forwarded to matcher runs.
-
-    R4b:
-        sample_frac < 1.0 subsamples rows per permutation.
-
-    R4c:
-        Return {} immediately if observed_counts is empty.
-
-    Parameters
-    ----------
-    sample_frac : float
-        Fraction of rows sampled per permutation.
-
-        Recommended:
-            0.2 - 0.5 for large windows
-
-        1.0 = no sampling.
-
-    null_cap : int
-        Per-type instance cap inside each null pass.
+    This function is now intended for SELECTED candidate windows only.
     """
-
-    # --------------------------------------------------------
-    # FIX R4c
-    # --------------------------------------------------------
-
     if not observed_counts:
         return {}
 
     null_counts: Dict[str, list] = {
-        mt: []
-        for mt in observed_counts
+        mt: [] for mt in observed_counts
     }
 
     rng = np.random.default_rng(seed)
 
-    # --------------------------------------------------------
-    # Permutation loop
-    # --------------------------------------------------------
-
     for i in range(cfg.n_permutations):
-
         if verbose:
-            print(
-                f"  Null permutation "
-                f"{i + 1}/{cfg.n_permutations}..."
-            )
-
-        # ----------------------------------------------------
-        # FIX R4b — optional row sampling
-        # ----------------------------------------------------
+            print(f"  Null permutation {i + 1}/{cfg.n_permutations}...")
 
         if sample_frac < 1.0:
-
             df_perm = (
                 event_df
                 .sample(
                     frac=sample_frac,
-                    random_state=int(
-                        rng.integers(1_000_000)
-                    ),
+                    random_state=int(rng.integers(1_000_000)),
                 )
                 .sort_values(["step", "event_id"])
                 .reset_index(drop=True)
             )
-
         else:
             df_perm = event_df
 
-        # ----------------------------------------------------
-        # Timestamp shuffling
-        # ----------------------------------------------------
-
         df_null = _shuffle_timestamps(df_perm, rng)
-
-        # ----------------------------------------------------
-        # FIX R4a
-        # ----------------------------------------------------
 
         perm_counts = _run_matchers_on_df(
             df_null,
@@ -1322,96 +1508,154 @@ def compute_null_zscore(
         )
 
         for mt in observed_counts:
-            null_counts[mt].append(
-                perm_counts.get(mt, 0)
-            )
+            null_counts[mt].append(perm_counts.get(mt, 0))
 
         del df_null, perm_counts
-
         if sample_frac < 1.0:
             del df_perm
 
         gc.collect()
 
-    # --------------------------------------------------------
-    # Aggregate z-score results
-    # --------------------------------------------------------
-
     results: Dict[str, dict] = {}
 
     for mt, c_obs in observed_counts.items():
-
-        arr = np.array(
-            null_counts[mt],
-            dtype=float,
-        )
-
+        arr = np.array(null_counts[mt], dtype=float)
         mean_null = float(arr.mean())
-        std_null  = float(arr.std())
+        std_null = float(arr.std())
 
-        zscore = (
-            (c_obs - mean_null)
-            / (std_null + 1e-9)
-        )
+        zscore = (c_obs - mean_null) / (std_null + 1e-9)
 
         results[mt] = {
-            "observed":  c_obs,
+            "observed": c_obs,
             "mean_null": round(mean_null, 2),
-            "std_null":  round(std_null, 2),
-            "zscore":    round(zscore, 3),
+            "std_null": round(std_null, 2),
+            "zscore": round(zscore, 3),
         }
 
     return results
 
 
-# ============================================================
-# Public exports
-# ============================================================
+# ---------------------------------------------------------------------------
+# Candidate-window exact mining
+# ---------------------------------------------------------------------------
+
+def mine_candidate_windows(
+    cfg: MotifConfig,
+    meta_path: str | Path = WINDOW_META_PATH,
+    temporal_shard_dir: str | Path = TEMPORAL_SHARD_DIR,
+    window_risk_df: pd.DataFrame | None = None,
+    run_null_model: bool = False,
+    null_sample_frac: float = 1.0,
+    null_cap: int = 10_000,
+    verbose: bool = True,
+) -> tuple[list[dict], pd.DataFrame]:
+    """
+    Main Stage-3 exact motif execution.
+
+    Pipeline
+    --------
+    1. Load windows_meta
+    2. Score windows cheaply
+    3. Select candidate windows
+    4. For each candidate window:
+         - load temporal shard
+         - reconstruct canonical event_df
+         - run exact matchers locally
+         - optionally run null-model z-score
+         - filter instances
+    5. Return:
+         - combined filtered motif instances
+         - per-window summary table
+
+    Returns
+    -------
+    all_instances : list[dict]
+    summary_df    : pd.DataFrame
+    """
+    meta_df = load_windows_meta(meta_path)
+    selected = select_candidate_windows(meta_df, cfg, window_risk_df)
+
+    if verbose:
+        print(f"Selected {len(selected)} candidate windows for exact motif mining.")
+
+    all_instances: list[dict] = []
+    summaries: list[dict] = []
+
+    for row in selected.itertuples(index=False):
+        step_start = int(row.start)
+        step_end = int(row.end)
+
+        if verbose:
+            print(
+                f"\n[Candidate window {int(row.window)}] "
+                f"{step_start}-{step_end} | "
+                f"score={float(row.candidate_score):.3f} | "
+                f"n_temporal={int(row.n_temporal)}"
+            )
+
+        event_df = load_event_window_from_temporal_shard(
+            step_start=step_start,
+            step_end=step_end,
+            shard_dir=temporal_shard_dir,
+        )
+
+        out_idx, in_idx, _, out_steps = build_event_indexes(event_df)
+        raw_instances = run_all_matchers(out_idx, in_idx, cfg, out_steps)
+        observed_counts = count_support(raw_instances)
+
+        zscore_results = None
+        if run_null_model and observed_counts:
+            zscore_results = compute_null_zscore(
+                observed_counts=observed_counts,
+                event_df=event_df,
+                cfg=cfg,
+                sample_frac=null_sample_frac,
+                null_cap=null_cap,
+                verbose=verbose,
+            )
+
+        filtered_instances = filter_motifs(
+            raw_instances,
+            cfg,
+            zscore_results=zscore_results,
+        )
+
+        all_instances.extend(filtered_instances)
+
+        summaries.append({
+            "window": int(row.window),
+            "start": step_start,
+            "end": step_end,
+            "candidate_score": float(row.candidate_score),
+            "n_events": int(len(event_df)),
+            "n_instances_raw": int(len(raw_instances)),
+            "n_instances_filtered": int(len(filtered_instances)),
+            "support_raw": observed_counts,
+            "zscores": zscore_results if zscore_results is not None else {},
+        })
+
+        del out_idx, in_idx, out_steps, event_df, raw_instances, filtered_instances
+        gc.collect()
+
+    summary_df = pd.DataFrame(summaries)
+    return all_instances, summary_df
+
 
 __all__ = [
     "count_support",
     "filter_motifs",
+    "score_candidate_windows",
+    "select_candidate_windows",
     "compute_null_zscore",
+    "mine_candidate_windows",
 ]
 
-cell 4: 
 
-"""
-feature — Motif feature extraction for ML downstream use.
-
-Two primary feature tables:
-    1. Entity-level (per node, per motif type)
-       Output: build_entity_motif_features()  → long format
-               build_entity_feature_wide()     → wide format (one row per node)
-
-    2. Window-level (per time bucket, per motif type)
-       Output: build_window_motif_features()
-
-Export:
-    save_features() — writes parquet to a configurable path (Google Drive).
-
-Feature columns produced (motif_spec §7 / guide §8):
-    count             — raw instance count
-    avg_amount        — mean amount across all edges in matched instances
-    avg_ratio         — mean amount preservation ratio across hops
-    ratio_std         — std of amount ratio (higher = more irregular)
-    avg_lag           — mean step gap between consecutive hops
-    max_lag           — worst-case lag (flags delayed relay)
-    avg_n_alert_edges — mean flagged edges per instance
-    zscore            — significance vs. null model (from compute_null_zscore)
-    freq_by_degree    — count / node degree (passed in by caller)
-    freq_by_volume    — count / total transaction volume in window
-
-Guarantees:
-    - Time   : window_start assigned from min(steps) of each instance.
-    - Direction: node role (src/dst) preserved in entity table; not collapsed.
-    - Memory : row-building is O(instances × nodes_per_instance), not O(all transactions).
-               groupby aggregation is vectorized. No unnecessary intermediate copies.
-"""
+cell 5:
 
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -1419,9 +1663,8 @@ import numpy as np
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Entity-level features
-# ---------------------------------------------------------------------------
+DEFAULT_EXPORT_DIR: str = "outputs/motif_features"
+
 
 def build_entity_motif_features(
     motif_instances: List[dict],
@@ -1430,40 +1673,11 @@ def build_entity_motif_features(
     total_volume: float = 0.0,
 ) -> pd.DataFrame:
     """
-    Aggregate motif instances into a feature table per (node, motif_type).
+    Build node-level motif features from matched motif instances.
 
-    For each node participating in at least one motif instance, computes:
-        count             — number of instances the node appears in
-        avg_amount        — mean of per-instance mean amounts
-        avg_ratio         — mean amount preservation ratio across hops
-        ratio_std         — std of ratio sequence (instability signal)
-        avg_lag           — mean hop lag
-        max_lag           — maximum hop lag seen
-        avg_n_alert_edges — mean SAR-flagged edges per instance
-        zscore            — motif significance (from compute_null_zscore)
-        freq_by_degree    — count / node out-degree (0 if degree unknown)
-        freq_by_volume    — count / total_volume (0 if volume == 0)
-
-    Parameters
-    ----------
-    motif_instances : list[dict]
-        Combined output of run_all_matchers() or filter_motifs().
-    zscore_table : dict, optional
-        Output of compute_null_zscore(). Keys are motif_type strings.
-    node_degree : dict, optional
-        {node_id: degree} mapping. Used to compute freq_by_degree.
-        If None, freq_by_degree is set to 0 for all rows.
-    total_volume : float
-        Total transaction amount in the current window.
-        Used to compute freq_by_volume. Set to 0 to skip.
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        node, motif_type, count, avg_amount, avg_ratio, ratio_std,
-        avg_lag, max_lag, avg_n_alert_edges, zscore,
-        freq_by_degree, freq_by_volume
-    One row per (node, motif_type). Sorted by node, motif_type.
+    This is the primary node-level output contract of the exact motif branch.
+    Each row represents one (node, motif_type) pair and is intended for
+    downstream model ingestion after optional wide-format pivoting.
     """
     _EMPTY_COLS = [
         "node", "motif_type", "count",
@@ -1477,30 +1691,34 @@ def build_entity_motif_features(
 
     rows = []
     for inst in motif_instances:
-        mt      = inst["motif_type"]
+        mt = inst["motif_type"]
         amounts = inst.get("amounts", [])
-        lags    = inst.get("lags", [])
-        ratios  = inst.get("ratios", [])
+        lags = inst.get("lags", [])
+        ratios = inst.get("ratios", [])
         n_alert = inst.get("n_alert", 0)
-        zs      = zscore_table[mt]["zscore"] if (zscore_table and mt in zscore_table) else np.nan
+        zs = (
+            zscore_table[mt]["zscore"]
+            if (zscore_table and mt in zscore_table)
+            else np.nan
+        )
 
-        avg_amt   = float(np.mean(amounts))   if amounts else 0.0
-        avg_ratio = float(np.mean(ratios))    if ratios  else np.nan
-        r_std     = float(np.std(ratios))     if ratios  else np.nan
-        avg_lag   = float(np.mean(lags))      if lags    else 0.0
-        max_lag   = float(max(lags))          if lags    else 0.0
+        avg_amt = float(np.mean(amounts)) if amounts else 0.0
+        avg_ratio = float(np.mean(ratios)) if ratios else np.nan
+        r_std = float(np.std(ratios)) if ratios else np.nan
+        avg_lag = float(np.mean(lags)) if lags else 0.0
+        max_lag = float(max(lags)) if lags else 0.0
 
         for node in set(inst.get("nodes", [])):
             rows.append({
-                "node":             int(node),
-                "motif_type":       mt,
-                "avg_amount":       avg_amt,
-                "avg_ratio":        avg_ratio,
-                "ratio_std":        r_std,
-                "avg_lag":          avg_lag,
-                "max_lag":          max_lag,
-                "n_alert_edges":    n_alert,
-                "zscore":           zs,
+                "node": int(node),
+                "motif_type": mt,
+                "avg_amount": avg_amt,
+                "avg_ratio": avg_ratio,
+                "ratio_std": r_std,
+                "avg_lag": avg_lag,
+                "max_lag": max_lag,
+                "n_alert_edges": n_alert,
+                "zscore": zs,
             })
 
     if not rows:
@@ -1511,18 +1729,17 @@ def build_entity_motif_features(
     agg = (
         df.groupby(["node", "motif_type"], as_index=False)
         .agg(
-            count               =("avg_amount",     "count"),
-            avg_amount          =("avg_amount",      "mean"),
-            avg_ratio           =("avg_ratio",       "mean"),
-            ratio_std           =("ratio_std",       "mean"),
-            avg_lag             =("avg_lag",         "mean"),
-            max_lag             =("max_lag",         "max"),
-            avg_n_alert_edges   =("n_alert_edges",   "mean"),
-            zscore              =("zscore",          "first"),
+            count=("avg_amount", "count"),
+            avg_amount=("avg_amount", "mean"),
+            avg_ratio=("avg_ratio", "mean"),
+            ratio_std=("ratio_std", "mean"),
+            avg_lag=("avg_lag", "mean"),
+            max_lag=("max_lag", "max"),
+            avg_n_alert_edges=("n_alert_edges", "mean"),
+            zscore=("zscore", "first"),
         )
     )
 
-    # Normalised frequency by node degree
     if node_degree:
         agg["freq_by_degree"] = agg.apply(
             lambda r: r["count"] / node_degree.get(int(r["node"]), 1),
@@ -1531,7 +1748,6 @@ def build_entity_motif_features(
     else:
         agg["freq_by_degree"] = 0.0
 
-    # Normalised frequency by window transaction volume
     if total_volume > 0:
         agg["freq_by_volume"] = agg["count"] / total_volume
     else:
@@ -1540,29 +1756,12 @@ def build_entity_motif_features(
     return agg.sort_values(["node", "motif_type"]).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Wide-format pivot (one row per node, all motif types as columns)
-# ---------------------------------------------------------------------------
-
 def build_entity_feature_wide(entity_features: pd.DataFrame) -> pd.DataFrame:
     """
-    Pivot entity_motif_features from long → wide format.
+    Pivot node-level motif features from long format to wide format.
 
-    Long:  [node, motif_type, count, avg_amount, ...]
-    Wide:  [node, fanin_count, fanin_avg_amount, ..., cycle3_count, ...]
-
-    Use when a single feature vector per node is needed for model input.
-    Missing (node, motif_type) combinations are filled with 0.
-
-    Parameters
-    ----------
-    entity_features : pd.DataFrame
-        Output of build_entity_motif_features().
-
-    Returns
-    -------
-    pd.DataFrame: one row per node.
-    Column naming: {motif_type}_{metric}  e.g. fanin_count, relay4_avg_lag.
+    This is the preferred output when the downstream model expects one row
+    per node and one feature vector per node.
     """
     if entity_features.empty:
         return pd.DataFrame()
@@ -1581,44 +1780,22 @@ def build_entity_feature_wide(entity_features: pd.DataFrame) -> pd.DataFrame:
         aggfunc="first",
     )
 
-    # Flatten multi-level columns: (metric, motif_type) → "motif_type_metric"
     wide.columns = [f"{mt}_{metric}" for metric, mt in wide.columns]
     wide = wide.fillna(0).reset_index()
 
     return wide
 
 
-# ---------------------------------------------------------------------------
-# Window-level features
-# ---------------------------------------------------------------------------
-
 def build_window_motif_features(
     motif_instances: List[dict],
     window_size: int = 7,
 ) -> pd.DataFrame:
     """
-    Aggregate motif instances into a feature table per (window_start, motif_type).
+    Build window-level motif features from matched motif instances.
 
-    For each time bucket, computes:
-        count             — number of matched instances
-        total_amount      — total transaction amount across all edges
-        avg_lag           — mean hop lag across all instances
-        n_alert_edges     — total SAR-flagged edges
-        suspicious_ratio  — fraction of instances with at least one alert edge
-
-    Parameters
-    ----------
-    motif_instances : list[dict]
-        Output from run_all_matchers() or filter_motifs().
-    window_size : int
-        Number of steps per bucket. Default 7 = one week if step == 1 day.
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        window_start, motif_type, count, total_amount,
-        avg_lag, n_alert_edges, suspicious_ratio
-    Sorted by window_start, motif_type.
+    This is the primary time-window output contract of the exact motif branch.
+    It is useful for candidate-window diagnostics, temporal summaries, and
+    optional downstream window scoring.
     """
     _EMPTY_COLS = [
         "window_start", "motif_type", "count",
@@ -1630,24 +1807,23 @@ def build_window_motif_features(
 
     rows = []
     for inst in motif_instances:
-        steps   = inst.get("steps", [])
+        steps = inst.get("steps", [])
         amounts = inst.get("amounts", [])
-        lags    = inst.get("lags", [])
+        lags = inst.get("lags", [])
         n_alert = inst.get("n_alert", 0)
 
         if not steps:
             continue
 
-        # Assign to bucket by first event's step — time-preserving
         window_start = (min(steps) // window_size) * window_size
 
         rows.append({
             "window_start": window_start,
-            "motif_type":   inst["motif_type"],
+            "motif_type": inst["motif_type"],
             "total_amount": float(sum(amounts)) if amounts else 0.0,
-            "avg_lag":      float(np.mean(lags)) if lags else 0.0,
+            "avg_lag": float(np.mean(lags)) if lags else 0.0,
             "n_alert_edges": n_alert,
-            "has_alert":    int(n_alert > 0),
+            "has_alert": int(n_alert > 0),
         })
 
     if not rows:
@@ -1658,25 +1834,15 @@ def build_window_motif_features(
     agg = (
         df.groupby(["window_start", "motif_type"], as_index=False)
         .agg(
-            count            =("total_amount",  "count"),
-            total_amount     =("total_amount",  "sum"),
-            avg_lag          =("avg_lag",        "mean"),
-            n_alert_edges    =("n_alert_edges",  "sum"),
-            suspicious_ratio =("has_alert",      "mean"),
+            count=("total_amount", "count"),
+            total_amount=("total_amount", "sum"),
+            avg_lag=("avg_lag", "mean"),
+            n_alert_edges=("n_alert_edges", "sum"),
+            suspicious_ratio=("has_alert", "mean"),
         )
     )
 
     return agg.sort_values(["window_start", "motif_type"]).reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Export to parquet / CSV (configurable path for Google Drive)
-# ---------------------------------------------------------------------------
-
-# Default export directory — override in Colab:
-#   import src.motif.features as mf
-#   mf.DEFAULT_EXPORT_DIR = "/content/drive/MyDrive/aml_outputs"
-DEFAULT_EXPORT_DIR: str = "outputs/motif_features"
 
 
 def save_features(
@@ -1686,34 +1852,14 @@ def save_features(
     fmt: str = "parquet",
 ) -> str:
     """
-    Save a feature DataFrame to disk (parquet or CSV).
+    Save one motif feature table.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Any feature table produced by this module.
-    filename : str
-        Base filename without extension, e.g. "entity_features_w30".
-    export_dir : str, optional
-        Target directory.  Defaults to DEFAULT_EXPORT_DIR.
-        Set to "/content/drive/MyDrive/<your_path>" in Colab.
-    fmt : str
-        "parquet" (default, smaller) or "csv".
-
-    Returns
-    -------
-    str : full path of the saved file.
-
-    Notes
-    -----
-    - Parquet is preferred for downstream pandas / spark reads.
-    - CSV is a fallback for manual inspection or Drive sharing.
-    - The directory is created if it does not exist.
+    Feature tables are the primary artifacts of the exact motif branch.
     """
     out_dir = Path(export_dir or DEFAULT_EXPORT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ext  = "parquet" if fmt == "parquet" else "csv"
+    ext = "parquet" if fmt == "parquet" else "csv"
     path = out_dir / f"{filename}.{ext}"
 
     if fmt == "parquet":
@@ -1721,8 +1867,165 @@ def save_features(
     else:
         df.to_csv(path, index=False)
 
-    print(f"  Saved {len(df):,} rows → {path}")
+    print(f"  Saved {len(df):,} rows -> {path}")
     return str(path)
+
+
+def export_motif_feature_outputs(
+    window_summary_df: pd.DataFrame,
+    motif_instances_by_window: Dict[str, List[dict]],
+    zscore_by_window: Optional[Dict[str, Dict[str, dict]]] = None,
+    node_degree_by_window: Optional[Dict[str, Dict[int, int]]] = None,
+    total_volume_by_window: Optional[Dict[str, float]] = None,
+    export_dir: Optional[str] = None,
+    export_instances: bool = False,
+    instance_format: str = "parquet",
+    feature_format: str = "parquet",
+    window_size: int = 7,
+) -> Dict[str, str]:
+    """
+    Export motif feature outputs as the main artifact of the exact motif branch.
+
+    Required behavior
+    -----------------
+    - Per-window entity feature shards
+    - Per-window entity-wide feature shards
+    - Per-window window-level feature shards
+    - Merged entity long table
+    - Merged entity wide table
+    - Merged window-level table
+
+    Optional debug behavior
+    -----------------------
+    Raw motif instance tables are exported only if export_instances=True.
+    They are not the primary saved artifact.
+    """
+    out_root = Path(export_dir or DEFAULT_EXPORT_DIR)
+    entity_dir = out_root / "entity_features"
+    entity_wide_dir = out_root / "entity_feature_wide"
+    window_dir = out_root / "window_features"
+    instance_dir = out_root / "instances_debug"
+    meta_dir = out_root / "meta"
+
+    for d in [entity_dir, entity_wide_dir, window_dir, meta_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    if export_instances:
+        instance_dir.mkdir(parents=True, exist_ok=True)
+
+    merged_entity_long = []
+    merged_entity_wide = []
+    merged_window = []
+
+    for window_key, motif_instances in motif_instances_by_window.items():
+        zscore_table = zscore_by_window.get(window_key) if zscore_by_window else None
+        node_degree = node_degree_by_window.get(window_key) if node_degree_by_window else None
+        total_volume = total_volume_by_window.get(window_key, 0.0) if total_volume_by_window else 0.0
+
+        entity_long = build_entity_motif_features(
+            motif_instances=motif_instances,
+            zscore_table=zscore_table,
+            node_degree=node_degree,
+            total_volume=total_volume,
+        )
+        entity_wide = build_entity_feature_wide(entity_long)
+        window_feat = build_window_motif_features(
+            motif_instances=motif_instances,
+            window_size=window_size,
+        )
+
+        if not entity_long.empty:
+            entity_long = entity_long.copy()
+            entity_long["window_key"] = window_key
+            merged_entity_long.append(entity_long)
+
+        if not entity_wide.empty:
+            entity_wide = entity_wide.copy()
+            entity_wide["window_key"] = window_key
+            merged_entity_wide.append(entity_wide)
+
+        if not window_feat.empty:
+            window_feat = window_feat.copy()
+            window_feat["window_key"] = window_key
+            merged_window.append(window_feat)
+
+        save_features(
+            entity_long,
+            filename=f"entity_features_{window_key}",
+            export_dir=entity_dir,
+            fmt=feature_format,
+        )
+        save_features(
+            entity_wide,
+            filename=f"entity_feature_wide_{window_key}",
+            export_dir=entity_wide_dir,
+            fmt=feature_format,
+        )
+        save_features(
+            window_feat,
+            filename=f"window_features_{window_key}",
+            export_dir=window_dir,
+            fmt=feature_format,
+        )
+
+        if export_instances:
+            inst_df = pd.DataFrame(motif_instances)
+            save_features(
+                inst_df,
+                filename=f"motif_instances_{window_key}",
+                export_dir=instance_dir,
+                fmt=instance_format,
+            )
+
+    merged_entity_long_df = (
+        pd.concat(merged_entity_long, ignore_index=True)
+        if merged_entity_long else
+        pd.DataFrame()
+    )
+    merged_entity_wide_df = (
+        pd.concat(merged_entity_wide, ignore_index=True)
+        if merged_entity_wide else
+        pd.DataFrame()
+    )
+    merged_window_df = (
+        pd.concat(merged_window, ignore_index=True)
+        if merged_window else
+        pd.DataFrame()
+    )
+
+    merged_entity_long_path = save_features(
+        merged_entity_long_df,
+        filename="entity_features_merged",
+        export_dir=out_root,
+        fmt=feature_format,
+    )
+    merged_entity_wide_path = save_features(
+        merged_entity_wide_df,
+        filename="entity_feature_wide_merged",
+        export_dir=out_root,
+        fmt=feature_format,
+    )
+    merged_window_path = save_features(
+        merged_window_df,
+        filename="window_features_merged",
+        export_dir=out_root,
+        fmt=feature_format,
+    )
+
+    summary_path = meta_dir / "window_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(
+            window_summary_df.to_dict(orient="records"),
+            f,
+            indent=2,
+        )
+
+    return {
+        "entity_features_merged": merged_entity_long_path,
+        "entity_feature_wide_merged": merged_entity_wide_path,
+        "window_features_merged": merged_window_path,
+        "window_summary": str(summary_path),
+    }
 
 
 __all__ = [
@@ -1730,379 +2033,512 @@ __all__ = [
     "build_entity_feature_wide",
     "build_window_motif_features",
     "save_features",
+    "export_motif_feature_outputs",
     "DEFAULT_EXPORT_DIR",
 ]
 
 
-
-cell 6:   
+cell 6:
 
 # ============================================================
-# CELL 6  — Vectorized Graph Feature Engineering
+# CELL 6 — Stage A Global Screening + Optional Motif Merge
 #
-# Unit of analysis : NODE
-# Approach         : GFP-style statistical proxies via groupby
-# Critical fix     : NO is_sar / SAR-based columns in features.
-#                    The label is attached ONCE at the end,
-#                    only as the target variable — never as input.
+# Purpose
+# -------
+# This cell is the scalable screening layer of the pipeline.
 #
-# Output: outputs/motif/node_features.parquet
-#   One row per node, columns = structural + statistical features
-#   derived purely from transaction topology and amounts.
+# It does three things:
+#   1. Build vectorized node-level graph proxy features from transactions.parquet
+#   2. Build window-level risk summaries for candidate-window selection
+#   3. Optionally merge exact motif features from Cell 5 if they exist
+#
+# Design rule
+# -----------
+# - Cell 6 is Stage A: cheap global screening
+# - Cells 2–5 are Stage B: selective exact motif evidence
+#
+# Output
+# ------
+# outputs/screening/
+#   - node_proxy_features.parquet
+#   - node_screening_features.parquet
+#   - window_risk_summary.parquet
+#   - feature_columns_screening.json
+#
+# Optional merged output
+# ----------------------
+# If Cell 5 has already exported motif features, this cell also writes:
+#   - node_screening_plus_motif.parquet
 # ============================================================
 
 import os
 import gc
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-OUTPUT_DIR       = "/content/drive/MyDrive/AML/outputs"
-MOTIF_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "motif")
-WINDOW_SIZE      = 7    # steps per rolling window (1 week)
-os.makedirs(MOTIF_OUTPUT_DIR, exist_ok=True)
+
+# ============================================================
+# USER CONFIG
+# ============================================================
+
+OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
+SCREEN_DIR = OUTPUT_DIR / "screening"
+MOTIF_FEATURE_DIR = OUTPUT_DIR / "motif_features"
+
+TX_PATH = OUTPUT_DIR / "transactions.parquet"
+
+WINDOW_SIZE = 7
+MERGE_MOTIF_FEATURES = True
+
+# Expected optional motif feature export from Cell 5
+MOTIF_WIDE_PATH = MOTIF_FEATURE_DIR / "entity_feature_wide_merged.parquet"
+
+SCREEN_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# Step 1 — Load transactions
+# Step 1 — Load transactions safely
 # ============================================================
 
-print("[1/5] Loading transactions...")
-df = pd.read_parquet(os.path.join(OUTPUT_DIR, "transactions.parquet"))
-df["src_node"] = df["src_node"].astype(np.int64)
-df["dst_node"] = df["dst_node"].astype(np.int64)
-df["step"]     = df["step"].astype(np.int32)
-df["amount"]   = df["amount"].astype(np.float32)
+print("[1/6] Loading transactions...")
 
-# is_sar is loaded but ONLY used at Step 4 to build the label.
-# It is NEVER passed into any feature aggregation below.
-if "is_sar" not in df.columns:
-    df["is_sar"] = np.int8(0)
+tx = pd.read_parquet(TX_PATH)
+
+required_cols = {"src_node", "dst_node", "step", "amount"}
+missing_cols = required_cols - set(tx.columns)
+if missing_cols:
+    raise ValueError(
+        f"transactions.parquet is missing required columns: {sorted(missing_cols)}"
+    )
+
+tx["src_node"] = tx["src_node"].astype(np.int64)
+tx["dst_node"] = tx["dst_node"].astype(np.int64)
+tx["step"] = tx["step"].astype(np.int32)
+tx["amount"] = tx["amount"].astype(np.float32)
+
+if "is_sar" not in tx.columns:
+    tx["is_sar"] = np.int8(0)
 else:
-    df["is_sar"] = df["is_sar"].astype(np.int8)
+    tx["is_sar"] = tx["is_sar"].astype(np.int8)
 
-print(f"      {len(df):,} transactions  |  "
-      f"steps {df['step'].min()}-{df['step'].max()}  |  "
-      f"SAR rate: {df['is_sar'].mean()*100:.3f}%")
+print(
+    f"      rows={len(tx):,} | "
+    f"steps={int(tx['step'].min())}-{int(tx['step'].max())} | "
+    f"sar_rate={tx['is_sar'].mean()*100:.3f}%"
+)
 
-# Separate the label column so it cannot accidentally be
-# included in any feature computation below.
-labels_src = df[["src_node", "is_sar"]].copy()
-labels_dst = df[["dst_node", "is_sar"]].copy()
-df_feats   = df.drop(columns=["is_sar"])   # feature-safe view
-del df
-gc.collect()
-
-
-# ============================================================
-# Step 2 — Per-window node features (GFP-style proxies)
-#
-# For each rolling 7-step window, we compute per-node
-# aggregations that proxy the structural patterns GFP searches
-# for, but using only vectorized groupby — no subgraph search.
-#
-# Features computed (ALL label-free):
-#
-# Outgoing (fan-out proxy):
-#   out_count, out_amount_{sum,mean,std,max,min}
-#   out_n_unique_dst   ← fan-out cardinality
-#   fanout_score       = out_n_unique_dst / out_count
-#
-# Incoming (fan-in proxy):
-#   in_count, in_amount_{sum,mean,std,max,min}
-#   in_n_unique_src    ← fan-in cardinality
-#   fanin_score        = in_n_unique_src / in_count
-#
-# Relay / scatter-gather proxy (node is both sender & receiver):
-#   relay_flag         = 1 if in_count > 0 and out_count > 0
-#   relay_ratio        = out_amount_sum / in_amount_sum
-#   amount_preservation= 1 - |relay_ratio - 1|  (≈1 for layering)
-#   gather_scatter     = fanin_score * fanout_score
-#
-# Cycle proxy (sends to someone it received from):
-#   cycle_proxy        = |sent-to ∩ received-from|  (set overlap)
-#
-# Temporal / velocity:
-#   out_velocity       = out_count / WINDOW_SIZE
-#   in_velocity        = in_count  / WINDOW_SIZE
-#   out_step_std       = std of steps of outgoing tx (burstiness)
-#   in_step_std        = std of steps of incoming tx (burstiness)
-#
-# Concentration (HHI-style):
-#   out_concentration  = sum(amount_to_dst^2) / sum(amount)^2
-#   in_concentration   = sum(amount_from_src^2) / sum(amount)^2
-# ============================================================
-
-print(f"\n[2/5] Computing per-window node features "
-      f"(window={WINDOW_SIZE} steps)...")
+# Keep labels separate so the scalable screening branch stays label-safe.
+labels_src = tx[["src_node", "is_sar"]].copy()
+labels_dst = tx[["dst_node", "is_sar"]].copy()
+df_feats = tx.drop(columns=["is_sar"]).copy()
 
 step_min = int(df_feats["step"].min())
 step_max = int(df_feats["step"].max())
-all_parts = []
 
 
-def _window_features(wdf: pd.DataFrame, ws: int) -> pd.DataFrame:
+# ============================================================
+# Step 2 — Window-level proxy features + window risk summary
+# ============================================================
+
+print(f"\n[2/6] Computing scalable proxy features (window={WINDOW_SIZE})...")
+
+all_node_parts = []
+window_rows = []
+
+
+def _window_node_features(wdf: pd.DataFrame, ws: int, we: int) -> tuple[pd.DataFrame, dict]:
     """
-    All feature computations for one time window.
-    wdf must NOT contain is_sar.
-    Returns one row per node active in this window.
+    Build one window's node-level proxy features plus one window-level
+    screening summary row.
+
+    This function is intentionally label-free.
     """
+    # --------------------------------------------------------
+    # Outgoing aggregates
+    # --------------------------------------------------------
+    out = (
+        wdf.groupby("src_node")
+        .agg(
+            out_count=("amount", "count"),
+            out_amount_sum=("amount", "sum"),
+            out_amount_mean=("amount", "mean"),
+            out_amount_std=("amount", "std"),
+            out_amount_max=("amount", "max"),
+            out_amount_min=("amount", "min"),
+            out_n_unique_dst=("dst_node", "nunique"),
+            out_step_std=("step", "std"),
+        )
+        .reset_index()
+        .rename(columns={"src_node": "node"})
+    )
 
-    # ── Outgoing aggregations ─────────────────────────────────
-    out = wdf.groupby("src_node").agg(
-        out_count        =("amount", "count"),
-        out_amount_sum   =("amount", "sum"),
-        out_amount_mean  =("amount", "mean"),
-        out_amount_std   =("amount", "std"),
-        out_amount_max   =("amount", "max"),
-        out_amount_min   =("amount", "min"),
-        out_n_unique_dst =("dst_node", "nunique"),
-        out_step_std     =("step",   "std"),
-    ).reset_index().rename(columns={"src_node": "node"})
+    # --------------------------------------------------------
+    # Incoming aggregates
+    # --------------------------------------------------------
+    inc = (
+        wdf.groupby("dst_node")
+        .agg(
+            in_count=("amount", "count"),
+            in_amount_sum=("amount", "sum"),
+            in_amount_mean=("amount", "mean"),
+            in_amount_std=("amount", "std"),
+            in_amount_max=("amount", "max"),
+            in_amount_min=("amount", "min"),
+            in_n_unique_src=("src_node", "nunique"),
+            in_step_std=("step", "std"),
+        )
+        .reset_index()
+        .rename(columns={"dst_node": "node"})
+    )
 
-    # ── Incoming aggregations ─────────────────────────────────
-    inc = wdf.groupby("dst_node").agg(
-        in_count         =("amount", "count"),
-        in_amount_sum    =("amount", "sum"),
-        in_amount_mean   =("amount", "mean"),
-        in_amount_std    =("amount", "std"),
-        in_amount_max    =("amount", "max"),
-        in_amount_min    =("amount", "min"),
-        in_n_unique_src  =("src_node", "nunique"),
-        in_step_std      =("step",   "std"),
-    ).reset_index().rename(columns={"dst_node": "node"})
-
-    # ── Merge out + in ────────────────────────────────────────
     feat = pd.merge(out, inc, on="node", how="outer").fillna(0)
 
-    # ── Structural proxy features ─────────────────────────────
+    # --------------------------------------------------------
+    # Structural proxies
+    # --------------------------------------------------------
+    feat["fanout_score"] = feat["out_n_unique_dst"] / (feat["out_count"] + 1e-6)
+    feat["fanin_score"] = feat["in_n_unique_src"] / (feat["in_count"] + 1e-6)
 
-    # Fan-out / fan-in scores (normalised cardinality)
-    feat["fanout_score"] = (feat["out_n_unique_dst"]
-                            / (feat["out_count"] + 1e-6))
-    feat["fanin_score"]  = (feat["in_n_unique_src"]
-                            / (feat["in_count"] + 1e-6))
+    feat["gather_scatter_score"] = feat["fanin_score"] * feat["fanout_score"]
 
-    # Scatter-gather: high fan-in AND high fan-out at same node
-    feat["gather_scatter_score"] = (feat["fanin_score"]
-                                    * feat["fanout_score"])
-
-    # Relay / layering
-    feat["relay_flag"]          = (
+    feat["relay_flag"] = (
         (feat["in_count"] > 0) & (feat["out_count"] > 0)
     ).astype(np.int8)
-    feat["relay_ratio"]         = (feat["out_amount_sum"]
-                                   / (feat["in_amount_sum"] + 1e-6))
+
+    feat["relay_ratio"] = feat["out_amount_sum"] / (feat["in_amount_sum"] + 1e-6)
     feat["amount_preservation"] = 1.0 - np.abs(feat["relay_ratio"] - 1.0)
 
-    # Velocity
     feat["out_velocity"] = feat["out_count"] / WINDOW_SIZE
-    feat["in_velocity"]  = feat["in_count"]  / WINDOW_SIZE
+    feat["in_velocity"] = feat["in_count"] / WINDOW_SIZE
 
-    # ── Concentration (HHI-style, outgoing) ───────────────────
-    # Sum of squared per-dst amounts / total-out-amount²
-    # High → one dominant recipient (suspicious structuring)
-    out_by_dst = (wdf.groupby(["src_node", "dst_node"])["amount"]
-                  .sum().reset_index())
+    # --------------------------------------------------------
+    # Concentration proxies
+    # --------------------------------------------------------
+    out_by_dst = (
+        wdf.groupby(["src_node", "dst_node"])["amount"]
+        .sum()
+        .reset_index()
+    )
     out_by_dst["sq"] = out_by_dst["amount"] ** 2
-    hhi_num = (out_by_dst.groupby("src_node")["sq"]
-               .sum().reset_index()
-               .rename(columns={"src_node": "node", "sq": "_hhi_num"}))
-    hhi_den = (wdf.groupby("src_node")["amount"]
-               .sum() ** 2).reset_index()
+
+    hhi_num = (
+        out_by_dst.groupby("src_node")["sq"]
+        .sum()
+        .reset_index()
+        .rename(columns={"src_node": "node", "sq": "_hhi_num"})
+    )
+    hhi_den = (wdf.groupby("src_node")["amount"].sum() ** 2).reset_index()
     hhi_den.columns = ["node", "_hhi_den"]
-    hhi = (hhi_num.merge(hhi_den, on="node", how="left")
-           .assign(out_concentration=lambda x:
-                   x["_hhi_num"] / (x["_hhi_den"] + 1e-9))
-           [["node", "out_concentration"]])
+
+    hhi = (
+        hhi_num.merge(hhi_den, on="node", how="left")
+        .assign(out_concentration=lambda x: x["_hhi_num"] / (x["_hhi_den"] + 1e-9))
+        [["node", "out_concentration"]]
+    )
     feat = feat.merge(hhi, on="node", how="left").fillna(0)
+
     del out_by_dst, hhi_num, hhi_den, hhi
 
-    # Incoming concentration (HHI-style)
-    inc_by_src = (wdf.groupby(["dst_node", "src_node"])["amount"]
-                  .sum().reset_index())
+    inc_by_src = (
+        wdf.groupby(["dst_node", "src_node"])["amount"]
+        .sum()
+        .reset_index()
+    )
     inc_by_src["sq"] = inc_by_src["amount"] ** 2
-    ihhi_num = (inc_by_src.groupby("dst_node")["sq"]
-                .sum().reset_index()
-                .rename(columns={"dst_node": "node", "sq": "_ihhi_num"}))
-    ihhi_den = (wdf.groupby("dst_node")["amount"]
-                .sum() ** 2).reset_index()
+
+    ihhi_num = (
+        inc_by_src.groupby("dst_node")["sq"]
+        .sum()
+        .reset_index()
+        .rename(columns={"dst_node": "node", "sq": "_ihhi_num"})
+    )
+    ihhi_den = (wdf.groupby("dst_node")["amount"].sum() ** 2).reset_index()
     ihhi_den.columns = ["node", "_ihhi_den"]
-    ihhi = (ihhi_num.merge(ihhi_den, on="node", how="left")
-            .assign(in_concentration=lambda x:
-                    x["_ihhi_num"] / (x["_ihhi_den"] + 1e-9))
-            [["node", "in_concentration"]])
+
+    ihhi = (
+        ihhi_num.merge(ihhi_den, on="node", how="left")
+        .assign(in_concentration=lambda x: x["_ihhi_num"] / (x["_ihhi_den"] + 1e-9))
+        [["node", "in_concentration"]]
+    )
     feat = feat.merge(ihhi, on="node", how="left").fillna(0)
+
     del inc_by_src, ihhi_num, ihhi_den, ihhi
 
-    # ── Cycle proxy (set intersection, label-free) ────────────
-    # Counts how many nodes a given node BOTH sends to AND receives from.
-    # A non-zero value is a necessary (not sufficient) condition for
-    # participation in a cycle.
+    # --------------------------------------------------------
+    # Cycle proxy
+    # --------------------------------------------------------
     src_to_dsts = wdf.groupby("src_node")["dst_node"].apply(set)
     dst_to_srcs = wdf.groupby("dst_node")["src_node"].apply(set)
-    common = src_to_dsts.index.intersection(dst_to_srcs.index)
-    if len(common) > 0:
+    common_nodes = src_to_dsts.index.intersection(dst_to_srcs.index)
+
+    if len(common_nodes) > 0:
         cycle_proxy = pd.Series(
-            {n: len(src_to_dsts[n] & dst_to_srcs[n]) for n in common},
+            {n: len(src_to_dsts[n] & dst_to_srcs[n]) for n in common_nodes},
             name="cycle_proxy",
         ).astype(np.float32).reset_index()
         cycle_proxy.columns = ["node", "cycle_proxy"]
         feat = feat.merge(cycle_proxy, on="node", how="left")
     else:
         feat["cycle_proxy"] = 0.0
+
     feat["cycle_proxy"] = feat["cycle_proxy"].fillna(0)
+
     del src_to_dsts, dst_to_srcs
 
-    # ── Window metadata ───────────────────────────────────────
+    # --------------------------------------------------------
+    # Window metadata
+    # --------------------------------------------------------
     feat["window_start"] = ws
+    feat["window_end"] = we
 
-    return feat
+    # --------------------------------------------------------
+    # Node-level screening score
+    # --------------------------------------------------------
+    # Cheap, label-free heuristic score used for global screening.
+    feat["node_screening_score"] = (
+        1.25 * feat["relay_flag"]
+        + 0.90 * feat["gather_scatter_score"]
+        + 0.60 * feat["cycle_proxy"]
+        + 0.50 * feat["amount_preservation"].clip(lower=-5, upper=1)
+        + 0.40 * feat["out_concentration"]
+        + 0.40 * feat["in_concentration"]
+        + 0.30 * feat["out_velocity"]
+        + 0.30 * feat["in_velocity"]
+    )
+
+    # --------------------------------------------------------
+    # Window-level risk summary
+    # --------------------------------------------------------
+    risk_row = {
+        "start": int(ws),
+        "end": int(we),
+        "n_tx": int(len(wdf)),
+        "n_nodes": int(feat["node"].nunique()),
+        "mean_node_score": float(feat["node_screening_score"].mean()) if len(feat) else 0.0,
+        "max_node_score": float(feat["node_screening_score"].max()) if len(feat) else 0.0,
+        "mean_relay_flag": float(feat["relay_flag"].mean()) if len(feat) else 0.0,
+        "mean_cycle_proxy": float(feat["cycle_proxy"].mean()) if len(feat) else 0.0,
+        "mean_gather_scatter": float(feat["gather_scatter_score"].mean()) if len(feat) else 0.0,
+        "window_risk_score": float(
+            (
+                0.45 * feat["node_screening_score"].mean()
+                + 0.35 * feat["node_screening_score"].quantile(0.95)
+                + 0.20 * np.log1p(len(wdf))
+            )
+            if len(feat) else 0.0
+        ),
+    }
+
+    return feat, risk_row
 
 
 for ws in range(step_min, step_max + 1, WINDOW_SIZE):
-    we  = ws + WINDOW_SIZE - 1
+    we = ws + WINDOW_SIZE - 1
     wdf = df_feats[(df_feats["step"] >= ws) & (df_feats["step"] <= we)]
+
     if wdf.empty:
         continue
 
-    feat = _window_features(wdf, ws)
-    all_parts.append(feat)
+    feat, risk_row = _window_node_features(wdf, ws, we)
+
+    all_node_parts.append(feat)
+    window_rows.append(risk_row)
 
     del wdf, feat
     gc.collect()
-    print(f"      window [{ws:3d}-{we:3d}] done", end="\r")
+    print(f"      processed window [{ws:3d}-{we:3d}]", end="\r")
 
-print(f"\n      {len(all_parts)} windows processed.")
+print(f"\n      windows processed: {len(window_rows):,}")
 
 
 # ============================================================
-# Step 3 — Aggregate across windows → one row per node
-#
-# For each feature we compute: mean, max, std across windows.
-# This captures temporal evolution without leaking labels.
+# Step 3 — Aggregate node features across windows
 # ============================================================
 
-print("\n[3/5] Aggregating across windows...")
+print("\n[3/6] Aggregating node-level screening features across windows...")
 
-all_feats = pd.concat(all_parts, ignore_index=True)
-del all_parts
+all_node_feats = pd.concat(all_node_parts, ignore_index=True)
+del all_node_parts
 gc.collect()
 
-agg_cols = [c for c in all_feats.columns
-            if c not in ("node", "window_start")]
+agg_exclude = {"node", "window_start", "window_end"}
+agg_cols = [c for c in all_node_feats.columns if c not in agg_exclude]
 
-node_features = (all_feats
-                 .groupby("node")[agg_cols]
-                 .agg(["mean", "max", "std"])
-                 .fillna(0))
-node_features.columns = [f"{col}_{stat}"
-                          for col, stat in node_features.columns]
-node_features = node_features.reset_index()
+node_proxy_features = (
+    all_node_feats
+    .groupby("node")[agg_cols]
+    .agg(["mean", "max", "std"])
+    .fillna(0)
+)
 
-del all_feats
-gc.collect()
-print(f"      node_features shape: {node_features.shape}")
+node_proxy_features.columns = [
+    f"{col}_{stat}" for col, stat in node_proxy_features.columns
+]
+node_proxy_features = node_proxy_features.reset_index()
 
-
-# ============================================================
-# Step 4 — Attach label
-#
-# is_sar is used ONLY here, as the target variable.
-# It is never part of the feature matrix.
-#
-# Label definition (AMLGentex §3):
-#   A node is positive if it appears in ANY SAR-flagged
-#   transaction (as sender OR receiver) within the full window.
-# ============================================================
-
-print("\n[4/5] Attaching label (is_sar)...")
-
+# Attach label only at the end
 sar_nodes = set(
     labels_src[labels_src["is_sar"] == 1]["src_node"].tolist()
     + labels_dst[labels_dst["is_sar"] == 1]["dst_node"].tolist()
 )
-node_features["label"] = (node_features["node"]
-                           .isin(sar_nodes)
-                           .astype(np.int8))
+node_proxy_features["label"] = (
+    node_proxy_features["node"].isin(sar_nodes).astype(np.int8)
+)
 
-n_pos = node_features["label"].sum()
-n_tot = len(node_features)
-print(f"      Nodes     : {n_tot:,}")
-print(f"      SAR nodes : {n_pos:,}  ({n_pos/n_tot*100:.2f}%)")
-print(f"      Normal    : {n_tot-n_pos:,}  ({(n_tot-n_pos)/n_tot*100:.2f}%)")
-
-del labels_src, labels_dst
-gc.collect()
+print(f"      node_proxy_features shape: {node_proxy_features.shape}")
 
 
 # ============================================================
-# Step 5 — Save
+# Step 4 — Build window risk summary for Cell 4 candidate selection
 # ============================================================
 
-print("\n[5/5] Saving node_features.parquet...")
+print("\n[4/6] Building window risk summary...")
 
-p_feats = os.path.join(MOTIF_OUTPUT_DIR, "node_features.parquet")
-node_features.to_parquet(p_feats, index=False)
+window_risk_summary = pd.DataFrame(window_rows).sort_values(["start", "end"]).reset_index(drop=True)
 
-feature_cols = [c for c in node_features.columns
-                if c not in ("node", "label")]
-p_cols = os.path.join(MOTIF_OUTPUT_DIR, "feature_columns.json")
-with open(p_cols, "w") as f:
+print(f"      window_risk_summary shape: {window_risk_summary.shape}")
+print("      top risk windows:")
+print(
+    window_risk_summary.sort_values("window_risk_score", ascending=False)
+    .head(10)
+    .to_string(index=False)
+)
+
+
+# ============================================================
+# Step 5 — Optional merge with exact motif features from Cell 5
+# ============================================================
+
+print("\n[5/6] Optional merge with exact motif features...")
+
+node_screening_features = node_proxy_features.copy()
+
+motif_merge_done = False
+if MERGE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists():
+    motif_wide = pd.read_parquet(MOTIF_WIDE_PATH)
+
+    if "node" not in motif_wide.columns:
+        raise ValueError(
+            f"Motif wide feature file does not contain 'node': {MOTIF_WIDE_PATH}"
+        )
+
+    before_cols = set(node_screening_features.columns)
+
+    node_screening_features = (
+        node_screening_features
+        .merge(motif_wide, on="node", how="left")
+        .fillna(0)
+    )
+
+    added_cols = [c for c in node_screening_features.columns if c not in before_cols]
+    motif_merge_done = True
+
+    print(f"      merged motif features from: {MOTIF_WIDE_PATH}")
+    print(f"      added motif columns: {len(added_cols)}")
+else:
+    print("      motif merge skipped (merged motif feature file not found or disabled).")
+
+
+# ============================================================
+# Step 6 — Save screening artifacts
+# ============================================================
+
+print("\n[6/6] Saving screening artifacts...")
+
+node_proxy_path = SCREEN_DIR / "node_proxy_features.parquet"
+node_screening_path = SCREEN_DIR / "node_screening_features.parquet"
+window_risk_path = SCREEN_DIR / "window_risk_summary.parquet"
+feature_cols_path = SCREEN_DIR / "feature_columns_screening.json"
+
+node_proxy_features.to_parquet(node_proxy_path, index=False)
+node_screening_features.to_parquet(node_screening_path, index=False)
+window_risk_summary.to_parquet(window_risk_path, index=False)
+
+feature_cols = [
+    c for c in node_screening_features.columns
+    if c not in ("node", "label")
+]
+with open(feature_cols_path, "w") as f:
     json.dump(feature_cols, f, indent=2)
 
-size_kb = os.path.getsize(p_feats) / 1024
-print(f"      node_features : {size_kb:.1f} KB  "
-      f"({n_tot:,} nodes × {len(feature_cols)} features)")
-print(f"      feature_cols  : {p_cols}")
+print("Artifacts saved:")
+for lbl, path in [
+    ("node_proxy_features", node_proxy_path),
+    ("node_screening_features", node_screening_path),
+    ("window_risk_summary", window_risk_path),
+    ("feature_columns", feature_cols_path),
+]:
+    print(f"   [{lbl:<24}] {path} ({os.path.getsize(path)/1024:.1f} KB)")
 
-del node_features, df_feats
+print("\nSummary:")
+print(f"   nodes total         : {len(node_screening_features):,}")
+print(f"   positives           : {int(node_screening_features['label'].sum()):,}")
+print(f"   motif merge applied : {motif_merge_done}")
+
+del tx, df_feats, labels_src, labels_dst
+del all_node_feats, node_proxy_features, node_screening_features, window_risk_summary
 gc.collect()
+
 print("\nDone.")
+
 
 
 
 cell 7: 
 
-
-
 # ============================================================
-# CELL 7 (corrected) — AMLGentex Features + XGBoost
+# CELL 7 — Stage A + Optional Motif Support + XGBoost
 #
-# Inputs:
-#   outputs/motif/node_features.parquet  ← Cell 6 graph features
-#   outputs/transactions.parquet         ← raw transactions
+# Inputs
+# ------
+# 1. outputs/screening/node_screening_features.parquet
+#    Main scalable screening features from Cell 6
 #
-# Critical fixes vs previous version:
-#   FIX 1 — ALL is_sar / SAR-based sub-window features removed.
-#            is_sar is used only to build the label at Step 3.
-#   FIX 2 — Stratified random split (not time-based).
-#            Matches AMLGentex §6 main protocol (transductive).
-#   FIX 3 — Sub-window features use df_feats (no is_sar column)
-#            so leakage is structurally impossible.
+# 2. outputs/screening/window_risk_summary.parquet
+#    Used upstream by Cell 4; not required for training here
 #
-# Evaluation metric: Average Precision at Recall ≥ 0.6 (P@R>0.6)
+# 3. outputs/transactions.parquet
+#    Used to derive AMLGentex-style subwindow transaction features
+#
+# 4. outputs/motif_features/entity_feature_wide_merged.parquet  (optional)
+#    Exact motif-derived node features from Cell 5
+#
+# Design
+# ------
+# - Cell 6 = Stage A global screening
+# - Cells 2–5 = Stage B selective exact motif evidence
+# - Cell 7 = final model integration
+#
+# Evaluation
+# ----------
+# - stratified node split
+# - threshold selected on validation only
+# - test used once for final holdout evaluation
 # ============================================================
 
-import os, gc, json, warnings
+import gc
+import json
+import os
+import warnings
+from pathlib import Path
+
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    average_precision_score,
-    precision_recall_curve,
-    roc_auc_score,
-    classification_report,
-)
 import xgboost as xgb
 
-try:
-    import shap
-    HAS_SHAP = True
-except ImportError:
-    HAS_SHAP = False
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
 
 try:
     import matplotlib.pyplot as plt
@@ -2115,175 +2551,188 @@ except ImportError:
 # USER CONFIG
 # ============================================================
 
-OUTPUT_DIR       = "/content/drive/MyDrive/AML/outputs"
-MOTIF_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "motif")
-MODEL_DIR        = os.path.join(OUTPUT_DIR, "model")
+OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
+SCREEN_DIR = OUTPUT_DIR / "screening"
+MOTIF_FEATURE_DIR = OUTPUT_DIR / "motif_features"
+MODEL_DIR = OUTPUT_DIR / "model"
 
-# AMLGentex sub-window setup (Appendix C / §4.3)
-# 112 steps total, m=4 sub-windows of size 28.
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+TX_PATH = OUTPUT_DIR / "transactions.parquet"
+SCREEN_FEATURE_PATH = SCREEN_DIR / "node_screening_features.parquet"
+MOTIF_WIDE_PATH = MOTIF_FEATURE_DIR / "entity_feature_wide_merged.parquet"
+
+USE_MOTIF_FEATURES = True
+
+# AMLGentex-style subwindow setup
 N_SUBWINDOWS = 4
-TOTAL_STEPS  = 112
-SUB_WIN_SIZE = TOTAL_STEPS // N_SUBWINDOWS   # = 28
+TOTAL_STEPS = 112
+SUB_WIN_SIZE = TOTAL_STEPS // N_SUBWINDOWS
 
-# Stratified split ratios (FIX 2)
-TEST_SIZE = 0.20    # 80% train / 20% test
-VAL_SIZE  = 0.15    # of the 80% train → validation for early stop
+# Split
+TEST_SIZE = 0.20
+VAL_SIZE = 0.15
 RANDOM_STATE = 42
 
 # XGBoost
 N_ESTIMATORS = 500
-EARLY_STOP   = 30
+EARLY_STOP = 30
 
-os.makedirs(MODEL_DIR, exist_ok=True)
+# Operating point target
+RECALL_TARGET = 0.60
 
 
 # ============================================================
-# Step 1 — Load inputs
+# Step 1 — Load base inputs
 # ============================================================
 
-print("[1/6] Loading inputs...")
+print("[1/7] Loading inputs...")
 
-tx = pd.read_parquet(os.path.join(OUTPUT_DIR, "transactions.parquet"))
+tx = pd.read_parquet(TX_PATH)
 tx["src_node"] = tx["src_node"].astype(np.int64)
 tx["dst_node"] = tx["dst_node"].astype(np.int64)
-tx["step"]     = tx["step"].astype(np.int32)
-tx["amount"]   = tx["amount"].astype(np.float32)
+tx["step"] = tx["step"].astype(np.int32)
+tx["amount"] = tx["amount"].astype(np.float32)
+
 if "is_sar" not in tx.columns:
     tx["is_sar"] = np.int8(0)
 else:
     tx["is_sar"] = tx["is_sar"].astype(np.int8)
 
-graph_feats = pd.read_parquet(
-    os.path.join(MOTIF_OUTPUT_DIR, "node_features.parquet")
-)
+screen_feats = pd.read_parquet(SCREEN_FEATURE_PATH)
 
-# FIX 1 — isolate label column early.
-# df_feats is the label-free view used for all feature construction.
-# is_sar stays in tx only for label derivation at Step 3.
+print(f"      transactions   : {len(tx):,}")
+print(f"      screen_feats   : {screen_feats.shape}")
+
+if "node" not in screen_feats.columns:
+    raise ValueError("node_screening_features.parquet must contain a 'node' column")
+
+if "label" not in screen_feats.columns:
+    raise ValueError("node_screening_features.parquet must contain a 'label' column")
+
 df_feats = tx.drop(columns=["is_sar"])
-
-print(f"      transactions : {len(tx):,}")
-print(f"      graph_feats  : {graph_feats.shape}")
-print(f"      label column : isolated, NOT in df_feats")
+print("      label column   : isolated from transaction feature construction")
 
 
 # ============================================================
-# Step 2 — AMLGentex Table-1 sub-window features
-#
-# Mirrors Appendix C, Table 1 exactly.
-# Computed over m=4 non-overlapping sub-windows of 28 steps.
-# Concatenated per node → model sees temporal evolution.
-#
-# df_feats has NO is_sar column, so leakage is structurally
-# impossible regardless of what aggregations are applied.
+# Step 2 — AMLGentex-style subwindow transaction features
 # ============================================================
 
-print(f"\n[2/6] AMLGentex sub-window features "
+print(f"\n[2/7] Building AMLGentex-style subwindow features "
       f"(m={N_SUBWINDOWS} × {SUB_WIN_SIZE} steps)...")
 
-
 def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
-    """
-    Compute Table-1 features for one sub-window.
-    wdf must NOT contain is_sar (enforced by caller passing df_feats).
-    """
+    out = (
+        wdf.groupby("src_node")["amount"]
+        .agg(
+            sum_spending="sum",
+            mean_spending="mean",
+            median_spending="median",
+            std_spending="std",
+            max_spending="max",
+            min_spending="min",
+            count_spending="count",
+        )
+        .reset_index()
+        .rename(columns={"src_node": "node"})
+    )
 
-    # ── Outgoing (spending) — Table 1 rows 1-7 ───────────────
-    out = wdf.groupby("src_node")["amount"].agg(
-        sum_spending   ="sum",
-        mean_spending  ="mean",
-        median_spending="median",
-        std_spending   ="std",
-        max_spending   ="max",
-        min_spending   ="min",
-        count_spending ="count",
-    ).reset_index().rename(columns={"src_node": "node"})
-
-    # ── All-transaction stats — Table 1 rows 8-13 ────────────
     both_amounts = pd.concat([
         wdf[["src_node", "amount"]].rename(columns={"src_node": "node"}),
         wdf[["dst_node", "amount"]].rename(columns={"dst_node": "node"}),
     ], ignore_index=True)
-    total_stats = both_amounts.groupby("node")["amount"].agg(
-        total_sum   ="sum",
-        total_mean  ="mean",
-        total_median="median",
-        total_std   ="std",
-        total_max   ="max",
-        total_min   ="min",
-    ).reset_index()
 
-    # ── In/out counts — Table 1 rows 14-15 ───────────────────
-    count_in  = (wdf.groupby("dst_node").size()
-                 .rename("count_in").reset_index()
-                 .rename(columns={"dst_node": "node"}))
-    count_out = (wdf.groupby("src_node").size()
-                 .rename("count_out").reset_index()
-                 .rename(columns={"src_node": "node"}))
-
-    # ── Unique counterparties — Table 1 rows 16-17 ───────────
-    uniq_in  = (wdf.groupby("dst_node")["src_node"].nunique()
-                .rename("count_unique_in").reset_index()
-                .rename(columns={"dst_node": "node"}))
-    uniq_out = (wdf.groupby("src_node")["dst_node"].nunique()
-                .rename("count_unique_out").reset_index()
-                .rename(columns={"src_node": "node"}))
-
-    # ── Days active — proxy for count_days_in_bank (Table 1 row 18) ──
-    step_range = pd.concat([
-        wdf[["src_node", "step"]].rename(columns={"src_node": "node"}),
-        wdf[["dst_node", "step"]].rename(columns={"dst_node": "node"}),
-    ]).groupby("node")["step"].agg(
-        step_first="min",
-        step_last ="max",
-    ).reset_index()
-    step_range["days_active"] = (step_range["step_last"]
-                                  - step_range["step_first"] + 1)
-
-    # ── Structural ratios (not in Table 1 but aligned with GFP) ─
-    # These are derived purely from counts/amounts, no label.
-
-    # ── Merge all into one row per node ───────────────────────
-    node_ids = pd.DataFrame(
-        {"node": both_amounts["node"].unique()}, dtype=np.int64
+    total_stats = (
+        both_amounts.groupby("node")["amount"]
+        .agg(
+            total_sum="sum",
+            total_mean="mean",
+            total_median="median",
+            total_std="std",
+            total_max="max",
+            total_min="min",
+        )
+        .reset_index()
     )
-    merged = (node_ids
-              .merge(out,                              on="node", how="left")
-              .merge(total_stats,                      on="node", how="left")
-              .merge(count_in,                         on="node", how="left")
-              .merge(count_out,                        on="node", how="left")
-              .merge(uniq_in,                          on="node", how="left")
-              .merge(uniq_out,                         on="node", how="left")
-              .merge(step_range[["node","days_active"]],
-                     on="node", how="left")
-              .fillna(0))
 
-    # Derived ratios (pure structure, no label)
-    merged["in_out_count_ratio"]  = (merged["count_in"]
-                                     / (merged["count_out"] + 1e-6))
-    merged["spend_total_ratio"]   = (merged["sum_spending"]
-                                     / (merged["total_sum"] + 1e-6))
-    merged["unique_in_out_ratio"] = (merged["count_unique_in"]
-                                     / (merged["count_unique_out"] + 1e-6))
+    count_in = (
+        wdf.groupby("dst_node")
+        .size()
+        .rename("count_in")
+        .reset_index()
+        .rename(columns={"dst_node": "node"})
+    )
 
-    # Rename with sub-window suffix
+    count_out = (
+        wdf.groupby("src_node")
+        .size()
+        .rename("count_out")
+        .reset_index()
+        .rename(columns={"src_node": "node"})
+    )
+
+    uniq_in = (
+        wdf.groupby("dst_node")["src_node"]
+        .nunique()
+        .rename("count_unique_in")
+        .reset_index()
+        .rename(columns={"dst_node": "node"})
+    )
+
+    uniq_out = (
+        wdf.groupby("src_node")["dst_node"]
+        .nunique()
+        .rename("count_unique_out")
+        .reset_index()
+        .rename(columns={"src_node": "node"})
+    )
+
+    step_range = (
+        pd.concat([
+            wdf[["src_node", "step"]].rename(columns={"src_node": "node"}),
+            wdf[["dst_node", "step"]].rename(columns={"dst_node": "node"}),
+        ])
+        .groupby("node")["step"]
+        .agg(step_first="min", step_last="max")
+        .reset_index()
+    )
+    step_range["days_active"] = step_range["step_last"] - step_range["step_first"] + 1
+
+    node_ids = pd.DataFrame({"node": both_amounts["node"].unique()}, dtype=np.int64)
+
+    merged = (
+        node_ids
+        .merge(out, on="node", how="left")
+        .merge(total_stats, on="node", how="left")
+        .merge(count_in, on="node", how="left")
+        .merge(count_out, on="node", how="left")
+        .merge(uniq_in, on="node", how="left")
+        .merge(uniq_out, on="node", how="left")
+        .merge(step_range[["node", "days_active"]], on="node", how="left")
+        .fillna(0)
+    )
+
+    merged["in_out_count_ratio"] = merged["count_in"] / (merged["count_out"] + 1e-6)
+    merged["spend_total_ratio"] = merged["sum_spending"] / (merged["total_sum"] + 1e-6)
+    merged["unique_in_out_ratio"] = merged["count_unique_in"] / (merged["count_unique_out"] + 1e-6)
+
     rename = {c: f"{c}{suffix}" for c in merged.columns if c != "node"}
     return merged.rename(columns=rename)
 
 
 all_sw = []
 for sw in range(N_SUBWINDOWS):
-    ws     = sw * SUB_WIN_SIZE
-    we     = ws + SUB_WIN_SIZE - 1
+    ws = sw * SUB_WIN_SIZE
+    we = ws + SUB_WIN_SIZE - 1
     suffix = f"_w{sw}"
 
-    # FIX 1: pass df_feats (no is_sar) to the function
     wdf = df_feats[(df_feats["step"] >= ws) & (df_feats["step"] <= we)]
     if wdf.empty:
         continue
 
     sw_feat = _subwindow_features(wdf, suffix)
     all_sw.append(sw_feat)
+
     del wdf, sw_feat
     gc.collect()
     print(f"      sub-window {sw} [{ws}-{we}] done", end="\r")
@@ -2294,273 +2743,322 @@ sw_combined = all_sw[0]
 for frame in all_sw[1:]:
     sw_combined = sw_combined.merge(frame, on="node", how="outer")
 sw_combined = sw_combined.fillna(0)
+
 del all_sw, df_feats
 gc.collect()
-print(f"      sub-window feature shape: {sw_combined.shape}")
+
+print(f"      sub-window features shape: {sw_combined.shape}")
 
 
 # ============================================================
-# Step 3 — Merge feature sets and attach label
+# Step 3 — Optional motif feature load
 # ============================================================
 
-print("\n[3/6] Merging features + attaching label...")
+print("\n[3/7] Loading optional motif-derived features...")
 
-# graph_feats from Cell 6 already has 'label' column.
-# We use its label (derived the same way) and drop it from
-# graph_feats before merging to avoid duplicate columns.
-graph_feats_X = graph_feats.drop(columns=["label"], errors="ignore")
+motif_wide = None
+if USE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists():
+    motif_wide = pd.read_parquet(MOTIF_WIDE_PATH)
+    if "node" not in motif_wide.columns:
+        raise ValueError("entity_feature_wide_merged.parquet must contain a 'node' column")
+    print(f"      motif_wide loaded: {motif_wide.shape}")
+else:
+    print("      motif_wide skipped.")
 
-node_matrix = (sw_combined
-               .merge(graph_feats_X, on="node", how="outer")
-               .fillna(0))
 
-# FIX 1 — Derive label from tx["is_sar"] directly (single source of truth)
-# Never from any feature column.
-sar_nodes = set(
-    tx[tx["is_sar"] == 1]["src_node"].tolist()
-    + tx[tx["is_sar"] == 1]["dst_node"].tolist()
+# ============================================================
+# Step 4 — Merge all node-level features and attach label
+# ============================================================
+
+print("\n[4/7] Merging screening + subwindow + optional motif features...")
+
+# Keep screen_feats label as source of truth for node labels
+screen_X = screen_feats.drop(columns=["label"], errors="ignore")
+
+node_matrix = (
+    screen_X
+    .merge(sw_combined, on="node", how="outer")
 )
-node_matrix["label"] = (node_matrix["node"]
-                         .isin(sar_nodes)
-                         .astype(np.int8))
+
+if motif_wide is not None:
+    node_matrix = node_matrix.merge(motif_wide, on="node", how="left")
+
+node_matrix = node_matrix.fillna(0)
+
+# Reattach label from Stage A screening output
+label_map = screen_feats[["node", "label"]].drop_duplicates()
+node_matrix = node_matrix.merge(label_map, on="node", how="left")
+node_matrix["label"] = node_matrix["label"].fillna(0).astype(np.int8)
 
 n_pos = int(node_matrix["label"].sum())
 n_tot = len(node_matrix)
-print(f"      Node matrix : {node_matrix.shape}")
-print(f"      SAR nodes   : {n_pos:,}  ({n_pos/n_tot*100:.2f}%)")
-print(f"      Normal      : {n_tot-n_pos:,}  ({(n_tot-n_pos)/n_tot*100:.2f}%)")
 
-del sw_combined, graph_feats_X, tx
+print(f"      node_matrix shape : {node_matrix.shape}")
+print(f"      SAR nodes         : {n_pos:,} ({n_pos/n_tot*100:.2f}%)")
+print(f"      Normal nodes      : {n_tot-n_pos:,} ({(n_tot-n_pos)/n_tot*100:.2f}%)")
+
+del sw_combined, screen_X, label_map
+if motif_wide is not None:
+    del motif_wide
 gc.collect()
 
 
 # ============================================================
-# Step 4 — Train / test split
-#
-# FIX 2 — Stratified random split on NODES.
-# Matches AMLGentex main protocol (transductive features,
-# node-level label stratification).
-#
-# Why NOT a time-based split here:
-#   - Laundering nodes are active throughout all 112 steps.
-#   - A cutoff at step 56 leaves almost no positives in train.
-#   - Time-based split is only appropriate for the "changed
-#     behavior" ablation experiment (AMLGentex §6 right panel).
+# Step 5 — Train / validation / test split with node tracking
 # ============================================================
 
-print("\n[4/6] Stratified train/test split...")
+print("\n[5/7] Stratified train/val/test split...")
 
 EXCLUDE = {"node", "label"}
 feature_cols = [c for c in node_matrix.columns if c not in EXCLUDE]
 
 X = node_matrix[feature_cols].values.astype(np.float32)
-y = node_matrix["label"].values
+y = node_matrix["label"].values.astype(np.int8)
+node_ids = node_matrix["node"].values.astype(np.int64)
 
-X_train_full, X_test, y_train_full, y_test = train_test_split(
-    X, y,
-    test_size    = TEST_SIZE,
-    stratify     = y,
-    random_state = RANDOM_STATE,
+X_train_full, X_test, y_train_full, y_test, nodes_train_full, nodes_test = train_test_split(
+    X, y, node_ids,
+    test_size=TEST_SIZE,
+    stratify=y,
+    random_state=RANDOM_STATE,
 )
 
-# Validation split from train (for early stopping)
-X_train, X_val, y_train, y_val = train_test_split(
-    X_train_full, y_train_full,
-    test_size    = VAL_SIZE,
-    stratify     = y_train_full,
-    random_state = RANDOM_STATE,
+X_train, X_val, y_train, y_val, nodes_train, nodes_val = train_test_split(
+    X_train_full, y_train_full, nodes_train_full,
+    test_size=VAL_SIZE,
+    stratify=y_train_full,
+    random_state=RANDOM_STATE,
 )
 
-print(f"      Train : {len(X_train):,}  "
-      f"(pos={y_train.sum():,}, {y_train.mean()*100:.2f}%)")
-print(f"      Val   : {len(X_val):,}  "
-      f"(pos={y_val.sum():,}, {y_val.mean()*100:.2f}%)")
-print(f"      Test  : {len(X_test):,}  "
-      f"(pos={y_test.sum():,}, {y_test.mean()*100:.2f}%)")
+print(f"      Train : {len(X_train):,} (pos={int(y_train.sum()):,}, {y_train.mean()*100:.2f}%)")
+print(f"      Val   : {len(X_val):,} (pos={int(y_val.sum()):,}, {y_val.mean()*100:.2f}%)")
+print(f"      Test  : {len(X_test):,} (pos={int(y_test.sum()):,}, {y_test.mean()*100:.2f}%)")
 
 
 # ============================================================
-# Step 5 — XGBoost
+# Step 6 — Train XGBoost and select operating threshold on validation
 # ============================================================
 
-print("\n[5/6] Training XGBoost...")
+print("\n[6/7] Training XGBoost...")
 
-n_pos_tr = y_train.sum()
-n_neg_tr = len(y_train) - n_pos_tr
+n_pos_tr = int(y_train.sum())
+n_neg_tr = int(len(y_train) - n_pos_tr)
 scale_pos = float(n_neg_tr) / float(n_pos_tr + 1e-9)
-print(f"      scale_pos_weight = {scale_pos:.1f}")
+
+print(f"      scale_pos_weight = {scale_pos:.2f}")
 
 model = xgb.XGBClassifier(
-    n_estimators          = N_ESTIMATORS,
-    max_depth             = 4,
-    learning_rate         = 0.05,
-    subsample             = 0.6,
-    colsample_bytree      = 0.5,
-    min_child_weight      = 20,
-    scale_pos_weight      = scale_pos,
-    eval_metric           = "aucpr",
-    early_stopping_rounds = EARLY_STOP,
-    random_state          = RANDOM_STATE,
-    tree_method           = "hist",
-    n_jobs                = -1,
-    reg_alpha         = 0.1,    # L1 — adds sparsity
-    reg_lambda        = 5.0,    # L2 — was 1.0 (default)
-    gamma             = 1.0    # minimum split gain — new
+    n_estimators=N_ESTIMATORS,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.6,
+    colsample_bytree=0.5,
+    min_child_weight=20,
+    scale_pos_weight=scale_pos,
+    eval_metric="aucpr",
+    early_stopping_rounds=EARLY_STOP,
+    random_state=RANDOM_STATE,
+    tree_method="hist",
+    n_jobs=-1,
+    reg_alpha=0.1,
+    reg_lambda=5.0,
+    gamma=1.0,
 )
 
 model.fit(
-    X_train, y_train,
+    X_train,
+    y_train,
     eval_set=[(X_val, y_val)],
     verbose=50,
 )
-print(f"\n      Best iteration : {model.best_iteration}")
+
+print(f"\n      Best iteration: {model.best_iteration}")
 
 
-# ── Evaluation ───────────────────────────────────────────────
-
-def p_at_recall(y_true, y_prob, recall_min=0.6):
-    """Average precision for the PR-curve region where recall >= recall_min."""
-    prec, rec, _ = precision_recall_curve(y_true, y_prob)
-    mask = rec >= recall_min
-    if mask.sum() < 2:
+def precision_at_recall(y_true, y_prob, recall_target=0.60):
+    prec, rec, thr = precision_recall_curve(y_true, y_prob)
+    if len(thr) == 0:
         return 0.0
-    p_f = prec[mask]
-    r_f = rec[mask]
-    idx = np.argsort(r_f)
-    denom = r_f[idx].max() - r_f[idx].min()
-    if denom < 1e-9:
+    mask = rec[:-1] >= recall_target
+    if not np.any(mask):
         return 0.0
-    return float(np.trapz(p_f[idx], r_f[idx]) / denom)
+    return float(np.max(prec[:-1][mask]))
 
 
-y_prob_tr   = model.predict_proba(X_train)[:, 1]
+def threshold_at_recall(y_true, y_prob, recall_target=0.60):
+    prec, rec, thr = precision_recall_curve(y_true, y_prob)
+
+    if len(thr) == 0:
+        return 0.5, 0.0, 0.0
+
+    mask = rec[:-1] >= recall_target
+    if not np.any(mask):
+        j = int(np.argmax(rec[:-1]))
+        j = min(j, len(thr) - 1)
+        return float(thr[j]), float(prec[:-1][j]), float(rec[:-1][j])
+
+    valid_idx = np.where(mask)[0]
+    best_idx = valid_idx[np.argmax(prec[:-1][valid_idx])]
+    return float(thr[best_idx]), float(prec[:-1][best_idx]), float(rec[:-1][best_idx])
+
+
+def compute_metrics(y_true, y_prob, recall_target=0.60):
+    return {
+        "roc_auc": float(roc_auc_score(y_true, y_prob)),
+        "pr_auc": float(average_precision_score(y_true, y_prob)),
+        "p_at_r_target": float(precision_at_recall(y_true, y_prob, recall_target)),
+    }
+
+
+y_prob_train = model.predict_proba(X_train)[:, 1]
+y_prob_val = model.predict_proba(X_val)[:, 1]
 y_prob_test = model.predict_proba(X_test)[:, 1]
 
-metrics = {
-    "train": {
-        "roc_auc":  round(float(roc_auc_score(y_train, y_prob_tr)),   4),
-        "pr_auc":   round(float(average_precision_score(y_train, y_prob_tr)), 4),
-        "p_at_r06": round(p_at_recall(y_train, y_prob_tr), 4),
-    },
-    "test": {
-        "roc_auc":  round(float(roc_auc_score(y_test, y_prob_test)),   4),
-        "pr_auc":   round(float(average_precision_score(y_test, y_prob_test)), 4),
-        "p_at_r06": round(p_at_recall(y_test, y_prob_test), 4),
-    },
-}
+val_threshold, val_precision, val_recall = threshold_at_recall(
+    y_val, y_prob_val, recall_target=RECALL_TARGET
+)
 
-print(f"\n      {'Metric':<26} {'Train':>8}  {'Test':>8}")
-print(f"      {'-'*44}")
-for k in ("roc_auc", "pr_auc", "p_at_r06"):
-    label = {"roc_auc":"ROC-AUC","pr_auc":"PR-AUC",
-             "p_at_r06":"P@R>0.6 (paper metric)"}[k]
-    print(f"      {label:<26} "
-          f"{metrics['train'][k]:>8.4f}  {metrics['test'][k]:>8.4f}")
+print(f"\n      Validation threshold = {val_threshold:.4f}")
+print(f"      Validation precision = {val_precision:.4f}")
+print(f"      Validation recall    = {val_recall:.4f}")
 
-y_pred = (y_prob_test >= 0.5).astype(int)
-print(f"\n      Classification report (test, threshold=0.5):")
-print(classification_report(y_test, y_pred,
-                             target_names=["normal","SAR"], digits=4))
+train_metrics = compute_metrics(y_train, y_prob_train, RECALL_TARGET)
+val_metrics = compute_metrics(y_val, y_prob_val, RECALL_TARGET)
+test_metrics = compute_metrics(y_test, y_prob_test, RECALL_TARGET)
 
+print(f"\n      {'Metric':<22} {'Train':>8} {'Val':>8} {'Test':>8}")
+print(f"      {'-'*52}")
+for k, label in [
+    ("roc_auc", "ROC-AUC"),
+    ("pr_auc", "PR-AUC"),
+    ("p_at_r_target", f"P@R≥{RECALL_TARGET:.1f}"),
+]:
+    print(
+        f"      {label:<22} "
+        f"{train_metrics[k]:>8.4f} "
+        f"{val_metrics[k]:>8.4f} "
+        f"{test_metrics[k]:>8.4f}"
+    )
 
-# ── Optional PR-curve plot ────────────────────────────────────
+y_pred_test = (y_prob_test >= val_threshold).astype(np.int8)
+
+print(f"\n      Classification report (test, threshold={val_threshold:.4f}):")
+print(classification_report(y_test, y_pred_test, target_names=["normal", "SAR"], digits=4))
+
+cm = confusion_matrix(y_test, y_pred_test)
+print("      Confusion matrix [TN FP; FN TP]:")
+print(cm)
+
 if HAS_PLT:
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for lbl, yt, yp in [("Train", y_train, y_prob_tr),
-                          ("Test",  y_test,  y_prob_test)]:
-        p, r, _ = precision_recall_curve(yt, yp)
-        ap = average_precision_score(yt, yp)
-        ax.plot(r, p, label=f"{lbl} (AP={ap:.3f})")
-    ax.axvline(0.6, color="gray", linestyle="--",
-               alpha=0.5, label="Recall threshold")
-    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
-    ax.set_title("PR Curve — AML Node Classification")
-    ax.legend(); plt.tight_layout()
-    pr_path = os.path.join(MODEL_DIR, "pr_curve.png")
-    plt.savefig(pr_path, dpi=150); plt.show()
-    print(f"      PR curve → {pr_path}")
+    p, r, _ = precision_recall_curve(y_test, y_prob_test)
+    ap = average_precision_score(y_test, y_prob_test)
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(r, p, label=f"Test (AP={ap:.3f})")
+    plt.axvline(RECALL_TARGET, linestyle="--", alpha=0.6, label="Recall target")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("PR Curve — Stage A + Optional Motif Support")
+    plt.legend()
+    plt.tight_layout()
+
+    pr_path = MODEL_DIR / "pr_curve_stageA_motif.png"
+    plt.savefig(pr_path, dpi=150)
+    plt.show()
+
+    print(f"      PR curve -> {pr_path}")
 
 
 # ============================================================
-# Step 6 — Save artifacts
+# Step 7 — Save model artifacts
 # ============================================================
 
-print("\n[6/6] Saving...")
+print("\n[7/7] Saving model artifacts...")
 
-# Model
-model_path = os.path.join(MODEL_DIR, "xgb_aml.json")
+model_path = MODEL_DIR / "xgb_stageA_motif.json"
 model.save_model(model_path)
 
-# Feature importance (XGBoost gain)
 score_dict = model.get_booster().get_score(importance_type="gain")
 imp_df = pd.DataFrame([
     {"feature": feature_cols[int(k[1:])], "gain": v}
     for k, v in score_dict.items()
 ]).sort_values("gain", ascending=False).reset_index(drop=True)
 
-print(f"\n      Top 20 features by gain:")
-print(imp_df.head(20).to_string(index=False))
-
-# SHAP
-if HAS_SHAP:
-    explainer = shap.TreeExplainer(model)
-    shap_vals = explainer.shap_values(X_test[:2000])
-    shap_df   = pd.DataFrame({
-        "feature": feature_cols,
-        "shap_mean_abs": np.abs(shap_vals).mean(axis=0),
-    }).sort_values("shap_mean_abs", ascending=False).reset_index(drop=True)
-    print(f"\n      Top 20 features by SHAP:")
-    print(shap_df.head(20).to_string(index=False))
-    if HAS_PLT:
-        shap.summary_plot(shap_vals, X_test[:2000],
-                          feature_names=feature_cols,
-                          max_display=20, show=False)
-        sp = os.path.join(MODEL_DIR, "shap_summary.png")
-        plt.savefig(sp, dpi=150, bbox_inches="tight"); plt.show()
-        print(f"      SHAP → {sp}")
-
-# Test predictions
-preds_df = pd.DataFrame({
-    "node":     node_matrix["node"].values[
-                    len(X_train_full):len(X_train_full)+len(X_test)],
-    "label":    y_test,
-    "prob_sar": y_prob_test,
-    "pred_sar": y_pred,
-})
-preds_path = os.path.join(MODEL_DIR, "test_predictions.parquet")
-preds_df.to_parquet(preds_path, index=False)
-
-# Metrics JSON
-metrics["n_features"]     = len(feature_cols)
-metrics["n_train"]        = int(len(X_train))
-metrics["n_test"]         = int(len(X_test))
-metrics["n_pos_train"]    = int(n_pos_tr)
-metrics["n_pos_test"]     = int(y_test.sum())
-metrics["best_iteration"] = int(model.best_iteration)
-m_path = os.path.join(MODEL_DIR, "metrics.json")
-with open(m_path, "w") as f:
-    json.dump(metrics, f, indent=2)
-
-# Feature columns (needed to reload model)
-fc_path = os.path.join(MODEL_DIR, "feature_columns.json")
-with open(fc_path, "w") as f:
-    json.dump(feature_cols, f, indent=2)
-
-# Importance tables
-imp_path = os.path.join(MODEL_DIR, "feature_importance.parquet")
+imp_path = MODEL_DIR / "feature_importance_stageA_motif.parquet"
 imp_df.to_parquet(imp_path, index=False)
 
-print("\nArtifacts saved:")
-for lbl, path in [("xgb model",    model_path),
-                   ("predictions",  preds_path),
-                   ("metrics",      m_path),
-                   ("feature_imp",  imp_path),
-                   ("feature_cols", fc_path)]:
-    print(f"   [{lbl:<14}]  {path}  "
-          f"({os.path.getsize(path)/1024:.1f} KB)")
+preds_df = pd.DataFrame({
+    "node": nodes_test,
+    "label": y_test,
+    "prob_sar": y_prob_test,
+    "pred_sar": y_pred_test,
+})
+preds_path = MODEL_DIR / "test_predictions_stageA_motif.parquet"
+preds_df.to_parquet(preds_path, index=False)
 
-del X_train, X_val, X_test, y_train, y_val, y_test
-del X_train_full, y_train_full
-del node_matrix, graph_feats
+metrics = {
+    "recall_target": RECALL_TARGET,
+    "threshold_from_validation": float(val_threshold),
+    "validation_operating_point": {
+        "precision": float(val_precision),
+        "recall": float(val_recall),
+    },
+    "train": train_metrics,
+    "val": val_metrics,
+    "test": test_metrics,
+    "n_features": len(feature_cols),
+    "n_train": int(len(X_train)),
+    "n_val": int(len(X_val)),
+    "n_test": int(len(X_test)),
+    "n_pos_train": int(y_train.sum()),
+    "n_pos_val": int(y_val.sum()),
+    "n_pos_test": int(y_test.sum()),
+    "best_iteration": int(model.best_iteration),
+    "use_motif_features": bool(USE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists()),
+    "feature_sources": {
+        "screening": str(SCREEN_FEATURE_PATH),
+        "transactions": str(TX_PATH),
+        "motif_wide": str(MOTIF_WIDE_PATH) if (USE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists()) else None,
+    },
+    "test_confusion_matrix": {
+        "tn": int(cm[0, 0]),
+        "fp": int(cm[0, 1]),
+        "fn": int(cm[1, 0]),
+        "tp": int(cm[1, 1]),
+    },
+}
+
+metrics_path = MODEL_DIR / "metrics_stageA_motif.json"
+with open(metrics_path, "w") as f:
+    json.dump(metrics, f, indent=2)
+
+feature_cols_path = MODEL_DIR / "feature_columns_stageA_motif.json"
+with open(feature_cols_path, "w") as f:
+    json.dump(feature_cols, f, indent=2)
+
+print("\nArtifacts saved:")
+for lbl, path in [
+    ("model", model_path),
+    ("predictions", preds_path),
+    ("metrics", metrics_path),
+    ("feature_importance", imp_path),
+    ("feature_columns", feature_cols_path),
+]:
+    print(f"   [{lbl:<18}] {path} ({os.path.getsize(path)/1024:.1f} KB)")
+
+print("\nTop 20 features by gain:")
+print(imp_df.head(20).to_string(index=False))
+
+del tx, screen_feats, node_matrix
+del X, y, node_ids
+del X_train_full, X_train, X_val, X_test
+del y_train_full, y_train, y_val, y_test
+del nodes_train_full, nodes_train, nodes_val, nodes_test
 gc.collect()
+
 print("\nDone.")
+
+
+
+
+
