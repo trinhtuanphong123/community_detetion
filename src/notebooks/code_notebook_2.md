@@ -2006,10 +2006,9 @@ def export_motif_feature_outputs(
             entity_long["window_key"] = window_key
             merged_entity_long.append(entity_long)
 
+        # SAU KHI FIX — Cell 5
         if not entity_wide.empty:
-            entity_wide = entity_wide.copy()
-            entity_wide["window_key"] = window_key
-            merged_entity_wide.append(entity_wide)
+            merged_entity_wide.append(entity_wide)   # không thêm window_key vào wide
 
         if not window_feat.empty:
             window_feat = window_feat.copy()
@@ -2058,6 +2057,7 @@ def export_motif_feature_outputs(
         pd.concat(merged_window, ignore_index=True)
         if merged_window else
         pd.DataFrame()
+
     )
 
     merged_entity_long_path = save_features(
@@ -2106,39 +2106,6 @@ __all__ = [
 
 
 
-# ============================================================
-# CELL 6 — Stage A Global Screening + Optional Motif Merge
-#
-# Purpose
-# -------
-# This cell is the scalable screening layer of the pipeline.
-#
-# It does four things:
-#   1. Build vectorized node-level graph proxy features from transactions.parquet
-#   2. Train a lightweight Stage A screening model and score node-window rows
-#   3. Build window-level risk summaries for candidate-window selection
-#   4. Optionally merge exact motif features from Cell 5 if they exist
-#
-# Design rule
-# -----------
-# - Cell 6 is Stage A: cheap global screening
-# - Cells 2–5 are Stage B: selective exact motif evidence
-#
-# Output
-# ------
-# outputs/screening/
-#   - node_window_features.parquet      <- NEW: needed by Cell 7 Stage B narrowing
-#   - node_proxy_features.parquet
-#   - node_screening_features.parquet
-#   - window_risk_summary.parquet
-#   - feature_columns_screening.json
-#
-# Optional merged output
-# ----------------------
-# If Cell 5 has already exported motif features, this cell also writes:
-#   - node_screening_plus_motif.parquet
-# ============================================================
-
 import os
 import gc
 import json
@@ -2159,7 +2126,7 @@ MOTIF_FEATURE_DIR = OUTPUT_DIR / "motif_features"
 TX_PATH = OUTPUT_DIR / "transactions.parquet"
 
 WINDOW_SIZE = 7
-MERGE_MOTIF_FEATURES = True
+MERGE_MOTIF_FEATURES = False
 
 MOTIF_WIDE_PATH = MOTIF_FEATURE_DIR / "entity_feature_wide_merged.parquet"
 
@@ -2538,8 +2505,16 @@ if MERGE_MOTIF_FEATURES and MOTIF_WIDE_PATH.exists():
     node_screening_features = (
         node_screening_features
         .merge(motif_wide, on="node", how="left")
-        .fillna(0)
     )
+
+    # Handle 'window_key' column specifically if it exists in the merged DataFrame
+    if "window_key" in node_screening_features.columns:
+        # Fill NaN with an empty string and ensure the column is of string type
+        node_screening_features["window_key"] = node_screening_features["window_key"].fillna("").astype(str)
+
+    # Fill remaining numeric NaNs with 0
+    numeric_cols = node_screening_features.select_dtypes(include=np.number).columns
+    node_screening_features[numeric_cols] = node_screening_features[numeric_cols].fillna(0)
 
     added_cols = [c for c in node_screening_features.columns if c not in before_cols]
     motif_merge_done = True
@@ -2601,6 +2576,7 @@ print("\nDone.")
 
 
 
+
 import gc
 import json
 import os
@@ -2652,7 +2628,7 @@ RUN_STAGE_B             = True
 RUN_NULL_MODEL          = False
 
 # Narrowing controls for Stage B
-TOP_K_WINDOWS_STAGE_B   = 3
+TOP_K_WINDOWS_STAGE_B   = 7
 TOP_NODES_PER_WINDOW    = 500
 EXACT_WINDOW_SIZE       = 7
 EXACT_WINDOW_STRIDE     = 7
@@ -2670,7 +2646,7 @@ VAL_SIZE                = 0.15
 RANDOM_STATE            = 42
 
 # XGBoost
-N_ESTIMATORS            = 500
+N_ESTIMATORS            = 1500
 EARLY_STOP              = 30
 
 # Operating point
@@ -2727,12 +2703,12 @@ def _node_degree_from_tx(tx_df: pd.DataFrame) -> dict:
 
 
 def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
-    # 1. Tính toán Outgoing
     out = (
         wdf.groupby("src_node")["amount"]
         .agg(
             sum_spending="sum",
             mean_spending="mean",
+            median_spending="median",
             std_spending="std",
             max_spending="max",
             min_spending="min",
@@ -2742,19 +2718,17 @@ def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
         .rename(columns={"src_node": "node"})
     )
 
-    # 2. Tạo both_amounts và giải phóng bộ nhớ
-    src_df = wdf[["src_node", "amount"]].rename(columns={"src_node": "node"})
-    dst_df = wdf[["dst_node", "amount"]].rename(columns={"dst_node": "node"})
-    both_amounts = pd.concat([src_df, dst_df], ignore_index=True)
-    del src_df, dst_df
-    gc.collect()
+    both_amounts = pd.concat([
+        wdf[["src_node", "amount"]].rename(columns={"src_node": "node"}),
+        wdf[["dst_node", "amount"]].rename(columns={"dst_node": "node"}),
+    ], ignore_index=True)
 
-    # 3. Tính toán Total
     total_stats = (
         both_amounts.groupby("node")["amount"]
         .agg(
             total_sum="sum",
             total_mean="mean",
+            total_median="median",
             total_std="std",
             total_max="max",
             total_min="min",
@@ -2762,62 +2736,57 @@ def _subwindow_features(wdf: pd.DataFrame, suffix: str) -> pd.DataFrame:
         .reset_index()
     )
 
-    # 4. Lấy danh sách Node duy nhất
-    node_ids = pd.DataFrame({"node": both_amounts["node"].unique()}, dtype=np.int64)
-    del both_amounts
-    gc.collect()
+    count_in = (
+        wdf.groupby("dst_node").size()
+        .rename("count_in").reset_index()
+        .rename(columns={"dst_node": "node"})
+    )
+    count_out = (
+        wdf.groupby("src_node").size()
+        .rename("count_out").reset_index()
+        .rename(columns={"src_node": "node"})
+    )
+    uniq_in = (
+        wdf.groupby("dst_node")["src_node"].nunique()
+        .rename("count_unique_in").reset_index()
+        .rename(columns={"dst_node": "node"})
+    )
+    uniq_out = (
+        wdf.groupby("src_node")["dst_node"].nunique()
+        .rename("count_unique_out").reset_index()
+        .rename(columns={"src_node": "node"})
+    )
 
-    # 5. Đếm và Unique
-    count_in = wdf.groupby("dst_node").size().rename("count_in").reset_index().rename(columns={"dst_node": "node"})
-    count_out = wdf.groupby("src_node").size().rename("count_out").reset_index().rename(columns={"src_node": "node"})
-    uniq_in = wdf.groupby("dst_node")["src_node"].nunique().rename("count_unique_in").reset_index().rename(columns={"dst_node": "node"})
-    uniq_out = wdf.groupby("src_node")["dst_node"].nunique().rename("count_unique_out").reset_index().rename(columns={"src_node": "node"})
-
-    # 6. Phạm vi thời gian
-    src_step = wdf[["src_node", "step"]].rename(columns={"src_node": "node"})
-    dst_step = wdf[["dst_node", "step"]].rename(columns={"dst_node": "node"})
-    step_range = pd.concat([src_step, dst_step]).groupby("node")["step"].agg(step_first="min", step_last="max").reset_index()
+    step_range = (
+        pd.concat([
+            wdf[["src_node", "step"]].rename(columns={"src_node": "node"}),
+            wdf[["dst_node", "step"]].rename(columns={"dst_node": "node"}),
+        ])
+        .groupby("node")["step"]
+        .agg(step_first="min", step_last="max")
+        .reset_index()
+    )
     step_range["days_active"] = step_range["step_last"] - step_range["step_first"] + 1
-    del src_step, dst_step
-    gc.collect()
 
-    # 7. Hợp nhất (Merge) từ từ để tránh dồn RAM
-    merged = node_ids.merge(out, on="node", how="left")
-    del out; gc.collect()
-    
-    merged = merged.merge(total_stats, on="node", how="left")
-    del total_stats; gc.collect()
-    
-    merged = merged.merge(count_in, on="node", how="left")
-    del count_in; gc.collect()
-    
-    merged = merged.merge(count_out, on="node", how="left")
-    del count_out; gc.collect()
-    
-    merged = merged.merge(uniq_in, on="node", how="left")
-    del uniq_in; gc.collect()
-    
-    merged = merged.merge(uniq_out, on="node", how="left")
-    del uniq_out; gc.collect()
-    
-    merged = merged.merge(step_range[["node", "days_active"]], on="node", how="left")
-    del step_range; gc.collect()
-    
-    merged = merged.fillna(0)
+    node_ids = pd.DataFrame({"node": both_amounts["node"].unique()}, dtype=np.int64)
 
-    # 8. Tính tỷ lệ
+    merged = (
+        node_ids
+        .merge(out, on="node", how="left")
+        .merge(total_stats, on="node", how="left")
+        .merge(count_in, on="node", how="left")
+        .merge(count_out, on="node", how="left")
+        .merge(uniq_in, on="node", how="left")
+        .merge(uniq_out, on="node", how="left")
+        .merge(step_range[["node", "days_active"]], on="node", how="left")
+        .fillna(0)
+    )
+
     merged["in_out_count_ratio"]  = merged["count_in"] / (merged["count_out"] + 1e-6)
     merged["spend_total_ratio"]   = merged["sum_spending"] / (merged["total_sum"] + 1e-6)
     merged["unique_in_out_ratio"] = merged["count_unique_in"] / (merged["count_unique_out"] + 1e-6)
 
-    # 9. Đổi tên cột
     rename = {c: f"{c}{suffix}" for c in merged.columns if c != "node"}
-    
-    # Ép kiểu float32 để giảm một nửa dung lượng
-    for col in rename.values():
-        if col in merged.columns and merged[col].dtype == 'float64':
-             merged[col] = merged[col].astype(np.float32)
-
     return merged.rename(columns=rename)
 
 
@@ -2920,7 +2889,7 @@ def _get_super_hubs(event_df: pd.DataFrame, max_degree: int = 1500) -> set[int]:
     out_counts = event_df["src_node"].value_counts()
     in_counts = event_df["dst_node"].value_counts()
     total_counts = out_counts.add(in_counts, fill_value=0)
-    
+
     # Trả về các nút có tổng giao dịch vượt ngưỡng max_degree
     return set(total_counts[total_counts > max_degree].index)
 
@@ -3037,10 +3006,10 @@ if RUN_STAGE_B:
         if not screen_slice.empty:
             # Gom nhóm tính điểm trung bình (tránh trùng nút vì 1 candidate window chứa nhiều subwindow 7 bước)
             agg_screen = screen_slice.groupby("node")["node_screening_score"].mean().reset_index()
-            
+
             # KIỂM DUYỆT TÀN NHẪN: Bắn bỏ các siêu trung tâm khỏi danh sách nghi ngờ
             agg_screen = agg_screen[~agg_screen["node"].isin(super_hubs)]
-            
+
             # Chọn top nodes thực sự
             top_nodes = _select_top_nodes_for_window(agg_screen, top_n=TOP_NODES_PER_WINDOW)
         else:
@@ -3060,7 +3029,7 @@ if RUN_STAGE_B:
             f"narrowed events={len(narrowed_df):,} | "
             f"top_nodes={len(top_nodes):,}"
         )
- 
+
         # screen_slice = node_window_df[
         #     (node_window_df["window_start"] >= step_start) &
         #      (node_window_df["window_end"] <= step_end)
@@ -3212,8 +3181,7 @@ else:
     else:
         print("      Stage B skipped. No pre-existing motif features found.")
 
-import gc
-gc.collect()
+
 # ============================================================
 # Step 3 — Subwindow transaction features
 # ============================================================
@@ -3272,7 +3240,19 @@ print("\n[4/8] Assembling feature matrix...")
 
 node_matrix = screen_X.merge(sw_combined, on="node", how="left")
 
+# SAU KHI FIX — Cell 7, Step 4
 if motif_wide is not None:
+    # Loại bỏ các cột đã tồn tại trong node_matrix trước khi merge
+    # để tránh pandas tạo ra _x và _y suffixes
+    overlap = [
+        c for c in motif_wide.columns
+        if c != "node" and c in node_matrix.columns
+    ]
+    if overlap:
+        print(f"      [INFO] Dropping {len(overlap)} overlapping columns "
+              f"from node_matrix before motif merge: {overlap[:5]}...")
+        node_matrix = node_matrix.drop(columns=overlap)
+    
     node_matrix = node_matrix.merge(motif_wide, on="node", how="left")
     print(
         f"      motif columns added: "
