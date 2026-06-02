@@ -260,9 +260,15 @@ def load_transactions(
     keep = [c for c in cfg.keep_cols if c in df.columns]
     df = df[keep]
 
-    # Step 9 — stable deterministic sort, then add unique event_id
-    df = df.sort_values(["step", "src_node", "dst_node", "amount"]).reset_index(drop=True)
+    # Step 9 — preserve raw row order for stable ties
+    df["_raw_row_id"] = pd_lib.Series(range(len(df)), dtype="int64")
+
+    # Step 10 — stable deterministic sort, then add unique event_id
+    df = df.sort_values(
+        ["step", "src_node", "dst_node", "amount", "_raw_row_id"]
+    ).reset_index(drop=True)
     df["event_id"] = pd_lib.Series(range(len(df)), dtype="int64")
+    df = df.drop(columns=["_raw_row_id"])
 
     # Reorder to canonical output schema
     out_cols = [c for c in cfg.keep_cols if c in df.columns]
@@ -939,6 +945,7 @@ OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
 WINDOW_SIZE = 7
 WINDOW_STRIDE = 7
 DELTA_W = 5
+WRITE_DEBUG_SHARDS = True
 
 TEMPORAL_DIR = OUTPUT_DIR / "temporal_edges"
 TEMPORAL_DEBUG_DIR = OUTPUT_DIR / "temporal_edges_debug"
@@ -966,6 +973,17 @@ def _to_np(s):
     if hasattr(s, "to_pandas"):
         return s.to_pandas().to_numpy()
     return s.to_numpy()
+
+
+FORBIDDEN_FEATURE_LABEL_COLS = {"is_sar", "alert_1", "alert_2", "n_alert", "_n_alert"}
+
+
+def assert_no_label_columns(df, artifact_name: str) -> None:
+    leaked = FORBIDDEN_FEATURE_LABEL_COLS & set(df.columns)
+    if leaked:
+        raise ValueError(
+            f"{artifact_name} contains label columns (forbidden in feature shards): {sorted(leaked)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1089,11 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     # A. Temporal relay edges (exact motif substrate)
     # --------------------------------------------------------
     temporal_edges = build_temporal_edges(window_df, delta_w=DELTA_W)
-    temporal_edges_debug = build_temporal_edges_debug(window_df, delta_w=DELTA_W)
+    temporal_edges_debug = (
+        build_temporal_edges_debug(window_df, delta_w=DELTA_W)
+        if WRITE_DEBUG_SHARDS
+        else None
+    )
 
     # Validate temporal edges if non-empty
     if len(temporal_edges) > 0:
@@ -1092,7 +1114,7 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         assert (_to_np(temporal_edges["_gap"]) == gaps).all(), "Mismatch in stored _gap."
 
     # Validate debug temporal edges if non-empty
-    if len(temporal_edges_debug) > 0:
+    if WRITE_DEBUG_SHARDS and temporal_edges_debug is not None and len(temporal_edges_debug) > 0:
         expected_te_dbg = {
             "event_id_1", "src_1", "dst_1", "step_1", "amount_1", "alert_1",
             "event_id_2", "src_2", "dst_2", "step_2", "amount_2", "alert_2",
@@ -1131,7 +1153,11 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     # C. Second-order edges (feature engineering only)
     # --------------------------------------------------------
     second_order_edges = build_second_order_edges(temporal_edges)
-    second_order_edges_debug = build_second_order_edges_debug(temporal_edges_debug)
+    second_order_edges_debug = (
+        build_second_order_edges_debug(temporal_edges_debug)
+        if WRITE_DEBUG_SHARDS and temporal_edges_debug is not None
+        else None
+    )
 
     if len(second_order_edges) > 0:
         expected_so = {
@@ -1148,7 +1174,7 @@ for window_id, (step_start, step_end, window_df) in enumerate(
             _to_np(second_order_edges["src_2nd"]) != _to_np(second_order_edges["dst_2nd"])
         ).all(), "Self-relays found in second_order_edges."
 
-    if len(second_order_edges_debug) > 0:
+    if WRITE_DEBUG_SHARDS and second_order_edges_debug is not None and len(second_order_edges_debug) > 0:
         expected_so_dbg = {
             "src_2nd", "dst_2nd", "count",
             "weight_src", "weight_dst", "avg_gap", "n_alert",
@@ -1179,15 +1205,31 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     second_order_debug_path = SECOND_ORDER_DEBUG_DIR / shard_name
     snapshot_path = SNAPSHOT_DIR / shard_name
 
+    assert_no_label_columns(temporal_edges, "temporal_edges (feature)")
     temporal_edges.to_parquet(temporal_path, index=False)
-    temporal_edges_debug.to_parquet(temporal_debug_path, index=False)
+    if WRITE_DEBUG_SHARDS and temporal_edges_debug is not None:
+        temporal_edges_debug.to_parquet(temporal_debug_path, index=False)
+    assert_no_label_columns(second_order_edges, "second_order_edges (feature)")
     second_order_edges.to_parquet(second_order_path, index=False)
-    second_order_edges_debug.to_parquet(second_order_debug_path, index=False)
+    if WRITE_DEBUG_SHARDS and second_order_edges_debug is not None:
+        second_order_edges_debug.to_parquet(second_order_debug_path, index=False)
     snapshot_edges.to_parquet(snapshot_path, index=False)
 
     # --------------------------------------------------------
     # F. Window metadata for notebook 2 candidate selection
     # --------------------------------------------------------
+    # Window-local diagnostics (do not change snapshot/community logic)
+    if len(snapshot_edges) > 0:
+        _src = _to_np(snapshot_edges["src_node"])
+        _dst = _to_np(snapshot_edges["dst_node"])
+        n_nodes_window = int(np.unique(np.concatenate([_src, _dst])).shape[0])
+    else:
+        n_nodes_window = 0
+
+    adj_sparsity_window = (
+        float(A.nnz / (n_nodes_window ** 2)) if n_nodes_window > 0 else 0.0
+    )
+
     window_stats.append({
         "window": int(window_id),
         "start": int(step_start),
@@ -1197,8 +1239,10 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         "n_temporal": int(len(temporal_edges)),
         "n_second": int(len(second_order_edges)),
         "n_snapshot": int(len(snapshot_edges)),
+        "n_nodes_window": int(n_nodes_window),
         "adj_nnz": int(A.nnz),
         "adj_sparsity": float(A.nnz / (encoder.n_nodes ** 2)) if encoder.n_nodes > 0 else 0.0,
+        "adj_sparsity_window": float(adj_sparsity_window),
     })
 
     del (
@@ -1259,6 +1303,8 @@ manifest = {
     "artifact_schema_version": 2,
     "feature_shards_labeled": False,
     "debug_shards_written": True,
+    "write_debug_shards": bool(WRITE_DEBUG_SHARDS),
+    "forbidden_feature_label_cols": sorted(FORBIDDEN_FEATURE_LABEL_COLS),
     "aml_data_path": AML_DATA_PATH,
     "output_dir": str(OUTPUT_DIR),
     "window_size": int(WINDOW_SIZE),
