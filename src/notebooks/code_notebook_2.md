@@ -3280,7 +3280,7 @@ del sw_combined, screen_X
 gc.collect()
 
 
-# ============================================================
+<!-- # ============================================================
 # Step 5 — Train / validation / test split
 # ============================================================
 
@@ -3313,8 +3313,145 @@ print(f"      Test  : {len(X_test):,} (pos={int(y_test.sum()):,}, {y_test.mean()
 print(f"      Features: {len(feature_cols)}")
 
 del X_trainval, y_trainval, nodes_trainval
-gc.collect()
+gc.collect() -->
+# ============================================================
+# Step 5 — Train / validation / test split by first appearance time
+# ============================================================
 
+print("\n[5/8] Time-based train / val / test split by node first_step...")
+
+# ------------------------------------------------------------
+# 1. Feature columns
+# ------------------------------------------------------------
+EXCLUDE = {"node", "label"}
+feature_cols = [c for c in node_matrix.columns if c not in EXCLUDE]
+
+# ------------------------------------------------------------
+# 2. Compute first_step for each node from raw transactions
+#    first_step[node] = earliest step where node appears
+# ------------------------------------------------------------
+src_first = (
+    tx.groupby("src_node", as_index=False)["step"]
+    .min()
+    .rename(columns={"src_node": "node", "step": "first_step_src"})
+)
+
+dst_first = (
+    tx.groupby("dst_node", as_index=False)["step"]
+    .min()
+    .rename(columns={"dst_node": "node", "step": "first_step_dst"})
+)
+
+first_step_df = (
+    src_first.merge(dst_first, on="node", how="outer")
+)
+
+first_step_df["first_step"] = first_step_df[
+    ["first_step_src", "first_step_dst"]
+].min(axis=1)
+
+first_step_df = first_step_df[["node", "first_step"]].copy()
+first_step_df["first_step"] = first_step_df["first_step"].astype(np.int32)
+
+# ------------------------------------------------------------
+# 3. Attach first_step to node_matrix
+# ------------------------------------------------------------
+node_matrix = node_matrix.merge(first_step_df, on="node", how="left")
+
+if node_matrix["first_step"].isna().any():
+    missing_nodes = int(node_matrix["first_step"].isna().sum())
+    raise ValueError(
+        f"{missing_nodes} nodes in node_matrix do not have first_step. "
+        "This indicates a mismatch between node_matrix and transactions."
+    )
+
+node_matrix["first_step"] = node_matrix["first_step"].astype(np.int32)
+
+# ------------------------------------------------------------
+# 4. Define temporal split ranges
+#    Train: step 0  - 78
+#    Val  : step 79 - 89
+#    Test : step 90 - 111
+# ------------------------------------------------------------
+TRAIN_END = 78
+VAL_START = 79
+VAL_END = 89
+TEST_START = 90
+
+train_mask = node_matrix["first_step"] <= TRAIN_END
+val_mask   = (node_matrix["first_step"] >= VAL_START) & (node_matrix["first_step"] <= VAL_END)
+test_mask  = node_matrix["first_step"] >= TEST_START
+
+train_df = node_matrix.loc[train_mask].copy()
+val_df   = node_matrix.loc[val_mask].copy()
+test_df  = node_matrix.loc[test_mask].copy()
+
+# ------------------------------------------------------------
+# 5. Basic safety checks
+# ------------------------------------------------------------
+if train_df.empty:
+    raise RuntimeError("Train set is empty after time-based split.")
+if val_df.empty:
+    raise RuntimeError("Validation set is empty after time-based split.")
+if test_df.empty:
+    raise RuntimeError("Test set is empty after time-based split.")
+
+if train_df["label"].sum() == 0:
+    raise RuntimeError("Train set has no positive (SAR) nodes.")
+if val_df["label"].sum() == 0:
+    raise RuntimeError("Validation set has no positive (SAR) nodes.")
+if test_df["label"].sum() == 0:
+    raise RuntimeError("Test set has no positive (SAR) nodes.")
+
+# Optional: enforce disjoint node sets
+train_nodes = set(train_df["node"].tolist())
+val_nodes   = set(val_df["node"].tolist())
+test_nodes  = set(test_df["node"].tolist())
+
+assert train_nodes.isdisjoint(val_nodes), "Train and Val node sets overlap."
+assert train_nodes.isdisjoint(test_nodes), "Train and Test node sets overlap."
+assert val_nodes.isdisjoint(test_nodes), "Val and Test node sets overlap."
+
+# ------------------------------------------------------------
+# 6. Build numpy arrays
+# ------------------------------------------------------------
+X_train = train_df[feature_cols].values.astype(np.float32)
+y_train = train_df["label"].values.astype(np.int8)
+nodes_train = train_df["node"].values.astype(np.int64)
+
+X_val = val_df[feature_cols].values.astype(np.float32)
+y_val = val_df["label"].values.astype(np.int8)
+nodes_val = val_df["node"].values.astype(np.int64)
+
+X_test = test_df[feature_cols].values.astype(np.float32)
+y_test = test_df["label"].values.astype(np.int8)
+nodes_test = test_df["node"].values.astype(np.int64)
+
+# ------------------------------------------------------------
+# 7. Reporting
+# ------------------------------------------------------------
+print(f"      Train range : step <= {TRAIN_END}")
+print(f"      Val range   : step {VAL_START}-{VAL_END}")
+print(f"      Test range  : step >= {TEST_START}")
+
+print(f"      Train : {len(X_train):,} (pos={int(y_train.sum()):,}, {y_train.mean()*100:.2f}%)")
+print(f"      Val   : {len(X_val):,} (pos={int(y_val.sum()):,}, {y_val.mean()*100:.2f}%)")
+print(f"      Test  : {len(X_test):,} (pos={int(y_test.sum()):,}, {y_test.mean()*100:.2f}%)")
+print(f"      Features: {len(feature_cols)}")
+
+print(
+    f"      first_step ranges -> "
+    f"train[{train_df['first_step'].min()}-{train_df['first_step'].max()}], "
+    f"val[{val_df['first_step'].min()}-{val_df['first_step'].max()}], "
+    f"test[{test_df['first_step'].min()}-{test_df['first_step'].max()}]"
+)
+
+# ------------------------------------------------------------
+# 8. Cleanup
+# ------------------------------------------------------------
+del src_first, dst_first, first_step_df
+del train_df, val_df, test_df
+gc.collect()
 
 # ============================================================
 # Step 6 — Train XGBoost
