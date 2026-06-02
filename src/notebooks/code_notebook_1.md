@@ -114,11 +114,12 @@ class LoaderConfig:
 
     # Columns to keep in the normalized DataFrame (§3.3)
     keep_cols: List[str] = field(default_factory=lambda: [
-        "src_node", "dst_node", "amount", "step", "is_sar",
+        "event_id", "src_node", "dst_node", "amount", "step", "is_sar",
     ])
 
     # Memory-efficient dtypes (§3.2 recommended types)
     dtypes: dict = field(default_factory=lambda: {
+        "event_id": "int64",
         "step":     "int32",
         "amount":   "float32",
         "is_sar":   "int8",
@@ -259,16 +260,21 @@ def load_transactions(
     keep = [c for c in cfg.keep_cols if c in df.columns]
     df = df[keep]
 
-    # Step 9 — sort by step for temporal ordering (must not shuffle)
-    df = df.sort_values("step").reset_index(drop=True)
+    # Step 9 — stable deterministic sort, then add unique event_id
+    df = df.sort_values(["step", "src_node", "dst_node", "amount"]).reset_index(drop=True)
+    df["event_id"] = pd_lib.Series(range(len(df)), dtype="int64")
+
+    # Reorder to canonical output schema
+    out_cols = [c for c in cfg.keep_cols if c in df.columns]
+    df = df[out_cols]
 
     return df
 
 
 def iter_windows(
     df: "pd_lib.DataFrame",
-    window_size: int = 30,
-    window_stride: int = 15,
+    window_size: int = 7,
+    window_stride: int = 7,
 ) -> Iterator[Tuple[int, int, "pd_lib.DataFrame"]]:
     """
     Yield non-overlapping (or overlapping) time windows from a transaction table.
@@ -517,25 +523,72 @@ def build_temporal_edges(
     delta_w=5,
     max_fan=100,   # NEW: pruning
 ):
-    base = df[["src_node", "dst_node", "step", "amount", "is_sar"]]
+    base = df[["event_id", "src_node", "dst_node", "step", "amount"]]
 
     left = base.rename(columns={
+        "event_id": "event_id_1",
         "src_node": "src_1",
         "dst_node": "dst_1",
         "step": "step_1",
         "amount": "amount_1",
-        "is_sar": "alert_1"
     })
 
     right = base.rename(columns={
+        "event_id": "event_id_2",
         "src_node": "src_2",
         "dst_node": "dst_2",
         "step": "step_2",
         "amount": "amount_2",
-        "is_sar": "alert_2"
     })
 
     # --- CRITICAL: prune hubs BEFORE join ---
+    left = left.sort_values(["dst_1", "step_1", "event_id_1"])
+    right = right.sort_values(["src_2", "step_2", "event_id_2"])
+    left = left.groupby("dst_1").head(max_fan)
+    right = right.groupby("src_2").head(max_fan)
+
+    merged = left.merge(right, left_on="dst_1", right_on="src_2", how="inner")
+
+    gap = merged["step_2"] - merged["step_1"]
+    mask = (gap > 0) & (gap <= delta_w)
+
+    te = merged.loc[mask].copy()
+    te["_gap"] = gap[mask]
+
+    return te.reset_index(drop=True)
+
+
+def build_temporal_edges_debug(
+    df,
+    delta_w=5,
+    max_fan=100,
+):
+    """
+    Debug-only temporal edges that preserve label-derived alert columns.
+    Do NOT use these shards for model features.
+    """
+    base = df[["event_id", "src_node", "dst_node", "step", "amount", "is_sar"]]
+
+    left = base.rename(columns={
+        "event_id": "event_id_1",
+        "src_node": "src_1",
+        "dst_node": "dst_1",
+        "step": "step_1",
+        "amount": "amount_1",
+        "is_sar": "alert_1",
+    })
+
+    right = base.rename(columns={
+        "event_id": "event_id_2",
+        "src_node": "src_2",
+        "dst_node": "dst_2",
+        "step": "step_2",
+        "amount": "amount_2",
+        "is_sar": "alert_2",
+    })
+
+    left = left.sort_values(["dst_1", "step_1", "event_id_1"])
+    right = right.sort_values(["src_2", "step_2", "event_id_2"])
     left = left.groupby("dst_1").head(max_fan)
     right = right.groupby("src_2").head(max_fan)
 
@@ -597,32 +650,26 @@ def build_snapshot_edges(
 
     return agg.reset_index(drop=True)
 # Snapshot edge table (community detection input)
+#
+# NOTE: a full, typed `build_second_order_edges()` is defined below.
+# Keep this legacy helper name distinct to avoid accidental overrides.
 
-def build_second_order_edges(te):
-
+def build_second_order_edges_legacy(te):
     if len(te) == 0:
-        return pd.DataFrame(columns=[
-            "src_2nd","dst_2nd","count",
-            "weight_src","weight_dst","avg_gap","n_alert"
-        ])
+        return pd.DataFrame(
+            columns=["src_2nd", "dst_2nd", "count", "weight_src", "weight_dst", "avg_gap"]
+        )
 
     te = te[te["src_1"] != te["dst_2"]].copy()
-
-    te["_n_alert"] = te["alert_1"] + te["alert_2"]
 
     grouped = te.groupby(["src_1", "dst_2"], as_index=False).agg(
         count=("_gap", "count"),
         weight_src=("amount_1", "sum"),
         weight_dst=("amount_2", "sum"),
         avg_gap=("_gap", "mean"),
-        n_alert=("_n_alert", "sum"),
     )
 
-    grouped = grouped.rename(columns={
-        "src_1": "src_2nd",
-        "dst_2": "dst_2nd"
-    })
-
+    grouped = grouped.rename(columns={"src_1": "src_2nd", "dst_2": "dst_2nd"})
     return grouped
 
 
@@ -676,8 +723,8 @@ def build_second_order_edges(
     ----------
     temporal_edges : DataFrame
         Output of build_temporal_edges().  Expected columns:
-        src_1, dst_1, step_1, amount_1, alert_1,
-        src_2, dst_2, step_2, amount_2, alert_2.
+        src_1, dst_1, step_1, amount_1,
+        src_2, dst_2, step_2, amount_2, _gap.
 
     Returns
     -------
@@ -688,7 +735,6 @@ def build_second_order_edges(
         weight_src  : total amount sent by src (sum of amount_1)
         weight_dst  : total amount received by dst (sum of amount_2)
         avg_gap     : mean step gap across relay hops
-        n_alert     : total alert flags across all hops (alert_1 + alert_2)
 
     Notes
     -----
@@ -703,7 +749,6 @@ def build_second_order_edges(
         "weight_src": "float32",
         "weight_dst": "float32",
         "avg_gap":    "float32",
-        "n_alert":    "int64",
     }
 
     if len(temporal_edges) == 0:
@@ -721,12 +766,62 @@ def build_second_order_edges(
             {col: pd_lib.Series(dtype=dtype) for col, dtype in _EMPTY_SCHEMA.items()}
         )
 
-    # Compute time gap and combined alert in-place (no copy)
-    te = te.copy()  # single copy here to safely assign new columns
+    # Compute time gap in-place (no copy)
+    te = te.copy()  # single copy here to safely assign a new column
+    te["_gap"] = te["step_2"] - te["step_1"]
+
+
+
+    grouped = te.groupby(["src_1", "dst_2"], as_index=False).agg(
+        count=("_gap", "count"),
+        weight_src=("amount_1", "sum"),
+        weight_dst=("amount_2", "sum"),
+        avg_gap=("_gap", "mean"),
+    )
+
+    grouped = grouped.rename(columns={"src_1": "src_2nd", "dst_2": "dst_2nd"})
+
+    # Cast to memory-efficient types
+    grouped["weight_src"] = grouped["weight_src"].astype("float32")
+    grouped["weight_dst"] = grouped["weight_dst"].astype("float32")
+    grouped["avg_gap"] = grouped["avg_gap"].astype("float32")
+
+    return grouped.reset_index(drop=True)
+
+
+def build_second_order_edges_debug(
+    temporal_edges_debug: "pd_lib.DataFrame",
+) -> "pd_lib.DataFrame":
+    """
+    Debug-only second-order edges that preserve label-derived aggregates (n_alert).
+    Do NOT use these shards for model features.
+    """
+    _EMPTY_SCHEMA = {
+        "src_2nd":    "int64",
+        "dst_2nd":    "int64",
+        "count":      "int64",
+        "weight_src": "float32",
+        "weight_dst": "float32",
+        "avg_gap":    "float32",
+        "n_alert":    "int64",
+    }
+
+    if len(temporal_edges_debug) == 0:
+        return pd_lib.DataFrame(
+            {col: pd_lib.Series(dtype=dtype) for col, dtype in _EMPTY_SCHEMA.items()}
+        )
+
+    te = temporal_edges_debug
+    te = te[te["src_1"] != te["dst_2"]]
+
+    if len(te) == 0:
+        return pd_lib.DataFrame(
+            {col: pd_lib.Series(dtype=dtype) for col, dtype in _EMPTY_SCHEMA.items()}
+        )
+
+    te = te.copy()
     te["_gap"] = te["step_2"] - te["step_1"]
     te["_n_alert"] = te["alert_1"] + te["alert_2"]
-
-
 
     grouped = te.groupby(["src_1", "dst_2"], as_index=False).agg(
         count=("_gap", "count"),
@@ -737,8 +832,6 @@ def build_second_order_edges(
     )
 
     grouped = grouped.rename(columns={"src_1": "src_2nd", "dst_2": "dst_2nd"})
-
-    # Cast to memory-efficient types
     grouped["weight_src"] = grouped["weight_src"].astype("float32")
     grouped["weight_dst"] = grouped["weight_dst"].astype("float32")
     grouped["avg_gap"] = grouped["avg_gap"].astype("float32")
@@ -876,12 +969,14 @@ tx_df = load_transactions(AML_DATA_PATH)
 print(f"      Rows: {len(tx_df):,}")
 print(f"      Columns: {list(tx_df.columns)}")
 
-_expected_cols = {"src_node", "dst_node", "amount", "step", "is_sar"}
+_expected_cols = {"event_id", "src_node", "dst_node", "amount", "step", "is_sar"}
 if set(tx_df.columns) != _expected_cols:
     raise ValueError(
         f"Unexpected columns after load_transactions(): {set(tx_df.columns)}"
     )
 
+assert str(tx_df["event_id"].dtype) == "int64", f"event_id dtype: {tx_df['event_id'].dtype}"
+assert tx_df["event_id"].is_unique, "event_id must be unique per transaction."
 assert str(tx_df["step"].dtype) == "int32", f"step dtype: {tx_df['step'].dtype}"
 assert str(tx_df["amount"].dtype) == "float32", f"amount dtype: {tx_df['amount'].dtype}"
 assert str(tx_df["is_sar"].dtype) == "int8", f"is_sar dtype: {tx_df['is_sar'].dtype}"
