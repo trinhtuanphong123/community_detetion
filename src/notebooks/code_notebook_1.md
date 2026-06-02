@@ -936,16 +936,25 @@ if not os.path.isdir("/content/drive/MyDrive"):
 AML_DATA_PATH = "/content/drive/MyDrive/AML/dataset/tx_log.csv"
 OUTPUT_DIR = Path("/content/drive/MyDrive/AML/outputs")
 
-WINDOW_SIZE = 30
-WINDOW_STRIDE = 15
+WINDOW_SIZE = 7
+WINDOW_STRIDE = 7
 DELTA_W = 5
 
 TEMPORAL_DIR = OUTPUT_DIR / "temporal_edges"
+TEMPORAL_DEBUG_DIR = OUTPUT_DIR / "temporal_edges_debug"
 SECOND_ORDER_DIR = OUTPUT_DIR / "second_order_edges"
+SECOND_ORDER_DEBUG_DIR = OUTPUT_DIR / "second_order_edges_debug"
 SNAPSHOT_DIR = OUTPUT_DIR / "snapshot_edges"
 META_PATH = OUTPUT_DIR / "windows_meta.parquet"
 
-for d in [OUTPUT_DIR, TEMPORAL_DIR, SECOND_ORDER_DIR, SNAPSHOT_DIR]:
+for d in [
+    OUTPUT_DIR,
+    TEMPORAL_DIR,
+    TEMPORAL_DEBUG_DIR,
+    SECOND_ORDER_DIR,
+    SECOND_ORDER_DEBUG_DIR,
+    SNAPSHOT_DIR,
+]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -1062,12 +1071,14 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     # A. Temporal relay edges (exact motif substrate)
     # --------------------------------------------------------
     temporal_edges = build_temporal_edges(window_df, delta_w=DELTA_W)
+    temporal_edges_debug = build_temporal_edges_debug(window_df, delta_w=DELTA_W)
 
     # Validate temporal edges if non-empty
     if len(temporal_edges) > 0:
         expected_te = {
-            "src_1", "dst_1", "step_1", "amount_1", "alert_1",
-            "src_2", "dst_2", "step_2", "amount_2", "alert_2",
+            "event_id_1", "src_1", "dst_1", "step_1", "amount_1",
+            "event_id_2", "src_2", "dst_2", "step_2", "amount_2",
+            "_gap",
         }
         missing_te = expected_te - set(temporal_edges.columns)
         if missing_te:
@@ -1078,6 +1089,20 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         gaps = _to_np(temporal_edges["step_2"] - temporal_edges["step_1"])
         assert (gaps > 0).all(), "Temporal ordering violated in temporal_edges."
         assert (gaps <= DELTA_W).all(), f"Temporal gap exceeds DELTA_W={DELTA_W}."
+        assert (_to_np(temporal_edges["_gap"]) == gaps).all(), "Mismatch in stored _gap."
+
+    # Validate debug temporal edges if non-empty
+    if len(temporal_edges_debug) > 0:
+        expected_te_dbg = {
+            "event_id_1", "src_1", "dst_1", "step_1", "amount_1", "alert_1",
+            "event_id_2", "src_2", "dst_2", "step_2", "amount_2", "alert_2",
+            "_gap",
+        }
+        missing_te_dbg = expected_te_dbg - set(temporal_edges_debug.columns)
+        if missing_te_dbg:
+            raise ValueError(
+                f"Debug temporal edges missing columns: {sorted(missing_te_dbg)}"
+            )
 
     # --------------------------------------------------------
     # B. Snapshot edges (community/global graph use)
@@ -1106,11 +1131,12 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     # C. Second-order edges (feature engineering only)
     # --------------------------------------------------------
     second_order_edges = build_second_order_edges(temporal_edges)
+    second_order_edges_debug = build_second_order_edges_debug(temporal_edges_debug)
 
     if len(second_order_edges) > 0:
         expected_so = {
             "src_2nd", "dst_2nd", "count",
-            "weight_src", "weight_dst", "avg_gap", "n_alert",
+            "weight_src", "weight_dst", "avg_gap",
         }
         missing_so = expected_so - set(second_order_edges.columns)
         if missing_so:
@@ -1121,6 +1147,17 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         assert (
             _to_np(second_order_edges["src_2nd"]) != _to_np(second_order_edges["dst_2nd"])
         ).all(), "Self-relays found in second_order_edges."
+
+    if len(second_order_edges_debug) > 0:
+        expected_so_dbg = {
+            "src_2nd", "dst_2nd", "count",
+            "weight_src", "weight_dst", "avg_gap", "n_alert",
+        }
+        missing_so_dbg = expected_so_dbg - set(second_order_edges_debug.columns)
+        if missing_so_dbg:
+            raise ValueError(
+                f"Debug second-order edges missing columns: {sorted(missing_so_dbg)}"
+            )
 
     # --------------------------------------------------------
     # D. Snapshot adjacency check (do not save matrix per window)
@@ -1137,11 +1174,15 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     shard_name = f"w_{step_start}_{step_end}.parquet"
 
     temporal_path = TEMPORAL_DIR / shard_name
+    temporal_debug_path = TEMPORAL_DEBUG_DIR / shard_name
     second_order_path = SECOND_ORDER_DIR / shard_name
+    second_order_debug_path = SECOND_ORDER_DEBUG_DIR / shard_name
     snapshot_path = SNAPSHOT_DIR / shard_name
 
     temporal_edges.to_parquet(temporal_path, index=False)
+    temporal_edges_debug.to_parquet(temporal_debug_path, index=False)
     second_order_edges.to_parquet(second_order_path, index=False)
+    second_order_edges_debug.to_parquet(second_order_debug_path, index=False)
     snapshot_edges.to_parquet(snapshot_path, index=False)
 
     # --------------------------------------------------------
@@ -1151,6 +1192,7 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         "window": int(window_id),
         "start": int(step_start),
         "end": int(step_end),
+        "window_key": f"w_{int(step_start)}_{int(step_end)}",
         "n_tx": int(n_tx),
         "n_temporal": int(len(temporal_edges)),
         "n_second": int(len(second_order_edges)),
@@ -1159,7 +1201,15 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         "adj_sparsity": float(A.nnz / (encoder.n_nodes ** 2)) if encoder.n_nodes > 0 else 0.0,
     })
 
-    del window_df, temporal_edges, snapshot_edges, second_order_edges, A
+    del (
+        window_df,
+        temporal_edges,
+        temporal_edges_debug,
+        snapshot_edges,
+        second_order_edges,
+        second_order_edges_debug,
+        A,
+    )
     gc.collect()
 
 print(f"\n      Total non-empty windows processed: {len(window_stats):,}")
@@ -1174,6 +1224,17 @@ print("\n[5/7] Saving windows metadata...")
 windows_meta_df = _pd.DataFrame(window_stats).sort_values(
     ["start", "end"]
 ).reset_index(drop=True)
+
+# Chronological split (window-level): train/val/test = 70/15/15
+if len(windows_meta_df) > 0:
+    n = len(windows_meta_df)
+    n_train = int(n * 0.70)
+    n_val = int(n * 0.15)
+    split = _pd.Series(["test"] * n, index=windows_meta_df.index, dtype="object")
+    split.iloc[:n_train] = "train"
+    split.iloc[n_train:n_train + n_val] = "val"
+    windows_meta_df["split"] = split
+
 windows_meta_df.to_parquet(META_PATH, index=False)
 
 print(f"      windows_meta.parquet -> {META_PATH}")
@@ -1195,6 +1256,9 @@ if len(windows_meta_df) > 0:
 print("\n[6/7] Saving graph manifest...")
 
 manifest = {
+    "artifact_schema_version": 2,
+    "feature_shards_labeled": False,
+    "debug_shards_written": True,
     "aml_data_path": AML_DATA_PATH,
     "output_dir": str(OUTPUT_DIR),
     "window_size": int(WINDOW_SIZE),
@@ -1206,7 +1270,9 @@ manifest = {
         "transactions": str(tx_path),
         "node_map": str(node_map_path),
         "temporal_edges_dir": str(TEMPORAL_DIR),
+        "temporal_edges_debug_dir": str(TEMPORAL_DEBUG_DIR),
         "second_order_edges_dir": str(SECOND_ORDER_DIR),
+        "second_order_edges_debug_dir": str(SECOND_ORDER_DEBUG_DIR),
         "snapshot_edges_dir": str(SNAPSHOT_DIR),
         "windows_meta": str(META_PATH),
     },
