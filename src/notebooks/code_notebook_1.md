@@ -114,7 +114,7 @@ class LoaderConfig:
 
     # Columns to keep in the normalized DataFrame (§3.3)
     keep_cols: List[str] = field(default_factory=lambda: [
-        "event_id", "src_node", "dst_node", "amount", "step", "is_sar",
+        "event_id", "src_node", "dst_node", "amount", "step", "type_code", "is_sar",
     ])
 
     # Memory-efficient dtypes (§3.2 recommended types)
@@ -122,6 +122,7 @@ class LoaderConfig:
         "event_id": "int64",
         "step":     "int32",
         "amount":   "float32",
+        "type_code":"int8",
         "is_sar":   "int8",
         "src_node": "int64",
         "dst_node": "int64",
@@ -225,6 +226,20 @@ def load_transactions(
 
     # Step 1 — rename to canonical names
     df = _rename_columns(df, cfg.column_map)
+
+    # Optional: hot-code transaction type into a compact numeric feature.
+    # Keeps strings out of the canonical table and avoids affecting graph shards.
+    if "type" in df.columns and "type_code" not in df.columns:
+        _type_map = {
+            "TRANSFER": 0,
+            "INITALBALANCE": 1,  # dataset spelling
+            "CASH": 2,
+        }
+        if hasattr(df["type"], "to_pandas"):
+            _codes = df["type"].to_pandas().map(_type_map).fillna(-1).astype("int8")
+            df["type_code"] = pd_lib.Series(_codes.values, dtype="int8")
+        else:
+            df["type_code"] = df["type"].map(_type_map).fillna(-1).astype("int8")
 
     # Step 2 — check mandatory columns
     for col in ("src_node", "dst_node", "amount"):
@@ -413,9 +428,12 @@ class NodeEncoder:
         Series of int64 encoded IDs, same index as input.
         """
         raw = _to_numpy(series)
-        new_nodes = np.setdiff1d(raw, np.array(list(self._label_to_id.keys())))
-        if len(new_nodes) > 0:
-            self._register(new_nodes)
+        # Deterministic: register unseen nodes in sorted unique order.
+        for node in np.unique(raw):
+            if node not in self._label_to_id:
+                self._label_to_id[node] = int(self._next_id)
+                self._id_to_label[int(self._next_id)] = node
+                self._next_id += 1
         return encode_series(series, self._label_to_id)
 
 
@@ -451,24 +469,12 @@ class NodeEncoder:
     # Internal
 
     def _register(self, nodes: np.ndarray) -> None:
-        """Add new nodes to the mapping. Vectorized; no Python loop."""
-        # Filter to nodes not yet registered
-        known = np.array(list(self._label_to_id.keys())) if self._label_to_id else np.array([])
-        if len(known) > 0:
-            new_nodes = np.setdiff1d(nodes, known)
-        else:
-            new_nodes = nodes
-
-        if len(new_nodes) == 0:
-            return
-
-        # Assign contiguous IDs starting from _next_id
-        new_ids = np.arange(self._next_id, self._next_id + len(new_nodes))
-        for node, nid in zip(new_nodes.tolist(), new_ids.tolist()):
-            self._label_to_id[node] = int(nid)
-            self._id_to_label[int(nid)] = node
-
-        self._next_id += len(new_nodes)
+        """Add new nodes to the mapping (deterministic, avoids key-array conversions)."""
+        for node in np.unique(nodes):
+            if node not in self._label_to_id:
+                self._label_to_id[node] = int(self._next_id)
+                self._id_to_label[int(self._next_id)] = node
+                self._next_id += 1
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +534,7 @@ def build_temporal_edges(
     df,
     delta_w=5,
     max_fan=100,   # NEW: pruning
+    return_trim_stats: bool = False,
 ):
     base = df[["event_id", "src_node", "dst_node", "step", "amount"]]
 
@@ -550,8 +557,13 @@ def build_temporal_edges(
     # --- CRITICAL: prune hubs BEFORE join ---
     left = left.sort_values(["dst_1", "step_1", "event_id_1"])
     right = right.sort_values(["src_2", "step_2", "event_id_2"])
+
+    left_rows_before = len(left)
+    right_rows_before = len(right)
     left = left.groupby("dst_1").head(max_fan)
     right = right.groupby("src_2").head(max_fan)
+    left_rows_after = len(left)
+    right_rows_after = len(right)
 
     merged = left.merge(right, left_on="dst_1", right_on="src_2", how="inner")
 
@@ -561,13 +573,25 @@ def build_temporal_edges(
     te = merged.loc[mask].copy()
     te["_gap"] = gap[mask]
 
-    return te.reset_index(drop=True)
+    te = te.reset_index(drop=True)
+    if not return_trim_stats:
+        return te
+
+    trim_stats = {
+        "max_fan_used": int(max_fan),
+        "left_rows_before": int(left_rows_before),
+        "left_rows_after": int(left_rows_after),
+        "right_rows_before": int(right_rows_before),
+        "right_rows_after": int(right_rows_after),
+    }
+    return te, trim_stats
 
 
 def build_temporal_edges_debug(
     df,
     delta_w=5,
     max_fan=100,
+    return_trim_stats: bool = False,
 ):
     """
     Debug-only temporal edges that preserve label-derived alert columns.
@@ -595,8 +619,13 @@ def build_temporal_edges_debug(
 
     left = left.sort_values(["dst_1", "step_1", "event_id_1"])
     right = right.sort_values(["src_2", "step_2", "event_id_2"])
+
+    left_rows_before = len(left)
+    right_rows_before = len(right)
     left = left.groupby("dst_1").head(max_fan)
     right = right.groupby("src_2").head(max_fan)
+    left_rows_after = len(left)
+    right_rows_after = len(right)
 
     merged = left.merge(right, left_on="dst_1", right_on="src_2", how="inner")
 
@@ -606,7 +635,18 @@ def build_temporal_edges_debug(
     te = merged.loc[mask].copy()
     te["_gap"] = gap[mask]
 
-    return te.reset_index(drop=True)
+    te = te.reset_index(drop=True)
+    if not return_trim_stats:
+        return te
+
+    trim_stats = {
+        "max_fan_used": int(max_fan),
+        "left_rows_before": int(left_rows_before),
+        "left_rows_after": int(left_rows_after),
+        "right_rows_before": int(right_rows_before),
+        "right_rows_after": int(right_rows_after),
+    }
+    return te, trim_stats
 
 def build_snapshot_edges(
     df: "pd_lib.DataFrame",
@@ -996,10 +1036,12 @@ tx_df = load_transactions(AML_DATA_PATH)
 print(f"      Rows: {len(tx_df):,}")
 print(f"      Columns: {list(tx_df.columns)}")
 
-_expected_cols = {"event_id", "src_node", "dst_node", "amount", "step", "is_sar"}
-if set(tx_df.columns) != _expected_cols:
+_required_cols = {"event_id", "src_node", "dst_node", "amount", "step", "is_sar"}
+missing = _required_cols - set(tx_df.columns)
+if missing:
     raise ValueError(
-        f"Unexpected columns after load_transactions(): {set(tx_df.columns)}"
+        f"Missing required columns after load_transactions(): {sorted(missing)}. "
+        f"Got: {sorted(set(tx_df.columns))}"
     )
 
 assert str(tx_df["event_id"].dtype) == "int64", f"event_id dtype: {tx_df['event_id'].dtype}"
@@ -1007,6 +1049,8 @@ assert tx_df["event_id"].is_unique, "event_id must be unique per transaction."
 assert str(tx_df["step"].dtype) == "int32", f"step dtype: {tx_df['step'].dtype}"
 assert str(tx_df["amount"].dtype) == "float32", f"amount dtype: {tx_df['amount'].dtype}"
 assert str(tx_df["is_sar"].dtype) == "int8", f"is_sar dtype: {tx_df['is_sar'].dtype}"
+if "type_code" in tx_df.columns:
+    assert str(tx_df["type_code"].dtype) == "int8", f"type_code dtype: {tx_df['type_code'].dtype}"
 
 print("      Schema OK.")
 
@@ -1088,12 +1132,16 @@ for window_id, (step_start, step_end, window_df) in enumerate(
     # --------------------------------------------------------
     # A. Temporal relay edges (exact motif substrate)
     # --------------------------------------------------------
-    temporal_edges = build_temporal_edges(window_df, delta_w=DELTA_W)
-    temporal_edges_debug = (
-        build_temporal_edges_debug(window_df, delta_w=DELTA_W)
-        if WRITE_DEBUG_SHARDS
-        else None
+    temporal_edges, temporal_trim_stats = build_temporal_edges(
+        window_df, delta_w=DELTA_W, return_trim_stats=True
     )
+    if WRITE_DEBUG_SHARDS:
+        temporal_edges_debug, temporal_trim_stats_debug = build_temporal_edges_debug(
+            window_df, delta_w=DELTA_W, return_trim_stats=True
+        )
+    else:
+        temporal_edges_debug = None
+        temporal_trim_stats_debug = {}
 
     # Validate temporal edges if non-empty
     if len(temporal_edges) > 0:
@@ -1243,6 +1291,24 @@ for window_id, (step_start, step_end, window_df) in enumerate(
         "adj_nnz": int(A.nnz),
         "adj_sparsity": float(A.nnz / (encoder.n_nodes ** 2)) if encoder.n_nodes > 0 else 0.0,
         "adj_sparsity_window": float(adj_sparsity_window),
+        # Hub trimming (max_fan pruning) diagnostics
+        "max_fan_used": int(temporal_trim_stats.get("max_fan_used", 0)),
+        "trim_left_rows_before": int(temporal_trim_stats.get("left_rows_before", 0)),
+        "trim_left_rows_after": int(temporal_trim_stats.get("left_rows_after", 0)),
+        "trim_right_rows_before": int(temporal_trim_stats.get("right_rows_before", 0)),
+        "trim_right_rows_after": int(temporal_trim_stats.get("right_rows_after", 0)),
+        "debug_trim_left_rows_before": int(temporal_trim_stats_debug.get("left_rows_before", 0))
+        if WRITE_DEBUG_SHARDS
+        else 0,
+        "debug_trim_left_rows_after": int(temporal_trim_stats_debug.get("left_rows_after", 0))
+        if WRITE_DEBUG_SHARDS
+        else 0,
+        "debug_trim_right_rows_before": int(temporal_trim_stats_debug.get("right_rows_before", 0))
+        if WRITE_DEBUG_SHARDS
+        else 0,
+        "debug_trim_right_rows_after": int(temporal_trim_stats_debug.get("right_rows_after", 0))
+        if WRITE_DEBUG_SHARDS
+        else 0,
     })
 
     del (
