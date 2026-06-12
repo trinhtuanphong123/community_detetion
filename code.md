@@ -23,6 +23,7 @@ print("Polars version:", pl.__version__)
 
 
 
+
 # ============================================================
 # Cell 2: Config Paths and Parameters
 # ============================================================
@@ -103,6 +104,55 @@ MATCHER_COLUMNS = [
     "amount",
     "is_sar",
 ]
+
+
+# ----------------------------
+# Fan-in / fan-out branch sizes
+# ----------------------------
+FAN_IN_SIZES  = [3, 4, 5, 6, 7]   # number of incoming branches per pattern
+FAN_OUT_SIZES = [3, 4, 5, 6, 7]   # number of outgoing branches per pattern
+
+# Candidate cap schedule keyed by branch count.
+# C(cap, n) is bounded at roughly 250 000 for all n.
+FAN_IN_CAP_SCHEDULE  = {3: 100, 4: 50, 5: 25, 6: 15, 7: 10}
+FAN_OUT_CAP_SCHEDULE = {3: 100, 4: 50, 5: 25, 6: 15, 7: 10}
+
+# ----------------------------
+# Split-merge branch sizes
+# ----------------------------
+SPLIT_MERGE_SIZES = [3, 4, 5]     # number of branch pairs (split legs = merge legs)
+
+SPLIT_MERGE_OUT_CAP   = {3: 12, 4: 8, 5: 6}
+SPLIT_MERGE_MERGE_CAP = {3: 3,  4: 2, 5: 2}
+
+# ----------------------------
+# Center-in-out arm configs
+# ----------------------------
+# Each tuple is (n_in, n_out).
+CENTER_INOUT_CONFIGS = [(3, 2), (3, 3), (4, 2), (4, 3), (5, 3)]
+
+CENTER_INOUT_IN_CAP  = {3: 30, 4: 15, 5: 10}
+CENTER_INOUT_OUT_CAP = {2: 20, 3: 12,  4: 8}
+
+# ----------------------------
+# Cycle sizes
+# ----------------------------
+CYCLE_SIZES           = list(range(5, 11))   # 5, 6, 7, 8, 9, 10
+BIDIRECTIONAL_CYCLE_THRESHOLD = 7            # use bidirectional DFS for k >= this
+
+CYCLE_MAX_BRANCHING = {5: 8, 6: 6, 7: 5, 8: 4, 9: 4, 10: 4}
+
+# ----------------------------
+# Stacked Bipartite layer configs
+# ----------------------------
+# Each entry is a list of intermediate layer widths.
+STACKED_BIPARTITE_CONFIGS = [
+    [2],        # equivalent to split_merge_4
+    [3],        # equivalent to split_merge_6
+    [2, 2],     # two-layer: 1→2→2→1
+    [3, 2],     # two-layer: 1→3→2→1
+]
+
 
 print("Config ready.")
 print("DATA_PATH:", DATA_PATH)
@@ -225,6 +275,7 @@ if non_positive_amount.height > 0:
     display(non_positive_amount.head(10))
 
 print("\nCell 3 completed.")
+
 
 
 # ============================================================
@@ -505,42 +556,88 @@ def validate_pattern(pattern: MotifPattern) -> None:
 # a -> d, b -> d, c -> d
 # ------------------------------------------------------------
 
-fan_in_4 = MotifPattern(
-    name="fan_in_4",
-    nodes=["a", "b", "c", "d"],
-    edges=[
-        PatternEdge("p1", "a", "d", 1, role="incoming_1"),
-        PatternEdge("p2", "b", "d", 2, role="incoming_2"),
-        PatternEdge("p3", "c", "d", 3, role="incoming_3"),
-    ],
-    matcher_type="fan_in",
-    max_duration=MAX_MOTIF_DURATION,
-    time_order="nondecreasing",
-    distinct_nodes=True,
-    description="Three distinct source nodes transfer to the same destination node.",
-)
+# ============================================================
+# Factory: fan_in family
+# ============================================================
 
+def make_fan_in_pattern(n: int) -> MotifPattern:
+    """
+    n distinct source nodes each send one edge to one common destination.
+    n = number of incoming branches (= number of source nodes).
+    Total nodes: n + 1. Total edges: n.
+    Minimum n: 3.
+    """
+    if n < 3:
+        raise ValueError(f"fan_in requires n >= 3, got {n}")
+
+    src_nodes = [f"src_{i}" for i in range(1, n + 1)]
+    nodes     = src_nodes + ["dst"]
+
+    edges = [
+        PatternEdge(
+            name  = f"p{i}",
+            src   = f"src_{i}",
+            dst   = "dst",
+            order = i,
+            role  = f"incoming_{i}",
+        )
+        for i in range(1, n + 1)
+    ]
+
+    return MotifPattern(
+        name          = f"fan_in_{n + 1}",   # n+1 = total node count
+        nodes         = nodes,
+        edges         = edges,
+        matcher_type  = "fan_in",
+        max_duration  = MAX_MOTIF_DURATION,
+        time_order    = "nondecreasing",
+        distinct_nodes= True,
+        description   = (
+            f"Fan-in: {n} distinct source nodes each transfer to one destination."
+        ),
+    )
 
 # ------------------------------------------------------------
 # Pattern 2: Fan-out size 4
 # a -> b, a -> c, a -> d
 # ------------------------------------------------------------
 
-fan_out_4 = MotifPattern(
-    name="fan_out_4",
-    nodes=["a", "b", "c", "d"],
-    edges=[
-        PatternEdge("p1", "a", "b", 1, role="outgoing_1"),
-        PatternEdge("p2", "a", "c", 2, role="outgoing_2"),
-        PatternEdge("p3", "a", "d", 3, role="outgoing_3"),
-    ],
-    matcher_type="fan_out",
-    max_duration=MAX_MOTIF_DURATION,
-    time_order="nondecreasing",
-    distinct_nodes=True,
-    description="One source node transfers to three distinct destination nodes.",
-)
+def make_fan_out_pattern(n: int) -> MotifPattern:
+    """
+    One source node sends one edge to n distinct destinations.
+    n = number of outgoing branches (= number of destination nodes).
+    Total nodes: n + 1. Total edges: n.
+    Minimum n: 3.
+    """
+    if n < 3:
+        raise ValueError(f"fan_out requires n >= 3, got {n}")
 
+    dst_nodes = [f"dst_{i}" for i in range(1, n + 1)]
+    nodes     = ["src"] + dst_nodes
+
+    edges = [
+        PatternEdge(
+            name  = f"p{i}",
+            src   = "src",
+            dst   = f"dst_{i}",
+            order = i,
+            role  = f"outgoing_{i}",
+        )
+        for i in range(1, n + 1)
+    ]
+
+    return MotifPattern(
+        name          = f"fan_out_{n + 1}",
+        nodes         = nodes,
+        edges         = edges,
+        matcher_type  = "fan_out",
+        max_duration  = MAX_MOTIF_DURATION,
+        time_order    = "nondecreasing",
+        distinct_nodes= True,
+        description   = (
+            f"Fan-out: one source transfers to {n} distinct destination nodes."
+        ),
+    )
 
 # ------------------------------------------------------------
 # Pattern 3: Directed temporal cycles with length from 5 to 12
@@ -597,23 +694,23 @@ def make_cycle_pattern(k: int) -> MotifPattern:
     )
 
 
-CYCLE_MIN_LEN = 5
-CYCLE_MAX_LEN = 12
+# CYCLE_MIN_LEN = 5
+# CYCLE_MAX_LEN = 12
 
-cycle_patterns = [
-    make_cycle_pattern(k)
-    for k in range(CYCLE_MIN_LEN, CYCLE_MAX_LEN + 1)
-]
+# cycle_patterns = [
+#     make_cycle_pattern(k)
+#     for k in range(CYCLE_MIN_LEN, CYCLE_MAX_LEN + 1)
+# ]
 
-# Keep these variable names for compatibility with later cells if needed.
-cycle_5 = cycle_patterns[0]
-cycle_6 = cycle_patterns[1]
-cycle_7 = cycle_patterns[2]
-cycle_8 = cycle_patterns[3]
-cycle_9 = cycle_patterns[4]
-cycle_10 = cycle_patterns[5]
-cycle_11 = cycle_patterns[6]
-cycle_12 = cycle_patterns[7]
+# # Keep these variable names for compatibility with later cells if needed.
+# cycle_5 = cycle_patterns[0]
+# cycle_6 = cycle_patterns[1]
+# cycle_7 = cycle_patterns[2]
+# cycle_8 = cycle_patterns[3]
+# cycle_9 = cycle_patterns[4]
+# cycle_10 = cycle_patterns[5]
+# cycle_11 = cycle_patterns[6]
+# cycle_12 = cycle_patterns[7]
 
 
 
@@ -622,25 +719,56 @@ cycle_12 = cycle_patterns[7]
 # a -> b, a -> c, a -> d, b -> e, c -> e, d -> e
 # ------------------------------------------------------------
 
-split_merge_5 = MotifPattern(
-    name="split_merge_5",
-    nodes=["a", "b", "c", "d", "e"],
-    edges=[
-        PatternEdge("p1", "a", "b", 1, role="split_1"),
-        PatternEdge("p2", "a", "c", 2, role="split_2"),
-        PatternEdge("p3", "a", "d", 3, role="split_3"),
-        PatternEdge("p4", "b", "e", 4, role="merge_1"),
-        PatternEdge("p5", "c", "e", 5, role="merge_2"),
-        PatternEdge("p6", "d", "e", 6, role="merge_3"),
-    ],
-    matcher_type="split_merge",
-    max_duration=MAX_MOTIF_DURATION,
-    time_order="nondecreasing",
-    distinct_nodes=True,
-    amount_ratio_min=AMOUNT_RATIO_MIN,
-    amount_ratio_max=AMOUNT_RATIO_MAX,
-    description="One source splits value into three intermediates, then they merge into one sink.",
-)
+def make_split_merge_pattern(n: int) -> MotifPattern:
+    """
+    One source fans out to n intermediates; all intermediates fan in to one sink.
+    n = number of branch pairs.
+    Total nodes: n + 2 (source, n intermediates, sink).
+    Total edges: 2n.
+    Minimum n: 3.
+    """
+    if n < 3:
+        raise ValueError(f"split_merge requires n >= 3, got {n}")
+
+    mid_nodes = [f"mid_{i}" for i in range(1, n + 1)]
+    nodes     = ["src"] + mid_nodes + ["sink"]
+
+    split_edges = [
+        PatternEdge(
+            name  = f"split_{i}",
+            src   = "src",
+            dst   = f"mid_{i}",
+            order = i,
+            role  = f"split_{i}",
+        )
+        for i in range(1, n + 1)
+    ]
+    merge_edges = [
+        PatternEdge(
+            name  = f"merge_{i}",
+            src   = f"mid_{i}",
+            dst   = "sink",
+            order = n + i,
+            role  = f"merge_{i}",
+        )
+        for i in range(1, n + 1)
+    ]
+
+    return MotifPattern(
+        name             = f"split_merge_{2 * n}",   # 2n total edges
+        nodes            = nodes,
+        edges            = split_edges + merge_edges,
+        matcher_type     = "split_merge",
+        max_duration     = MAX_MOTIF_DURATION,
+        time_order       = "nondecreasing",
+        distinct_nodes   = True,
+        amount_ratio_min = AMOUNT_RATIO_MIN,
+        amount_ratio_max = AMOUNT_RATIO_MAX,
+        description      = (
+            f"Split-merge: source splits to {n} intermediates "
+            f"that converge to one sink."
+        ),
+    )
 
 
 # ------------------------------------------------------------
@@ -648,24 +776,59 @@ split_merge_5 = MotifPattern(
 # a -> d, b -> d, c -> d, d -> e, d -> f
 # ------------------------------------------------------------
 
-fanin_fanout_6 = MotifPattern(
-    name="fanin_fanout_6",
-    nodes=["a", "b", "c", "d", "e", "f"],
-    edges=[
-        PatternEdge("p1", "a", "d", 1, role="incoming_1"),
-        PatternEdge("p2", "b", "d", 2, role="incoming_2"),
-        PatternEdge("p3", "c", "d", 3, role="incoming_3"),
-        PatternEdge("p4", "d", "e", 4, role="outgoing_1"),
-        PatternEdge("p5", "d", "f", 5, role="outgoing_2"),
-    ],
-    matcher_type="center_in_out",
-    max_duration=MAX_MOTIF_DURATION,
-    time_order="nondecreasing",
-    distinct_nodes=True,
-    amount_ratio_min=AMOUNT_RATIO_MIN,
-    amount_ratio_max=AMOUNT_RATIO_MAX,
-    description="A center node receives from three sources and then sends to two destinations.",
-)
+def make_center_inout_pattern(n_in: int, n_out: int) -> MotifPattern:
+    """
+    n_in sources feed into one center; center distributes to n_out destinations.
+    All nodes must be distinct.
+    Total nodes: n_in + 1 + n_out. Total edges: n_in + n_out.
+    Minimum n_in: 2. Minimum n_out: 2.
+    """
+    if n_in < 2:
+        raise ValueError(f"center_inout requires n_in >= 2, got {n_in}")
+    if n_out < 2:
+        raise ValueError(f"center_inout requires n_out >= 2, got {n_out}")
+
+    in_nodes  = [f"in_{i}"  for i in range(1, n_in  + 1)]
+    out_nodes = [f"out_{i}" for i in range(1, n_out + 1)]
+    nodes     = in_nodes + ["center"] + out_nodes
+
+    in_edges = [
+        PatternEdge(
+            name  = f"in_{i}",
+            src   = f"in_{i}",
+            dst   = "center",
+            order = i,
+            role  = f"incoming_{i}",
+        )
+        for i in range(1, n_in + 1)
+    ]
+    out_edges = [
+        PatternEdge(
+            name  = f"out_{i}",
+            src   = "center",
+            dst   = f"out_{i}",
+            order = n_in + i,
+            role  = f"outgoing_{i}",
+        )
+        for i in range(1, n_out + 1)
+    ]
+
+    return MotifPattern(
+        name             = f"center_inout_{n_in}in_{n_out}out",
+        nodes            = nodes,
+        edges            = in_edges + out_edges,
+        matcher_type     = "center_in_out",
+        max_duration     = MAX_MOTIF_DURATION,
+        time_order       = "nondecreasing",
+        distinct_nodes   = True,
+        amount_ratio_min = AMOUNT_RATIO_MIN,
+        amount_ratio_max = AMOUNT_RATIO_MAX,
+        description      = (
+            f"Center-in-out: {n_in} sources feed center, "
+            f"center distributes to {n_out} destinations."
+        ),
+    )
+
 
 
 # ------------------------------------------------------------
@@ -673,73 +836,215 @@ fanin_fanout_6 = MotifPattern(
 # a -> d, b -> d, b -> e, c -> e, d -> f, d -> g, e -> h
 # ------------------------------------------------------------
 
-two_stage_split_8 = MotifPattern(
-    name="two_stage_split_8",
-    nodes=["a", "b", "c", "d", "e", "f", "g", "h"],
-    edges=[
-        PatternEdge("p1", "a", "d", 1, role="stage1_in_1"),
-        PatternEdge("p2", "b", "d", 2, role="stage1_in_2"),
-        PatternEdge("p3", "b", "e", 3, role="stage1_in_3"),
-        PatternEdge("p4", "c", "e", 4, role="stage1_in_4"),
-        PatternEdge("p5", "d", "f", 5, role="stage2_out_1"),
-        PatternEdge("p6", "d", "g", 6, role="stage2_out_2"),
-        PatternEdge("p7", "e", "h", 7, role="stage2_out_3"),
-    ],
-    matcher_type="two_stage_split",
-    max_duration=MAX_MOTIF_DURATION,
-    time_order="nondecreasing",
-    distinct_nodes=True,
-    amount_ratio_min=AMOUNT_RATIO_MIN,
-    amount_ratio_max=AMOUNT_RATIO_MAX,
-    description="Two intermediate nodes receive from upstream nodes and then distribute downstream.",
+def make_stacked_bipartite_pattern(layer_sizes: List[int]) -> MotifPattern:
+    """
+    Layered bipartite chain.
+
+    layer_sizes defines the width of each intermediate layer.
+    Example: layer_sizes=[3, 2] means:
+        layer 0: [L0_0]       (1 source node)
+        layer 1: [L1_0..L1_2] (3 intermediate nodes)
+        layer 2: [L2_0..L2_1] (2 intermediate nodes)
+        layer 3: [L3_0]       (1 sink node)
+
+    Between each pair of adjacent layers, there is a full bipartite
+    edge set (every node in layer i connects to every node in layer i+1).
+
+    Total edges = sum over adjacent layer pairs of (width_i * width_{i+1}),
+    with width_0 = width_last = 1.
+    """
+    if not layer_sizes:
+        raise ValueError("layer_sizes must have at least one element")
+
+    all_layer_widths = [1] + list(layer_sizes) + [1]
+
+    # Build node names per layer.
+    all_layers: List[List[str]] = []
+    for l_idx, width in enumerate(all_layer_widths):
+        all_layers.append([f"L{l_idx}_{j}" for j in range(width)])
+
+    nodes = [n for layer in all_layers for n in layer]
+
+    edges: List[PatternEdge] = []
+    order = 1
+    for l_idx in range(len(all_layers) - 1):
+        for src_node in all_layers[l_idx]:
+            for dst_node in all_layers[l_idx + 1]:
+                edges.append(
+                    PatternEdge(
+                        name  = f"e{order}",
+                        src   = src_node,
+                        dst   = dst_node,
+                        order = order,
+                        role  = f"L{l_idx}_to_L{l_idx+1}_{src_node}_{dst_node}",
+                    )
+                )
+                order += 1
+
+    size_str = "_".join(str(s) for s in layer_sizes)
+
+    return MotifPattern(
+        name             = f"stacked_bipartite_{size_str}",
+        nodes            = nodes,
+        edges            = edges,
+        matcher_type     = "stacked_bipartite",
+        max_duration     = MAX_MOTIF_DURATION,
+        time_order       = "nondecreasing",
+        distinct_nodes   = True,
+        amount_ratio_min = AMOUNT_RATIO_MIN,
+        amount_ratio_max = AMOUNT_RATIO_MAX,
+        description      = (
+            f"Stacked bipartite with intermediate layer widths {layer_sizes}."
+        ),
+    )
+
+
+# ============================================================
+# Build pattern collections from factories
+# ============================================================
+
+fan_in_patterns        = [make_fan_in_pattern(n)      for n in FAN_IN_SIZES]
+fan_out_patterns       = [make_fan_out_pattern(n)     for n in FAN_OUT_SIZES]
+cycle_patterns         = [make_cycle_pattern(k)       for k in CYCLE_SIZES]
+split_merge_patterns   = [make_split_merge_pattern(n) for n in SPLIT_MERGE_SIZES]
+center_inout_patterns  = [make_center_inout_pattern(n_in, n_out)
+                          for n_in, n_out in CENTER_INOUT_CONFIGS]
+stacked_bipartite_patterns = [make_stacked_bipartite_pattern(cfg)
+                              for cfg in STACKED_BIPARTITE_CONFIGS]
+
+# Convenience aliases for backward compatibility with later cells.
+fan_in_4   = fan_in_patterns[0]    # n=3 branches, 4 total nodes
+fan_out_4  = fan_out_patterns[0]   # n=3 branches, 4 total nodes
+cycle_5    = cycle_patterns[0]
+split_merge_5 = split_merge_patterns[0]   # 3 branch pairs, 5 total nodes
+fanin_fanout_6 = center_inout_patterns[0] # (3 in, 2 out)
+
+ALL_PATTERNS = (
+    fan_in_patterns
+    + fan_out_patterns
+    + cycle_patterns
+    + split_merge_patterns
+    + center_inout_patterns
+    + stacked_bipartite_patterns
 )
 
-
-# ------------------------------------------------------------
-# Pattern registry
-# ------------------------------------------------------------
-
-ALL_PATTERNS = [
-    fan_in_4,
-    fan_out_4,
-    *cycle_patterns,
-    split_merge_5,
-    fanin_fanout_6,
-    two_stage_split_8,
-]
-# First implementation target.
-# The first matcher implementation should start with these two.
 ACTIVE_PATTERNS = [
     fan_in_4,
     fan_out_4,
+    cycle_5,
+    split_merge_5,
+    fanin_fanout_6,
 ]
 
-for pattern in ALL_PATTERNS:
-    validate_pattern(pattern)
-
-print("Pattern definitions completed.")
-print("Total patterns:", len(ALL_PATTERNS))
-print("Active patterns for first implementation:", [p.name for p in ACTIVE_PATTERNS])
-
-pattern_summary_rows = []
-
 for p in ALL_PATTERNS:
-    pattern_summary_rows.append({
-        "name": p.name,
-        "matcher_type": p.matcher_type,
-        "num_nodes": len(p.nodes),
-        "num_edges": len(p.edges),
-        "max_duration": p.max_duration,
-        "time_order": p.time_order,
-        "distinct_nodes": p.distinct_nodes,
-        "description": p.description,
-    })
+    validate_pattern(p)
 
-pattern_summary = pl.DataFrame(pattern_summary_rows)
+print(f"Pattern definitions completed.")
+print(f"Total patterns: {len(ALL_PATTERNS)}")
+print(f"  fan_in family:          {len(fan_in_patterns)}")
+print(f"  fan_out family:         {len(fan_out_patterns)}")
+print(f"  cycle family:           {len(cycle_patterns)}")
+print(f"  split_merge family:     {len(split_merge_patterns)}")
+print(f"  center_inout family:    {len(center_inout_patterns)}")
+print(f"  stacked_bipartite:      {len(stacked_bipartite_patterns)}")
 
+pattern_summary = pl.DataFrame([
+    {
+        "name":          p.name,
+        "matcher_type":  p.matcher_type,
+        "num_nodes":     len(p.nodes),
+        "num_edges":     len(p.edges),
+        "max_duration":  p.max_duration,
+        "time_order":    p.time_order,
+    }
+    for p in ALL_PATTERNS
+])
 display(pattern_summary)
-
 print("\nCell 5 completed.")
+
+
+
+ # ============================================================
+# Cell 5a: Window Candidate Summary
+# ============================================================
+
+@dataclass
+class WindowCandidateSummary:
+    """
+    Lightweight per-window structural summary.
+
+    Computed once per window, shared across all matchers.
+    Allows matchers to skip nodes that cannot satisfy minimum
+    degree requirements before touching the temporal index.
+    """
+    total_edges: int
+    node_in_degree:  Dict[int, int]
+    node_out_degree: Dict[int, int]
+
+    # Pre-filtered node lists for each matcher type.
+    fan_in_candidate_dsts:   Dict[int, List[int]]   # dst -> [min_branches] for each size
+    fan_out_candidate_srcs:  Dict[int, List[int]]   # src -> [min_branches] for each size
+    center_candidate_nodes:  List[int]               # nodes with in >= 2 and out >= 2
+
+    @property
+    def high_in_degree_nodes(self) -> List[int]:
+        return [n for n, d in self.node_in_degree.items()  if d >= 3]
+
+    @property
+    def high_out_degree_nodes(self) -> List[int]:
+        return [n for n, d in self.node_out_degree.items() if d >= 3]
+
+
+def build_window_candidate_summary(
+    df_extended: pl.DataFrame,
+    min_fan_branches: int = 3,
+    min_center_in:    int = 2,
+    min_center_out:   int = 2,
+) -> WindowCandidateSummary:
+    """
+    Build a WindowCandidateSummary from the extended window edge dataframe.
+
+    This is O(|edges|) and should be called once per window before
+    any matcher is invoked.
+    """
+    in_degree:  Dict[int, int] = defaultdict(int)
+    out_degree: Dict[int, int] = defaultdict(int)
+
+    for row in df_extended.select(["src", "dst"]).iter_rows():
+        src, dst = row
+        out_degree[src] += 1
+        in_degree[dst]  += 1
+
+    # Pre-build candidate node lists per role.
+    fan_in_dsts   = {n for n, d in in_degree.items()  if d >= min_fan_branches}
+    fan_out_srcs  = {n for n, d in out_degree.items() if d >= min_fan_branches}
+    center_nodes  = [
+        n for n in set(in_degree) & set(out_degree)
+        if in_degree[n] >= min_center_in and out_degree[n] >= min_center_out
+    ]
+
+    return WindowCandidateSummary(
+        total_edges      = df_extended.height,
+        node_in_degree   = dict(in_degree),
+        node_out_degree  = dict(out_degree),
+        fan_in_candidate_dsts  = {n: in_degree[n]  for n in fan_in_dsts},
+        fan_out_candidate_srcs = {n: out_degree[n] for n in fan_out_srcs},
+        center_candidate_nodes = center_nodes,
+    )
+
+
+# ------------------------------------------------------------
+# Smoke test
+# ------------------------------------------------------------
+
+# test_summary = build_window_candidate_summary(df_extended_test, min_fan_branches=3)
+
+# print("WindowCandidateSummary smoke test:")
+# print("  total_edges:           ", test_summary.total_edges)
+# print("  nodes with in >= 3:    ", len(test_summary.fan_in_candidate_dsts))
+# print("  nodes with out >= 3:   ", len(test_summary.fan_out_candidate_srcs))
+# print("  center candidates:     ", len(test_summary.center_candidate_nodes))
+print("\nCell 5a completed.")
 
 
 
@@ -1159,6 +1464,44 @@ class TemporalIndex:
             "num_pairs": len(self.pair_edges),
         }
 
+    def has_any_outgoing(
+        self,
+        src: int,
+        t_min: int,
+        t_max: int,
+    ) -> bool:
+        """
+        Return True if there is at least one outgoing edge from src
+        with step in (t_min, t_max].
+        Used for cheap return-to-start feasibility checks in cycle DFS.
+        """
+        times = self.out_times.get(src)
+        if not times:
+            return False
+        left  = bisect_right(times, t_min)
+        right = bisect_right(times, t_max)
+        return right > left
+
+    def has_any_pair(
+        self,
+        src: int,
+        dst: int,
+        t_min: int,
+        t_max: int,
+    ) -> bool:
+        """
+        Return True if there is at least one edge src -> dst
+        with step in (t_min, t_max].
+        Used for cheap cycle-close feasibility checks.
+        """
+        key   = (src, dst)
+        times = self.pair_times.get(key)
+        if not times:
+            return False
+        left  = bisect_right(times, t_min)
+        right = bisect_right(times, t_max)
+        return right > left
+
 
 def build_temporal_index_from_polars(df_window_edges: pl.DataFrame) -> TemporalIndex:
     """
@@ -1364,7 +1707,7 @@ def make_motif_instance_row(
     node_map: Dict[str, int],
     role_map: Dict[str, int],
     anchor_edge_id: Optional[int] = None,
-    validate: bool = True,
+    validate: bool = False,
 ) -> Dict[str, Any]:
     """
     Create one row for motif_instances.

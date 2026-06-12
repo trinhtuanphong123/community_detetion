@@ -1,307 +1,245 @@
 # ============================================================
-# Cell 9: FanInMatcher
+# Cell 9: FanInMatcher (generalized, variable n)
 # ============================================================
 
 from itertools import combinations
 
 
 def is_edge_in_primary_window(edge: EdgeRecord, window: WindowSpec) -> bool:
-    """
-    Check whether an edge belongs to the primary window.
-
-    Only motif instances whose anchor edge is in the primary window
-    should be emitted. This prevents duplicate output across windows.
-    """
     return window.primary_start <= edge.step <= window.primary_end
 
 
 def get_anchor_edge(edges: List[EdgeRecord]) -> EdgeRecord:
-    """
-    Define the canonical anchor edge of an instance.
-
-    For unordered branch motifs like fan-in/fan-out, use the earliest edge.
-    Tie-break by edge_id.
-    """
     return min(edges, key=lambda e: (e.step, e.edge_id))
 
 
 def passes_amount_min(edges: List[EdgeRecord], amount_min: Optional[float]) -> bool:
-    """
-    Optional absolute amount filter.
-    """
     if amount_min is None:
         return True
-
     return all(e.amount >= amount_min for e in edges)
 
 
 def passes_distinct_nodes_for_fanin(edges: List[EdgeRecord]) -> bool:
     """
-    Fan-in structure:
-        a -> d
-        b -> d
-        c -> d
-
-    Conditions:
-        all dst are the same
-        all src are distinct
-        src nodes are different from dst
-        edge IDs are distinct
+    All edges must share the same dst.
+    All src nodes must be distinct.
+    No src may equal dst.
+    All edge_ids must be distinct.
+    Works for any n >= 3.
     """
-    if len(edges) == 0:
+    if not edges:
         return False
-
-    edge_ids = [e.edge_id for e in edges]
-    if len(edge_ids) != len(set(edge_ids)):
+    if len({e.edge_id for e in edges}) != len(edges):
         return False
-
-    dst_values = [e.dst for e in edges]
-    if len(set(dst_values)) != 1:
+    dst_values = {e.dst for e in edges}
+    if len(dst_values) != 1:
         return False
-
     src_values = [e.src for e in edges]
     if len(src_values) != len(set(src_values)):
         return False
-
-    center_dst = dst_values[0]
-
-    if any(src == center_dst for src in src_values):
-        return False
-
-    return True
+    center_dst = next(iter(dst_values))
+    return not any(s == center_dst for s in src_values)
 
 
 def passes_fanin_duration(edges: List[EdgeRecord], max_duration: int) -> bool:
-    """
-    Fan-in motif duration constraint:
-        max(step_i) - min(step_i) <= max_duration
-    """
     steps = [e.step for e in edges]
     return (max(steps) - min(steps)) <= max_duration
 
-def passes_consecutive_delta_hop(
-    edges: List[EdgeRecord],
+
+def passes_consecutive_delta_hop_sorted(
+    edges_sorted_by_step: List[EdgeRecord],
     delta_hop: Optional[int],
 ) -> bool:
     """
-    Check whether consecutive edges are temporally close enough.
-
-    After edges are sorted by step, edge_id:
-        step[i + 1] - step[i] <= delta_hop
-
-    If delta_hop is None, this constraint is disabled.
+    Expects edges already sorted by (step, edge_id).
+    Checks step[i+1] - step[i] <= delta_hop for all consecutive pairs.
     """
-    if delta_hop is None:
+    if delta_hop is None or len(edges_sorted_by_step) <= 1:
         return True
-
-    if len(edges) <= 1:
-        return True
-
-    steps = [int(e.step) for e in edges]
-
-    for i in range(len(steps) - 1):
-        if steps[i + 1] - steps[i] > delta_hop:
-            return False
-
-    return True
+    steps = [e.step for e in edges_sorted_by_step]
+    return all(steps[i+1] - steps[i] <= delta_hop for i in range(len(steps)-1))
 
 
 def canonicalize_fanin_edges(edges: List[EdgeRecord]) -> List[EdgeRecord]:
-    """
-    Canonical ordering for fan-in branches.
-
-    Since fan-in branches are unordered, we sort by step then edge_id
-    before building output. This avoids duplicate representation.
-    """
     return sorted(edges, key=lambda e: (e.step, e.edge_id))
+
+
+def prefilter_by_time_window(
+    candidates: List[EdgeRecord],
+    max_duration: int,
+) -> List[EdgeRecord]:
+    """
+    Cheap O(n) pre-filter before combinations().
+
+    After sorting by step, any edge whose step is more than
+    max_duration ahead of the earliest edge's step can only
+    appear in a combination that violates duration.
+    Remove it from the candidate list entirely.
+
+    This reduces combinations from C(n, k) to C(n', k)
+    where n' = candidates within the valid time window.
+    """
+    if not candidates:
+        return candidates
+    candidates_sorted = sorted(candidates, key=lambda e: (e.step, e.edge_id))
+    earliest_step = candidates_sorted[0].step
+    return [e for e in candidates_sorted if e.step - earliest_step <= max_duration]
 
 
 class FanInMatcher:
     """
-    Specialized matcher for fan_in_4.
+    Generalized fan-in matcher. Supports n = 3..7 incoming branches.
 
-    Pattern:
-        a -> d
-        b -> d
-        c -> d
+    Pattern: n distinct sources each send one edge to one common destination.
 
-    Matching strategy:
-        1. Use incoming index grouped by dst.
-        2. For each dst, take candidate incoming edges.
-        3. Apply degree/candidate cap.
-        4. Generate combinations of size 3.
-        5. Keep only combinations satisfying:
-            - same dst
-            - distinct sources
-            - duration <= max_duration
-            - optional amount_min
-            - anchor edge is in primary window
-        6. Emit motif_instances and edge_motif_membership rows.
-
-    This matcher deliberately allows overlap between motif instances.
-    It only prevents duplicate enumeration via combinations and canonical anchor.
+    Changes from original:
+    - n_branches read from pattern, not hard-coded.
+    - Cap looked up from FAN_IN_CAP_SCHEDULE.
+    - Time-window pre-filter applied before combinations().
+    - Filter order: duration → delta_hop → distinct_nodes → amount → anchor.
+    - validate=False passed to make_motif_instance_row.
     """
 
     def __init__(
         self,
-        max_in_candidates: int = MAX_IN_CANDIDATES,
-        max_instances_per_window: int = MAX_INSTANCES_PER_WINDOW,
-        amount_min: Optional[float] = AMOUNT_MIN,
-        delta_hop: Optional[int] = DELTA_HOP,
+        cap_schedule:             Dict[int, int] = FAN_IN_CAP_SCHEDULE,
+        max_instances_per_window: int            = MAX_INSTANCES_PER_WINDOW,
+        amount_min:               Optional[float]= AMOUNT_MIN,
+        delta_hop:                Optional[int]  = DELTA_HOP,
     ):
-        self.max_in_candidates = max_in_candidates
+        self.cap_schedule             = cap_schedule
         self.max_instances_per_window = max_instances_per_window
-        self.amount_min = amount_min
-        self.delta_hop = delta_hop
+        self.amount_min               = amount_min
+        self.delta_hop                = delta_hop
 
-    def _select_candidate_edges_for_dst(
+    def _get_cap(self, n_branches: int) -> int:
+        return self.cap_schedule.get(n_branches, 10)
+
+    def _select_candidates(
         self,
-        edges: List[EdgeRecord],
-        max_candidates: int,
+        edges:        List[EdgeRecord],
+        n_branches:   int,
+        max_duration: int,
     ) -> List[EdgeRecord]:
-        """
-        Candidate selection for one destination node.
+        cap = self._get_cap(n_branches)
 
-        Current policy:
-            sort by step, edge_id and keep earliest max_candidates.
+        # Amount floor filter first — O(n), removes disqualified edges entirely.
+        if self.amount_min is not None:
+            edges = [e for e in edges if e.amount >= self.amount_min]
 
-        Later alternatives:
-            top-K by amount
-            top-K by local risk score
-            hybrid earliest + high amount
-        """
-        edges_sorted = sorted(edges, key=lambda e: (e.step, e.edge_id))
+        # Time-window pre-filter.
+        edges = prefilter_by_time_window(edges, max_duration)
 
-        if max_candidates is not None and len(edges_sorted) > max_candidates:
-            return edges_sorted[:max_candidates]
+        # Apply cap: keep earliest.
+        if len(edges) > cap:
+            edges = edges[:cap]   # already sorted by prefilter_by_time_window
 
-        return edges_sorted
+        return edges
 
     def match(
         self,
-        df_primary: pl.DataFrame,
-        df_extended: pl.DataFrame,
-        index: TemporalIndex,
-        window: WindowSpec,
-        pattern: MotifPattern,
+        df_primary:   pl.DataFrame,
+        df_extended:  pl.DataFrame,
+        index:        TemporalIndex,
+        window:       WindowSpec,
+        pattern:      MotifPattern,
         write_output: bool = False,
     ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
-        """
-        Run fan-in motif matching for one window.
-
-        Returns:
-            motif_df
-            membership_df
-            stats
-        """
 
         if pattern.matcher_type != "fan_in":
             raise ValueError(
-                f"FanInMatcher can only handle matcher_type='fan_in'. "
-                f"Got: {pattern.matcher_type}"
+                f"FanInMatcher requires matcher_type='fan_in', got {pattern.matcher_type}"
             )
 
-        if len(pattern.edges) != 3:
-            raise ValueError(
-                f"Current FanInMatcher expects exactly 3 incoming edges. "
-                f"Pattern {pattern.name} has {len(pattern.edges)} edges."
-            )
+        n_branches = len(pattern.edges)
+        if n_branches < 3:
+            raise ValueError(f"fan_in pattern must have >= 3 edges, got {n_branches}")
 
         start_time = time.time()
+        motif_rows:      List[Dict] = []
+        membership_rows: List[Dict] = []
 
-        motif_rows = []
-        membership_rows = []
+        n_dst_scanned      = 0
+        n_dst_skipped_deg  = 0
+        n_dst_capped       = 0
+        n_combos_checked   = 0
+        n_rej_duration     = 0
+        n_rej_delta_hop    = 0
+        n_rej_structure    = 0
+        n_rej_amount       = 0
+        n_rej_anchor       = 0
 
-        num_dst_groups_scanned = 0
-        num_dst_groups_capped = 0
-        num_combinations_checked = 0
-        num_combinations_rejected_duration = 0
-        num_combinations_rejected_delta_hop = 0
-        num_combinations_rejected_structure = 0
-        num_combinations_rejected_amount = 0
-        num_combinations_rejected_anchor = 0
+        pattern_edges_sorted = sorted(pattern.edges, key=lambda x: x.order)
 
-        # Iterate over incoming groups from temporal index.
-        # Each key is a destination node.
         for dst_node, incoming_edges in index.in_edges.items():
-            num_dst_groups_scanned += 1
 
-            candidates = self._select_candidate_edges_for_dst(
-                incoming_edges,
-                self.max_in_candidates,
+            # Fast degree check before any other work.
+            if len(incoming_edges) < n_branches:
+                n_dst_skipped_deg += 1
+                continue
+
+            n_dst_scanned += 1
+
+            candidates = self._select_candidates(
+                list(incoming_edges), n_branches, pattern.max_duration
             )
 
             if len(incoming_edges) > len(candidates):
-                num_dst_groups_capped += 1
+                n_dst_capped += 1
 
-            if len(candidates) < 3:
+            if len(candidates) < n_branches:
                 continue
 
-            for edge_triplet in combinations(candidates, 3):
-                num_combinations_checked += 1
+            for edge_combo in combinations(candidates, n_branches):
+                n_combos_checked += 1
+                edges = canonicalize_fanin_edges(list(edge_combo))
 
-                edges = canonicalize_fanin_edges(list(edge_triplet))
-
+                # 1. Duration — cheapest check (just max-min of steps)
                 if not passes_fanin_duration(edges, pattern.max_duration):
-                    num_combinations_rejected_duration += 1
+                    n_rej_duration += 1
                     continue
 
-                if not passes_consecutive_delta_hop(edges, self.delta_hop):
-                    num_combinations_rejected_delta_hop += 1
+                # 2. Delta hop — O(n) on sorted list
+                if not passes_consecutive_delta_hop_sorted(edges, self.delta_hop):
+                    n_rej_delta_hop += 1
                     continue
 
+                # 3. Structural validity — distinct nodes, same dst
                 if not passes_distinct_nodes_for_fanin(edges):
-                    num_combinations_rejected_structure += 1
+                    n_rej_structure += 1
                     continue
 
-                if not passes_amount_min(edges, self.amount_min):
-                    num_combinations_rejected_amount += 1
+                # 4. Anchor in primary window — O(1)
+                anchor = get_anchor_edge(edges)
+                if not is_edge_in_primary_window(anchor, window):
+                    n_rej_anchor += 1
                     continue
 
-                anchor_edge = get_anchor_edge(edges)
-
-                if not is_edge_in_primary_window(anchor_edge, window):
-                    num_combinations_rejected_anchor += 1
-                    continue
-
-                # Build structural node map:
-                # fan-in: a,b,c are sources, d is common destination.
+                # Build maps.
                 node_map = {
-                    "a": int(edges[0].src),
-                    "b": int(edges[1].src),
-                    "c": int(edges[2].src),
-                    "d": int(edges[0].dst),
+                    f"src_{i+1}": int(edges[i].src) for i in range(n_branches)
                 }
+                node_map["dst"] = int(edges[0].dst)
 
-                # Build role map according to pattern roles.
-                pattern_edges_sorted = sorted(pattern.edges, key=lambda x: x.order)
-
-                role_map = {}
-                for p_edge, real_edge in zip(pattern_edges_sorted, edges):
-                    role = p_edge.role if p_edge.role else p_edge.name
-                    role_map[role] = int(real_edge.edge_id)
+                role_map = {
+                    p_edge.role: int(real_edge.edge_id)
+                    for p_edge, real_edge in zip(pattern_edges_sorted, edges)
+                }
 
                 try:
                     motif_row = make_motif_instance_row(
-                        window_id=window.window_id,
-                        pattern=pattern,
-                        edges=edges,
-                        node_map=node_map,
-                        role_map=role_map,
-                        anchor_edge_id=anchor_edge.edge_id,
-                        validate=True,
+                        window_id      = window.window_id,
+                        pattern        = pattern,
+                        edges          = edges,
+                        node_map       = node_map,
+                        role_map       = role_map,
+                        anchor_edge_id = anchor.edge_id,
+                        validate       = False,
                     )
-                except Exception as exc:
-                    # This should be rare if checks above are correct.
-                    # Keep the matcher robust during experimentation.
+                except Exception:
                     continue
 
-                membership = make_edge_motif_membership_rows(
-                    motif_row=motif_row,
-                    pattern=pattern,
-                    edges=edges,
-                )
-
+                membership = make_edge_motif_membership_rows(motif_row, pattern, edges)
                 motif_rows.append(motif_row)
                 membership_rows.extend(membership)
 
@@ -311,388 +249,230 @@ class FanInMatcher:
             if len(motif_rows) >= self.max_instances_per_window:
                 break
 
-        motif_df = motif_instance_rows_to_polars(motif_rows)
+        motif_df      = motif_instance_rows_to_polars(motif_rows)
         membership_df = membership_rows_to_polars(membership_rows)
-
-        elapsed = time.time() - start_time
+        elapsed       = time.time() - start_time
 
         stats = {
-            "window_id": int(window.window_id),
-            "motif_type": pattern.name,
-            "matcher_type": pattern.matcher_type,
-            "primary_start": int(window.primary_start),
-            "primary_end": int(window.primary_end),
-            "extended_start": int(window.extended_start),
-            "extended_end": int(window.extended_end),
-            "primary_num_edges": int(df_primary.height),
-            "extended_num_edges": int(df_extended.height),
-            "num_dst_groups_scanned": int(num_dst_groups_scanned),
-            "num_dst_groups_capped": int(num_dst_groups_capped),
-            "num_combinations_checked": int(num_combinations_checked),
-            "num_instances": int(motif_df.height),
-            "num_membership_rows": int(membership_df.height),
-            "num_combinations_rejected_duration": int(num_combinations_rejected_duration),
-            "num_combinations_rejected_delta_hop": int(num_combinations_rejected_delta_hop),
-            "num_combinations_rejected_structure": int(num_combinations_rejected_structure),
-            "num_combinations_rejected_amount": int(num_combinations_rejected_amount),
-            "num_combinations_rejected_anchor": int(num_combinations_rejected_anchor),
-            "hit_max_instances_per_window": int(len(motif_rows) >= self.max_instances_per_window),
-            "elapsed_seconds": float(elapsed),
+            "window_id":                   int(window.window_id),
+            "motif_type":                  pattern.name,
+            "matcher_type":                pattern.matcher_type,
+            "n_branches":                  int(n_branches),
+            "primary_start":               int(window.primary_start),
+            "primary_end":                 int(window.primary_end),
+            "primary_num_edges":           int(df_primary.height),
+            "extended_num_edges":          int(df_extended.height),
+            "n_dst_scanned":               int(n_dst_scanned),
+            "n_dst_skipped_low_degree":    int(n_dst_skipped_deg),
+            "n_dst_capped":                int(n_dst_capped),
+            "n_combos_checked":            int(n_combos_checked),
+            "num_instances":               int(motif_df.height),
+            "num_membership_rows":         int(membership_df.height),
+            "n_rej_duration":              int(n_rej_duration),
+            "n_rej_delta_hop":             int(n_rej_delta_hop),
+            "n_rej_structure":             int(n_rej_structure),
+            "n_rej_anchor":                int(n_rej_anchor),
+            "hit_max_instances_per_window":int(len(motif_rows) >= self.max_instances_per_window),
+            "elapsed_seconds":             float(elapsed),
         }
 
         if write_output:
-            motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
-                membership_rows=membership_rows,
-                window_id=window.window_id,
-                motif_type=pattern.name,
+            mp, mep = write_motif_outputs(
+                motif_rows, membership_rows, window.window_id, pattern.name
             )
-
-            stats["motif_path"] = motif_path
-            stats["membership_path"] = membership_path
+            stats["motif_path"]      = mp
+            stats["membership_path"] = mep
 
         return motif_df, membership_df, stats
 
 
-# # ------------------------------------------------------------
-# # Smoke test FanInMatcher on first non-empty window
-# # ------------------------------------------------------------
-
-# print("Running Cell 9 FanInMatcher smoke test...")
-
-fanin_matcher = FanInMatcher(
-    max_in_candidates=MAX_IN_CANDIDATES,
-    max_instances_per_window=MAX_INSTANCES_PER_WINDOW,
-    amount_min=AMOUNT_MIN,
-    delta_hop=DELTA_HOP,
-)
-
-# # Use the first non-empty test window from Cell 6.
-# df_primary_test, df_extended_test = slice_window_edges(df_edges, test_window)
-# test_index = build_temporal_index_from_polars(df_extended_test)
-
-# fanin_motif_df, fanin_membership_df, fanin_stats = fanin_matcher.match(
-#     df_primary=df_primary_test,
-#     df_extended=df_extended_test,
-#     index=test_index,
-#     window=test_window,
-#     pattern=fan_in_4,
-#     write_output=False,
-# )
-
-# print("\nFanInMatcher smoke test stats:")
-# for k, v in fanin_stats.items():
-#     print(f"{k}: {v}")
-
-# print("\nFan-in motif instances preview:")
-# display(fanin_motif_df.head(10))
-
-# print("\nFan-in edge membership preview:")
-# display(fanin_membership_df.head(15))
-
-
-# # ------------------------------------------------------------
-# # Optional: write smoke test output to Drive
-# # Set to True only if you want to persist the test shard.
-# # ------------------------------------------------------------
-
-# WRITE_CELL9_SMOKE_OUTPUT = False
-
-# if WRITE_CELL9_SMOKE_OUTPUT:
-#     motif_path, membership_path = write_motif_outputs(
-#         motif_rows=fanin_motif_df.to_dicts(),
-#         membership_rows=fanin_membership_df.to_dicts(),
-#         window_id=test_window.window_id,
-#         motif_type=fan_in_4.name,
-#     )
-
-#     print("\nSmoke test outputs written:")
-#     print("motif_path:", motif_path)
-#     print("membership_path:", membership_path)
-
-
-# ------------------------------------------------------------
-# Store matcher in registry for later pipeline cells
-# ------------------------------------------------------------
-
-MATCHER_REGISTRY = {
-    "fan_in": fanin_matcher,
+# Build one matcher instance per fan-in size and store in a dict.
+# The pipeline in Cell 11 will dispatch by pattern.name.
+fanin_matchers = {
+    p.name: FanInMatcher(
+        cap_schedule             = FAN_IN_CAP_SCHEDULE,
+        max_instances_per_window = MAX_INSTANCES_PER_WINDOW,
+        amount_min               = AMOUNT_MIN,
+        delta_hop                = DELTA_HOP,
+    )
+    for p in fan_in_patterns
 }
 
-print("\nMATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
-print("\nCell 9 completed.")
+# Backward-compatible alias used in Cell 11 registry.
+fanin_matcher = fanin_matchers[fan_in_4.name]
 
+MATCHER_REGISTRY = {"fan_in": FanInMatcher(
+    cap_schedule             = FAN_IN_CAP_SCHEDULE,
+    max_instances_per_window = MAX_INSTANCES_PER_WINDOW,
+    amount_min               = AMOUNT_MIN,
+    delta_hop                = DELTA_HOP,
+)}
+
+print("FanInMatcher (generalized) ready.")
+print("MATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
+print("Cell 9 completed.")
 
 
 # ============================================================
-# Cell 10: FanOutMatcher
+# Cell 10: FanOutMatcher (generalized, variable n)
 # ============================================================
 
 def passes_distinct_nodes_for_fanout(edges: List[EdgeRecord]) -> bool:
-    """
-    Fan-out structure:
-        a -> b
-        a -> c
-        a -> d
-
-    Conditions:
-        all src are the same
-        all dst are distinct
-        dst nodes are different from src
-        edge IDs are distinct
-    """
-    if len(edges) == 0:
+    if not edges:
         return False
-
-    edge_ids = [e.edge_id for e in edges]
-    if len(edge_ids) != len(set(edge_ids)):
+    if len({e.edge_id for e in edges}) != len(edges):
         return False
-
-    src_values = [e.src for e in edges]
-    if len(set(src_values)) != 1:
+    src_values = {e.src for e in edges}
+    if len(src_values) != 1:
         return False
-
     dst_values = [e.dst for e in edges]
     if len(dst_values) != len(set(dst_values)):
         return False
-
-    center_src = src_values[0]
-
-    if any(dst == center_src for dst in dst_values):
-        return False
-
-    return True
+    center_src = next(iter(src_values))
+    return not any(d == center_src for d in dst_values)
 
 
 def passes_fanout_duration(edges: List[EdgeRecord], max_duration: int) -> bool:
-    """
-    Fan-out motif duration constraint:
-        max(step_i) - min(step_i) <= max_duration
-    """
     steps = [e.step for e in edges]
     return (max(steps) - min(steps)) <= max_duration
 
-def passes_consecutive_delta_hop(
-    edges: List[EdgeRecord],
-    delta_hop: Optional[int],
-) -> bool:
-    """
-    Check whether consecutive edges are temporally close enough.
-
-    After edges are sorted by step, edge_id:
-        step[i + 1] - step[i] <= delta_hop
-
-    If delta_hop is None, this constraint is disabled.
-    """
-    if delta_hop is None:
-        return True
-
-    if len(edges) <= 1:
-        return True
-
-    steps = [int(e.step) for e in edges]
-
-    for i in range(len(steps) - 1):
-        if steps[i + 1] - steps[i] > delta_hop:
-            return False
-
-    return True
-
 
 def canonicalize_fanout_edges(edges: List[EdgeRecord]) -> List[EdgeRecord]:
-    """
-    Canonical ordering for fan-out branches.
-
-    Since fan-out branches are unordered, sort by step then edge_id.
-    """
     return sorted(edges, key=lambda e: (e.step, e.edge_id))
 
 
 class FanOutMatcher:
     """
-    Specialized matcher for fan_out_4.
-
-    Pattern:
-        a -> b
-        a -> c
-        a -> d
-
-    Matching strategy:
-        1. Use outgoing index grouped by src.
-        2. For each src, take candidate outgoing edges.
-        3. Apply degree/candidate cap.
-        4. Generate combinations of size 3.
-        5. Keep only combinations satisfying:
-            - same src
-            - distinct destinations
-            - duration <= max_duration
-            - optional amount_min
-            - anchor edge is in primary window
-        6. Emit motif_instances and edge_motif_membership rows.
-
-    This matcher allows overlap between motif instances.
-    It avoids duplicate enumeration by using combinations and canonical ordering.
+    Generalized fan-out matcher. Supports n = 3..7 outgoing branches.
+    Mirrors FanInMatcher exactly, operating on out_edges instead of in_edges.
     """
 
     def __init__(
         self,
-        max_out_candidates: int = MAX_OUT_CANDIDATES,
-        max_instances_per_window: int = MAX_INSTANCES_PER_WINDOW,
-        amount_min: Optional[float] = AMOUNT_MIN,
-        delta_hop: Optional[int] = DELTA_HOP,
+        cap_schedule:             Dict[int, int] = FAN_OUT_CAP_SCHEDULE,
+        max_instances_per_window: int            = MAX_INSTANCES_PER_WINDOW,
+        amount_min:               Optional[float]= AMOUNT_MIN,
+        delta_hop:                Optional[int]  = DELTA_HOP,
     ):
-        self.max_out_candidates = max_out_candidates
+        self.cap_schedule             = cap_schedule
         self.max_instances_per_window = max_instances_per_window
-        self.amount_min = amount_min
-        self.delta_hop = delta_hop
+        self.amount_min               = amount_min
+        self.delta_hop                = delta_hop
 
-    def _select_candidate_edges_for_src(
+    def _get_cap(self, n_branches: int) -> int:
+        return self.cap_schedule.get(n_branches, 10)
+
+    def _select_candidates(
         self,
-        edges: List[EdgeRecord],
-        max_candidates: int,
+        edges:        List[EdgeRecord],
+        n_branches:   int,
+        max_duration: int,
     ) -> List[EdgeRecord]:
-        """
-        Candidate selection for one source node.
-
-        Current policy:
-            sort by step, edge_id and keep earliest max_candidates.
-
-        Later alternatives:
-            top-K by amount
-            top-K by local risk score
-            hybrid earliest + high amount
-        """
-        edges_sorted = sorted(edges, key=lambda e: (e.step, e.edge_id))
-
-        if max_candidates is not None and len(edges_sorted) > max_candidates:
-            return edges_sorted[:max_candidates]
-
-        return edges_sorted
+        cap = self._get_cap(n_branches)
+        if self.amount_min is not None:
+            edges = [e for e in edges if e.amount >= self.amount_min]
+        edges = prefilter_by_time_window(edges, max_duration)
+        if len(edges) > cap:
+            edges = edges[:cap]
+        return edges
 
     def match(
         self,
-        df_primary: pl.DataFrame,
-        df_extended: pl.DataFrame,
-        index: TemporalIndex,
-        window: WindowSpec,
-        pattern: MotifPattern,
+        df_primary:   pl.DataFrame,
+        df_extended:  pl.DataFrame,
+        index:        TemporalIndex,
+        window:       WindowSpec,
+        pattern:      MotifPattern,
         write_output: bool = False,
     ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
-        """
-        Run fan-out motif matching for one window.
-
-        Returns:
-            motif_df
-            membership_df
-            stats
-        """
 
         if pattern.matcher_type != "fan_out":
             raise ValueError(
-                f"FanOutMatcher can only handle matcher_type='fan_out'. "
-                f"Got: {pattern.matcher_type}"
+                f"FanOutMatcher requires matcher_type='fan_out', got {pattern.matcher_type}"
             )
 
-        if len(pattern.edges) != 3:
-            raise ValueError(
-                f"Current FanOutMatcher expects exactly 3 outgoing edges. "
-                f"Pattern {pattern.name} has {len(pattern.edges)} edges."
-            )
+        n_branches = len(pattern.edges)
+        if n_branches < 3:
+            raise ValueError(f"fan_out pattern must have >= 3 edges, got {n_branches}")
 
         start_time = time.time()
+        motif_rows:      List[Dict] = []
+        membership_rows: List[Dict] = []
 
-        motif_rows = []
-        membership_rows = []
+        n_src_scanned     = 0
+        n_src_skipped_deg = 0
+        n_src_capped      = 0
+        n_combos_checked  = 0
+        n_rej_duration    = 0
+        n_rej_delta_hop   = 0
+        n_rej_structure   = 0
+        n_rej_anchor      = 0
 
-        num_src_groups_scanned = 0
-        num_src_groups_capped = 0
-        num_combinations_checked = 0
-        num_combinations_rejected_duration = 0
-        num_combinations_rejected_structure = 0
-        num_combinations_rejected_delta_hop = 0
-        num_combinations_rejected_amount = 0
-        num_combinations_rejected_anchor = 0
+        pattern_edges_sorted = sorted(pattern.edges, key=lambda x: x.order)
 
-        # Iterate over outgoing groups from temporal index.
-        # Each key is a source node.
         for src_node, outgoing_edges in index.out_edges.items():
-            num_src_groups_scanned += 1
 
-            candidates = self._select_candidate_edges_for_src(
-                outgoing_edges,
-                self.max_out_candidates,
+            if len(outgoing_edges) < n_branches:
+                n_src_skipped_deg += 1
+                continue
+
+            n_src_scanned += 1
+
+            candidates = self._select_candidates(
+                list(outgoing_edges), n_branches, pattern.max_duration
             )
 
             if len(outgoing_edges) > len(candidates):
-                num_src_groups_capped += 1
+                n_src_capped += 1
 
-            if len(candidates) < 3:
+            if len(candidates) < n_branches:
                 continue
 
-            for edge_triplet in combinations(candidates, 3):
-                num_combinations_checked += 1
-
-                edges = canonicalize_fanout_edges(list(edge_triplet))
+            for edge_combo in combinations(candidates, n_branches):
+                n_combos_checked += 1
+                edges = canonicalize_fanout_edges(list(edge_combo))
 
                 if not passes_fanout_duration(edges, pattern.max_duration):
-                    num_combinations_rejected_duration += 1
+                    n_rej_duration += 1
                     continue
 
-                if not passes_consecutive_delta_hop(edges, self.delta_hop):
-                    num_combinations_rejected_delta_hop += 1
+                if not passes_consecutive_delta_hop_sorted(edges, self.delta_hop):
+                    n_rej_delta_hop += 1
                     continue
 
                 if not passes_distinct_nodes_for_fanout(edges):
-                    num_combinations_rejected_structure += 1
+                    n_rej_structure += 1
                     continue
 
-                if not passes_amount_min(edges, self.amount_min):
-                    num_combinations_rejected_amount += 1
+                anchor = get_anchor_edge(edges)
+                if not is_edge_in_primary_window(anchor, window):
+                    n_rej_anchor += 1
                     continue
 
-                anchor_edge = get_anchor_edge(edges)
+                node_map = {"src": int(edges[0].src)}
+                node_map.update({
+                    f"dst_{i+1}": int(edges[i].dst) for i in range(n_branches)
+                })
 
-                if not is_edge_in_primary_window(anchor_edge, window):
-                    num_combinations_rejected_anchor += 1
-                    continue
-
-                # Build structural node map:
-                # fan-out: a is common source, b/c/d are destinations.
-                node_map = {
-                    "a": int(edges[0].src),
-                    "b": int(edges[0].dst),
-                    "c": int(edges[1].dst),
-                    "d": int(edges[2].dst),
+                role_map = {
+                    p_edge.role: int(real_edge.edge_id)
+                    for p_edge, real_edge in zip(pattern_edges_sorted, edges)
                 }
-
-                # Build role map according to pattern roles.
-                pattern_edges_sorted = sorted(pattern.edges, key=lambda x: x.order)
-
-                role_map = {}
-                for p_edge, real_edge in zip(pattern_edges_sorted, edges):
-                    role = p_edge.role if p_edge.role else p_edge.name
-                    role_map[role] = int(real_edge.edge_id)
 
                 try:
                     motif_row = make_motif_instance_row(
-                        window_id=window.window_id,
-                        pattern=pattern,
-                        edges=edges,
-                        node_map=node_map,
-                        role_map=role_map,
-                        anchor_edge_id=anchor_edge.edge_id,
-                        validate=True,
+                        window_id      = window.window_id,
+                        pattern        = pattern,
+                        edges          = edges,
+                        node_map       = node_map,
+                        role_map       = role_map,
+                        anchor_edge_id = anchor.edge_id,
+                        validate       = False,
                     )
-                except Exception as exc:
-                    # This should be rare if checks above are correct.
+                except Exception:
                     continue
 
-                membership = make_edge_motif_membership_rows(
-                    motif_row=motif_row,
-                    pattern=pattern,
-                    edges=edges,
-                )
-
+                membership = make_edge_motif_membership_rows(motif_row, pattern, edges)
                 motif_rows.append(motif_row)
                 membership_rows.extend(membership)
 
@@ -702,118 +482,51 @@ class FanOutMatcher:
             if len(motif_rows) >= self.max_instances_per_window:
                 break
 
-        motif_df = motif_instance_rows_to_polars(motif_rows)
+        motif_df      = motif_instance_rows_to_polars(motif_rows)
         membership_df = membership_rows_to_polars(membership_rows)
-
-        elapsed = time.time() - start_time
+        elapsed       = time.time() - start_time
 
         stats = {
-            "window_id": int(window.window_id),
-            "motif_type": pattern.name,
-            "matcher_type": pattern.matcher_type,
-            "primary_start": int(window.primary_start),
-            "primary_end": int(window.primary_end),
-            "extended_start": int(window.extended_start),
-            "extended_end": int(window.extended_end),
-            "primary_num_edges": int(df_primary.height),
-            "extended_num_edges": int(df_extended.height),
-            "num_src_groups_scanned": int(num_src_groups_scanned),
-            "num_src_groups_capped": int(num_src_groups_capped),
-            "num_combinations_checked": int(num_combinations_checked),
-            "num_instances": int(motif_df.height),
-            "num_membership_rows": int(membership_df.height),
-            "num_combinations_rejected_duration": int(num_combinations_rejected_duration),
-            "num_combinations_rejected_structure": int(num_combinations_rejected_structure),
-            "num_combinations_rejected_delta_hop": int(num_combinations_rejected_delta_hop),
-            "num_combinations_rejected_amount": int(num_combinations_rejected_amount),
-            "num_combinations_rejected_anchor": int(num_combinations_rejected_anchor),
+            "window_id":                    int(window.window_id),
+            "motif_type":                   pattern.name,
+            "matcher_type":                 pattern.matcher_type,
+            "n_branches":                   int(n_branches),
+            "primary_num_edges":            int(df_primary.height),
+            "extended_num_edges":           int(df_extended.height),
+            "n_src_scanned":                int(n_src_scanned),
+            "n_src_skipped_low_degree":     int(n_src_skipped_deg),
+            "n_src_capped":                 int(n_src_capped),
+            "n_combos_checked":             int(n_combos_checked),
+            "num_instances":                int(motif_df.height),
+            "num_membership_rows":          int(membership_df.height),
+            "n_rej_duration":               int(n_rej_duration),
+            "n_rej_delta_hop":              int(n_rej_delta_hop),
+            "n_rej_structure":              int(n_rej_structure),
+            "n_rej_anchor":                 int(n_rej_anchor),
             "hit_max_instances_per_window": int(len(motif_rows) >= self.max_instances_per_window),
-            "elapsed_seconds": float(elapsed),
+            "elapsed_seconds":              float(elapsed),
         }
 
         if write_output:
-            motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
-                membership_rows=membership_rows,
-                window_id=window.window_id,
-                motif_type=pattern.name,
+            mp, mep = write_motif_outputs(
+                motif_rows, membership_rows, window.window_id, pattern.name
             )
-
-            stats["motif_path"] = motif_path
-            stats["membership_path"] = membership_path
+            stats["motif_path"]      = mp
+            stats["membership_path"] = mep
 
         return motif_df, membership_df, stats
 
 
-# # ------------------------------------------------------------
-# # Smoke test FanOutMatcher on first non-empty window
-# # ------------------------------------------------------------
-
-# print("Running Cell 10 FanOutMatcher smoke test...")
-
-fanout_matcher = FanOutMatcher(
-    max_out_candidates=MAX_OUT_CANDIDATES,
-    max_instances_per_window=MAX_INSTANCES_PER_WINDOW,
-    amount_min=AMOUNT_MIN,
-    delta_hop=DELTA_HOP,
-
+MATCHER_REGISTRY["fan_out"] = FanOutMatcher(
+    cap_schedule             = FAN_OUT_CAP_SCHEDULE,
+    max_instances_per_window = MAX_INSTANCES_PER_WINDOW,
+    amount_min               = AMOUNT_MIN,
+    delta_hop                = DELTA_HOP,
 )
 
-# # Use the first non-empty test window from Cell 6.
-# df_primary_test, df_extended_test = slice_window_edges(df_edges, test_window)
-# test_index = build_temporal_index_from_polars(df_extended_test)
-
-# fanout_motif_df, fanout_membership_df, fanout_stats = fanout_matcher.match(
-#     df_primary=df_primary_test,
-#     df_extended=df_extended_test,
-#     index=test_index,
-#     window=test_window,
-#     pattern=fan_out_4,
-#     write_output=False,
-# )
-
-# print("\nFanOutMatcher smoke test stats:")
-# for k, v in fanout_stats.items():
-#     print(f"{k}: {v}")
-
-# print("\nFan-out motif instances preview:")
-# display(fanout_motif_df.head(10))
-
-# print("\nFan-out edge membership preview:")
-# display(fanout_membership_df.head(15))
-
-
-# # ------------------------------------------------------------
-# # Optional: write smoke test output to Drive
-# # Set to True only if you want to persist the test shard.
-# # ------------------------------------------------------------
-
-# WRITE_CELL10_SMOKE_OUTPUT = False
-
-# if WRITE_CELL10_SMOKE_OUTPUT:
-#     motif_path, membership_path = write_motif_outputs(
-#         motif_rows=fanout_motif_df.to_dicts(),
-#         membership_rows=fanout_membership_df.to_dicts(),
-#         window_id=test_window.window_id,
-#         motif_type=fan_out_4.name,
-#     )
-
-#     print("\nSmoke test outputs written:")
-#     print("motif_path:", motif_path)
-#     print("membership_path:", membership_path)
-
-
-# # ------------------------------------------------------------
-# # Update matcher registry for later pipeline cells
-# # ------------------------------------------------------------
-
-if "MATCHER_REGISTRY" not in globals():
-    MATCHER_REGISTRY = {}
-
-MATCHER_REGISTRY["fan_out"] = fanout_matcher
-
-print("\nMATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
-print("\nCell 10 completed.")
+print("FanOutMatcher (generalized) ready.")
+print("MATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
+print("Cell 10 completed.")
 
 
 
@@ -934,6 +647,8 @@ def run_matchers_over_windows(
         )
 
         df_primary, df_extended = slice_window_edges(df_edges, window)
+
+        window_summary = build_window_candidate_summary(df_extended)
 
         if df_primary.height == 0:
             print("  Primary window is empty. Skipping matcher execution.")
@@ -1090,10 +805,7 @@ def run_matchers_over_windows(
 # Select patterns for this run
 # ------------------------------------------------------------
 
-PATTERNS_TO_RUN_CELL11 = [
-    fan_in_4,
-    fan_out_4,
-]
+PATTERNS_TO_RUN_CELL11 = fan_in_patterns + fan_out_patterns
 
 # Ensure matchers are registered.
 required_matcher_types = sorted(set(p.matcher_type for p in PATTERNS_TO_RUN_CELL11))
@@ -1120,7 +832,7 @@ print("Matcher registry:", list(MATCHER_REGISTRY.keys()))
 # For first run, keep this small to validate the pipeline.
 # After checking outputs, set MAX_WINDOWS_TO_RUN = None to run all windows.
 
-MAX_WINDOWS_TO_RUN = 4
+MAX_WINDOWS_TO_RUN = 2
 
 SKIP_EXISTING_OUTPUTS = False
 WRITE_EMPTY_OUTPUTS = True
@@ -1167,3 +879,6 @@ else:
     print("\nrun_stats_df is empty or missing status column.")
 
 print("\nCell 11 completed.")
+
+
+
