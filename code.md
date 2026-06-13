@@ -74,7 +74,8 @@ MAX_BRANCHING = 50
 
 MAX_INSTANCES_PER_ANCHOR = 1_000
 MAX_INSTANCES_PER_WINDOW = 1_000_000
-MAX_FAN_INSTANCES_PER_WINDOW = 100_000
+MAX_FAN_INSTANCES_PER_WINDOW = 10_000
+MAX_FAN_INSTANCES_PER_CENTER = 20
 
 # ----------------------------
 # Amount constraints
@@ -145,7 +146,7 @@ CENTER_INOUT_OUT_CAP = {2: 20, 3: 12,  4: 8}
 # Cycle sizes
 # ----------------------------
 CYCLE_SIZES           = list(range(5, 11))   # 5, 6, 7, 8, 9, 10
-BIDIRECTIONAL_CYCLE_THRESHOLD = 7            # use bidirectional DFS for k >= this
+BIDIRECTIONAL_CYCLE_THRESHOLD = 999            # use bidirectional DFS for k >= this
 
 CYCLE_MAX_BRANCHING = {5: 8, 6: 6, 7: 5, 8: 4, 9: 4, 10: 4}
 
@@ -1218,7 +1219,6 @@ class TemporalIndex:
     Indexes:
         outgoing_by_src[src] -> edges sorted by step
         incoming_by_dst[dst] -> edges sorted by step
-        pair_by_src_dst[(src, dst)] -> edges sorted by step
 
     Query methods return candidate EdgeRecord objects within a step interval.
     This prevents scanning all edges in a delta_t range.
@@ -1229,7 +1229,6 @@ class TemporalIndex:
 
         self.out_edges = defaultdict(list)
         self.in_edges = defaultdict(list)
-        self.pair_edges = defaultdict(list)
 
         self.num_edges = len(edges)
 
@@ -1244,33 +1243,18 @@ class TemporalIndex:
         for e in edge_records:
             self.out_edges[e.src].append(e)
             self.in_edges[e.dst].append(e)
-            self.pair_edges[(e.src, e.dst)].append(e)
 
             # Increment degrees and pair counts
             self.node_out_degree[e.src] += 1
             self.node_in_degree[e.dst] += 1
             self.pair_count[(e.src, e.dst)] += 1
 
-        # Convert defaultdicts to regular dicts
+        # Convert defaultdicts to regular dicts to save space
         self.node_in_degree = dict(self.node_in_degree)
         self.node_out_degree = dict(self.node_out_degree)
         self.pair_count = dict(self.pair_count)
-
-        # Precompute step arrays for binary search.
-        self.out_times = {
-            key: [e.step for e in edge_list]
-            for key, edge_list in self.out_edges.items()
-        }
-
-        self.in_times = {
-            key: [e.step for e in edge_list]
-            for key, edge_list in self.in_edges.items()
-        }
-
-        self.pair_times = {
-            key: [e.step for e in edge_list]
-            for key, edge_list in self.pair_edges.items()
-        }
+        self.out_edges = dict(self.out_edges)
+        self.in_edges = dict(self.in_edges)
 
         # Index-level metadata
         total_sar = sum(1 for e in edge_records if e.is_sar)
@@ -1287,7 +1271,6 @@ class TemporalIndex:
     def _range_query(
         self,
         edge_dict: Dict[Any, List[EdgeRecord]],
-        time_dict: Dict[Any, List[int]],
         key: Any,
         t_min: int,
         t_max: int,
@@ -1307,18 +1290,16 @@ class TemporalIndex:
         if not edges:
             return []
 
-        times = time_dict[key]
-
         if include_left:
             # First index with step >= t_min.
             # bisect_right(t_min - 1) works for integer steps.
-            left = bisect_right(times, t_min - 1)
+            left = bisect_right(edges, t_min - 1, key=lambda e: e.step)
         else:
             # First index with step > t_min.
-            left = bisect_right(times, t_min)
+            left = bisect_right(edges, t_min, key=lambda e: e.step)
 
         # Last index with step <= t_max.
-        right = bisect_right(times, t_max)
+        right = bisect_right(edges, t_max, key=lambda e: e.step)
 
         result = edges[left:right]
 
@@ -1342,7 +1323,6 @@ class TemporalIndex:
         """
         return self._range_query(
             self.out_edges,
-            self.out_times,
             src,
             t_min,
             t_max,
@@ -1363,7 +1343,6 @@ class TemporalIndex:
         """
         return self._range_query(
             self.in_edges,
-            self.in_times,
             dst,
             t_min,
             t_max,
@@ -1383,15 +1362,11 @@ class TemporalIndex:
         """
         Query src -> dst edges in temporal range.
         """
-        return self._range_query(
-            self.pair_edges,
-            self.pair_times,
-            (src, dst),
-            t_min,
-            t_max,
-            include_left=include_left,
-            max_candidates=max_candidates,
-        )
+        candidates = self.outgoing(src, t_min, t_max, include_left=include_left)
+        result = [e for e in candidates if e.dst == dst]
+        if max_candidates is not None and len(result) > max_candidates:
+            result = result[:max_candidates]
+        return result
 
     def stats(self) -> Dict[str, int]:
         """
@@ -1401,7 +1376,7 @@ class TemporalIndex:
             "num_edges": self.num_edges,
             "num_src_nodes": len(self.out_edges),
             "num_dst_nodes": len(self.in_edges),
-            "num_pairs": len(self.pair_edges),
+            "num_pairs": len(self.pair_count),
         }
 
     def has_any_outgoing(
@@ -1415,11 +1390,11 @@ class TemporalIndex:
         with step in (t_min, t_max].
         Used for cheap return-to-start feasibility checks in cycle DFS.
         """
-        times = self.out_times.get(src)
-        if not times:
+        edges = self.out_edges.get(src)
+        if not edges:
             return False
-        left  = bisect_right(times, t_min)
-        right = bisect_right(times, t_max)
+        left  = bisect_right(edges, t_min, key=lambda e: e.step)
+        right = bisect_right(edges, t_max, key=lambda e: e.step)
         return right > left
 
     def has_any_pair(
@@ -1434,13 +1409,17 @@ class TemporalIndex:
         with step in (t_min, t_max].
         Used for cheap cycle-close feasibility checks.
         """
-        key   = (src, dst)
-        times = self.pair_times.get(key)
-        if not times:
+        edges = self.out_edges.get(src)
+        if not edges:
             return False
-        left  = bisect_right(times, t_min)
-        right = bisect_right(times, t_max)
-        return right > left
+        left  = bisect_right(edges, t_min, key=lambda e: e.step)
+        right = bisect_right(edges, t_max, key=lambda e: e.step)
+        if right <= left:
+            return False
+        for i in range(left, right):
+            if edges[i].dst == dst:
+                return True
+        return False
 
     def has_any_incoming(
         self,
@@ -1453,11 +1432,11 @@ class TemporalIndex:
         with step in (t_min, t_max].
         Used for cheap feasibility checks in lookback queries.
         """
-        times = self.in_times.get(dst)
-        if not times:
+        edges = self.in_edges.get(dst)
+        if not edges:
             return False
-        left  = bisect_right(times, t_min)
-        right = bisect_right(times, t_max)
+        left  = bisect_right(edges, t_min, key=lambda e: e.step)
+        right = bisect_right(edges, t_max, key=lambda e: e.step)
         return right > left
 
 
@@ -2310,9 +2289,37 @@ def membership_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
     return df.select(select_exprs)
 
 
+def make_membership_df_from_motif_rows(
+    motif_rows: List[Dict[str, Any]],
+    pattern: MotifPattern,
+    emitted_edges: List[List[EdgeRecord]],
+) -> pl.DataFrame:
+    """
+    Build membership DataFrame from motif_rows and their corresponding EdgeRecords
+    in a memory-efficient chunked manner to avoid RAM overflow.
+    """
+    if not motif_rows:
+        return membership_rows_to_polars([])
+
+    chunk_size = 10000
+    membership_dfs = []
+    current_chunk = []
+
+    for motif_row, edges_val in zip(motif_rows, emitted_edges):
+        current_chunk.extend(make_edge_motif_membership_rows(motif_row, pattern, edges_val))
+        if len(current_chunk) >= chunk_size:
+            membership_dfs.append(membership_rows_to_polars(current_chunk))
+            current_chunk = []
+
+    if current_chunk:
+        membership_dfs.append(membership_rows_to_polars(current_chunk))
+
+    return pl.concat(membership_dfs)
+
+
 def write_motif_outputs(
     motif_rows: List[Dict[str, Any]],
-    membership_rows: List[Dict[str, Any]],
+    membership_rows: Any,
     window_id: int,
     motif_type: str,
     motif_instance_dir: str = MOTIF_INSTANCE_DIR,
@@ -2323,7 +2330,10 @@ def write_motif_outputs(
     """
 
     motif_df = motif_instance_rows_to_polars(motif_rows)
-    membership_df = membership_rows_to_polars(membership_rows)
+    if isinstance(membership_rows, pl.DataFrame):
+        membership_df = membership_rows
+    else:
+        membership_df = membership_rows_to_polars(membership_rows)
 
     motif_path = f"{motif_instance_dir}/window_{int(window_id):06d}_{motif_type}.parquet"
     membership_path = f"{membership_dir}/window_{int(window_id):06d}_{motif_type}.parquet"

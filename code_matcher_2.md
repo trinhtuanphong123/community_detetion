@@ -109,6 +109,10 @@ def run_matchers_over_windows(
             continue
 
         index_start_time = time.time()
+        if 'temporal_index' in locals():
+            del temporal_index
+            gc.collect()
+
         temporal_index = build_temporal_index_from_polars(df_extended)
         index_elapsed = time.time() - index_start_time
 
@@ -203,6 +207,10 @@ def run_matchers_over_windows(
 
         window_elapsed = time.time() - window_start_time
         print(f"  Window {w_id} completed in {round(window_elapsed, 3)}s")
+
+        if 'temporal_index' in locals():
+            del temporal_index
+            gc.collect()
 
     # Aggregate and return stats
     if len(stats_rows) == 0:
@@ -423,31 +431,24 @@ def merge_and_deduplicate_motif_shards(
     Rule: keep the instance with the highest instance_score; if there's a tie,
     keep the one from the earliest window_id.
     """
-    paths  = sorted(Path(motif_instance_dir).glob("**/*.parquet"))
-    shards = [pl.read_parquet(p) for p in paths if p.stat().st_size > 0]
-
-    if not shards:
+    paths = sorted(Path(motif_instance_dir).glob("**/*.parquet"))
+    if not paths:
         print("No motif instance shards found.")
         return pl.DataFrame()
 
-    df_all = pl.concat(shards)
+    # LazyFrame: no data is loaded until collect().
+    df_lazy = pl.scan_parquet([str(p) for p in paths])
 
-    # Ensure instance_score column exists (defaulting to 0.0 if not present)
-    if "instance_score" not in df_all.columns:
-        df_all = df_all.with_columns(pl.lit(0.0).alias("instance_score"))
-
-    # Sorting logic:
-    #   canonical_key: ascending
-    #   instance_score: descending (highest score first)
-    #   window_id: ascending (earliest window first)
+    # Deduplicate with lazy sort + unique so Polars can stream with bounded RAM.
     df_deduped = (
-        df_all
+        df_lazy
         .sort(["canonical_key", "instance_score", "window_id"], descending=[False, True, False])
         .unique(subset=["canonical_key"], keep="first")
+        .collect(streaming=True)
     )
 
     df_deduped.write_parquet(output_path)
-    print(f"Deduplicated motif instances: {df_deduped.height} (from {df_all.height} raw)")
+    print(f"Deduplicated: {df_deduped.height} instances")
     return df_deduped
 
 

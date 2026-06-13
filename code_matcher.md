@@ -157,7 +157,7 @@ class FanMatcher:
 
         start_time = time.time()
         motif_rows:      List[Dict] = []
-        membership_rows: List[Dict] = []
+        emitted_edges:   List[List[EdgeRecord]] = []
 
         n_centers_scanned     = 0
         n_centers_skipped_deg = 0
@@ -306,9 +306,7 @@ class FanMatcher:
                         candidate_rank=rank_idx,
                     )
                     motif_rows.append(motif_row)
-                    membership_rows.extend(
-                        make_edge_motif_membership_rows(motif_row, pattern, edges)
-                    )
+                    emitted_edges.append(edges)
                 except Exception:
                     continue
 
@@ -317,7 +315,7 @@ class FanMatcher:
                 break
 
         motif_df      = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
+        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
         elapsed       = time.time() - start_time
 
         max_deg = int(max(scanned_center_degrees)) if scanned_center_degrees else 0
@@ -352,7 +350,7 @@ class FanMatcher:
 
         if write_output:
             mp, mep = write_motif_outputs(
-                motif_rows, membership_rows, window.window_id, pattern.name
+                motif_rows, membership_df, window.window_id, pattern.name
             )
             stats["motif_path"]      = mp
             stats["membership_path"] = mep
@@ -368,7 +366,7 @@ fanin_matchers = {
         direction="in",
         cap_schedule=FAN_IN_CAP_SCHEDULE,
         max_instances_per_window=MAX_INSTANCES_PER_WINDOW,
-        max_instances_per_center=100,
+        max_instances_per_center=MAX_FAN_INSTANCES_PER_CENTER,
         amount_min=AMOUNT_MIN,
         amount_coherence_ratio=3.0,
         delta_hop=DELTA_HOP,
@@ -382,7 +380,7 @@ fanout_matchers = {
         direction="out",
         cap_schedule=FAN_OUT_CAP_SCHEDULE,
         max_instances_per_window=MAX_INSTANCES_PER_WINDOW,
-        max_instances_per_center=100,
+        max_instances_per_center=MAX_FAN_INSTANCES_PER_CENTER,
         amount_min=AMOUNT_MIN,
         amount_coherence_ratio=3.0,
         delta_hop=DELTA_HOP,
@@ -536,7 +534,7 @@ class SplitMergeMatcher:
         start_time = time.time()
 
         motif_rows = []
-        membership_rows = []
+        emitted_edges = []
 
         num_sources_scanned = 0
         num_split_combinations = 0
@@ -572,6 +570,7 @@ class SplitMergeMatcher:
                 continue
 
             source_candidates_to_rank = []
+            seen_source_keys = set()
             source_combos_count = 0
 
             for split_combo in combinations(split_candidates, n_branches):
@@ -751,6 +750,14 @@ class SplitMergeMatcher:
                         # Score the combination
                         score = score_instance(edges_for_validation, index, pattern)
 
+                        ck = make_canonical_key(
+                            pattern.name,
+                            [e.edge_id for e in edges_for_validation],
+                            ordered=True,
+                        )
+                        if ck in seen_source_keys:
+                            continue
+                        seen_source_keys.add(ck)
                         source_candidates_to_rank.append((score, edges_for_validation, node_map, role_map, anchor))
 
                     if source_combos_count > self.max_combinations_per_source:
@@ -782,9 +789,7 @@ class SplitMergeMatcher:
                         candidate_rank=rank_idx,
                     )
                     motif_rows.append(motif_row)
-                    membership_rows.extend(
-                        make_edge_motif_membership_rows(motif_row, pattern, edges_val)
-                    )
+                    emitted_edges.append(edges_val)
                 except Exception:
                     continue
 
@@ -792,7 +797,7 @@ class SplitMergeMatcher:
                 break
 
         motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
+        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
 
         elapsed = time.time() - start_time
 
@@ -829,7 +834,7 @@ class SplitMergeMatcher:
         if write_output:
             motif_path, membership_path = write_motif_outputs(
                 motif_rows=motif_rows,
-                membership_rows=membership_rows,
+                membership_rows=membership_df,
                 window_id=window.window_id,
                 motif_type=pattern.name,
             )
@@ -891,7 +896,7 @@ class CenterInOutMatcher:
         start_time = time.time()
 
         motif_rows = []
-        membership_rows = []
+        emitted_edges = []
 
         num_centers_scanned = 0
         num_in_combinations_checked = 0
@@ -938,6 +943,7 @@ class CenterInOutMatcher:
                 continue
 
             center_candidates_to_rank = []
+            seen_center_keys = set()
             center_combos_count = 0
 
             for in_combo in combinations(incoming, n_in):
@@ -1098,6 +1104,14 @@ class CenterInOutMatcher:
                     # Score the combination
                     score = score_instance(edges, index, pattern)
 
+                    ck = make_canonical_key(
+                        pattern.name,
+                        [e.edge_id for e in edges],
+                        ordered=True,
+                    )
+                    if ck in seen_center_keys:
+                        continue
+                    seen_center_keys.add(ck)
                     center_candidates_to_rank.append((score, edges, node_map, role_map, anchor, flow_features))
 
                 if center_combos_count > self.max_combinations_per_center:
@@ -1129,9 +1143,7 @@ class CenterInOutMatcher:
                     # Add flow features into motif row.
                     motif_row.update(flow_features)
                     motif_rows.append(motif_row)
-                    membership_rows.extend(
-                        make_edge_motif_membership_rows(motif_row, pattern, edges_val)
-                    )
+                    emitted_edges.append(edges_val)
                 except Exception:
                     continue
 
@@ -1139,7 +1151,7 @@ class CenterInOutMatcher:
                 break
 
         motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
+        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
 
         elapsed = time.time() - start_time
 
@@ -1180,7 +1192,7 @@ class CenterInOutMatcher:
         if write_output:
             motif_path, membership_path = write_motif_outputs(
                 motif_rows=motif_rows,
-                membership_rows=membership_rows,
+                membership_rows=membership_df,
                 window_id=window.window_id,
                 motif_type=pattern.name,
             )
@@ -1198,6 +1210,8 @@ print("Cell 10 completed.")
 # ============================================================
 # Cell 11: Cycle matcher, diagnostic only
 # ============================================================
+
+BIDIRECTIONAL_CYCLE_THRESHOLD = 999
 
 def passes_pairwise_amount_ratio(
     edges: List[EdgeRecord],
@@ -1335,7 +1349,7 @@ class CycleKMatcher:
     def _emit_cycle_instance(
         self,
         motif_rows: List[Dict[str, Any]],
-        membership_rows: List[Dict[str, Any]],
+        emitted_edges: List[List[EdgeRecord]],
         window: WindowSpec,
         pattern: MotifPattern,
         edges: List[EdgeRecord],
@@ -1374,14 +1388,8 @@ class CycleKMatcher:
 
             motif_row["amount_consistency"] = compute_amount_consistency(edges)
 
-            membership = make_edge_motif_membership_rows(
-                motif_row=motif_row,
-                pattern=pattern,
-                edges=edges,
-            )
-
             motif_rows.append(motif_row)
-            membership_rows.extend(membership)
+            emitted_edges.append(edges)
 
             return True
 
@@ -1420,7 +1428,7 @@ class CycleKMatcher:
         start_time = time.time()
 
         motif_rows = []
-        membership_rows = []
+        emitted_edges = []
 
         num_anchor_edges = 0
         num_dfs_expansions = 0
@@ -1520,7 +1528,7 @@ class CycleKMatcher:
 
                 emitted = self._emit_cycle_instance(
                     motif_rows=motif_rows,
-                    membership_rows=membership_rows,
+                    emitted_edges=emitted_edges,
                     window=window,
                     pattern=pattern,
                     edges=edges,
@@ -1652,7 +1660,7 @@ class CycleKMatcher:
 
                             emitted = self._emit_cycle_instance(
                                 motif_rows=motif_rows,
-                                membership_rows=membership_rows,
+                                emitted_edges=emitted_edges,
                                 window=window,
                                 pattern=pattern,
                                 edges=edges,
@@ -1746,7 +1754,7 @@ class CycleKMatcher:
                     break
 
         motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
+        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
 
         elapsed = time.time() - start_time
 
@@ -1794,7 +1802,7 @@ class CycleKMatcher:
         if write_output:
             motif_path, membership_path = write_motif_outputs(
                 motif_rows=motif_rows,
-                membership_rows=membership_rows,
+                membership_rows=membership_df,
                 window_id=window.window_id,
                 motif_type=pattern.name,
             )
@@ -1942,7 +1950,7 @@ class BidirectionalCycleSearch:
         else:
             t_min = anchor_step - max_duration
 
-        candidates = index.incoming(dst=state.endpoint, t_min=t_min, t_max=t_max, include_right=False)
+        candidates = index.incoming(dst=state.endpoint, t_min=t_min, t_max=t_max, include_left=False)
         candidates = self._filter_candidates(candidates)
 
         results = []
@@ -2136,7 +2144,7 @@ MATCHER_REGISTRY = {
         direction="in",
         cap_schedule=FAN_IN_CAP_SCHEDULE,
         max_instances_per_window=MAX_FAN_INSTANCES_PER_WINDOW,
-        max_instances_per_center=100,
+        max_instances_per_center=MAX_FAN_INSTANCES_PER_CENTER,
         amount_min=AMOUNT_MIN,
         amount_coherence_ratio=3.0,
         delta_hop=DELTA_HOP,
@@ -2145,7 +2153,7 @@ MATCHER_REGISTRY = {
         direction="out",
         cap_schedule=FAN_OUT_CAP_SCHEDULE,
         max_instances_per_window=MAX_FAN_INSTANCES_PER_WINDOW,
-        max_instances_per_center=100,
+        max_instances_per_center=MAX_FAN_INSTANCES_PER_CENTER,
         amount_min=AMOUNT_MIN,
         amount_coherence_ratio=3.0,
         delta_hop=DELTA_HOP,
