@@ -74,6 +74,7 @@ MAX_BRANCHING = 50
 
 MAX_INSTANCES_PER_ANCHOR = 1_000
 MAX_INSTANCES_PER_WINDOW = 1_000_000
+MAX_FAN_INSTANCES_PER_WINDOW = 100_000
 
 # ----------------------------
 # Amount constraints
@@ -832,14 +833,17 @@ stacked_bipartite_patterns = []
 fan_in_4   = fan_in_patterns[0]    # n=3 branches, 4 total nodes
 fan_out_4  = fan_out_patterns[0]   # n=3 branches, 4 total nodes
 cycle_5    = cycle_patterns[0]
-split_merge_5 = split_merge_patterns[0]   # 3 branch pairs, 5 total nodes
+split_merge_6 = split_merge_patterns[0]   # 3 branch pairs, 5 nodes, 6 edges
+split_merge_8 = split_merge_patterns[1]   # 4 branch pairs, 6 nodes, 8 edges
+split_merge_10 = split_merge_patterns[2]  # 5 branch pairs, 7 nodes, 10 edges
+split_merge_5 = split_merge_6              # backward compatibility alias
 fanin_fanout_6 = center_inout_patterns[0] # (3 in, 2 out)
 
 # 1. Core Patterns: Flow patterns (standard split-merge, standard center-in-out) + small fan patterns
 CORE_PATTERNS = (
     [p for p in fan_in_patterns if len(p.edges) <= 4]        # fan_in_4, fan_in_5
     + [p for p in fan_out_patterns if len(p.edges) <= 4]    # fan_out_4, fan_out_5
-    + [p for p in split_merge_patterns if len(p.edges) // 2 == 3]  # split_merge_5 (3 branch pairs)
+    + [p for p in split_merge_patterns if len(p.edges) // 2 == 3]  # split_merge_6 (3 branch pairs)
     + [p for p in center_inout_patterns if p.name == "center_inout_3in_2out"]
 )
 
@@ -1788,29 +1792,31 @@ def cap_edges(
         selected = sorted(edges, key=lambda e: (abs(e.amount - anchor_edge.amount), e.step, e.edge_id))[:max_candidates]
         return sorted(selected, key=lambda e: (e.step, e.edge_id))
 
-    # Fallback to hybrid combination
-    k_earliest = max(1, max_candidates // 4)
-    k_amount = max(1, max_candidates // 4)
-    k_dense = max(1, max_candidates // 4) if anchor_edge is not None else 0
-    k_coherent = max(1, max_candidates - (k_earliest + k_amount + k_dense)) if anchor_edge is not None else 0
-    
     if anchor_edge is None:
         k_earliest = max_candidates // 2
         k_amount = max_candidates - k_earliest
+        earliest = sorted(edges, key=lambda e: (e.step, e.edge_id))[:k_earliest]
+        top_amount = sorted(edges, key=lambda e: (-e.amount, e.step, e.edge_id))[:k_amount]
+        selected_dict = {e.edge_id: e for e in earliest + top_amount}
+        if len(selected_dict) < max_candidates:
+            remaining = sorted(edges, key=lambda e: (e.step, e.edge_id))
+            for e in remaining:
+                if e.edge_id not in selected_dict:
+                    selected_dict[e.edge_id] = e
+                    if len(selected_dict) >= max_candidates:
+                        break
+        return sorted(selected_dict.values(), key=lambda e: (e.step, e.edge_id))[:max_candidates]
 
+    # Fallback to hybrid combination when anchor_edge is not None
+    k_earliest = max(1, max_candidates // 4)
+    k_amount = max(1, max_candidates // 4)
+    k_dense = max(1, max_candidates // 4)
+    k_coherent = max(1, max_candidates - (k_earliest + k_amount + k_dense))
+    
     earliest = sorted(edges, key=lambda e: (e.step, e.edge_id))[:k_earliest]
     top_amount = sorted(edges, key=lambda e: (-e.amount, e.step, e.edge_id))[:k_amount]
-    
-    dense = []
-    if anchor_edge is not None:
-        dense = sorted(edges, key=lambda e: (abs(e.step - anchor_edge.step), e.step, e.edge_id))[:k_dense]
-
-    coherent = []
-    if anchor_edge is not None:
-        coherent = sorted(edges, key=lambda e: (abs(e.amount - anchor_edge.amount), e.step, e.edge_id))[:k_coherent]
-    else:
-        median_amount = amount_quantiles.get(0.5, 0.0) if amount_quantiles else 0.0
-        coherent = sorted(edges, key=lambda e: (abs(e.amount - median_amount), e.step, e.edge_id))[:k_amount]
+    dense = sorted(edges, key=lambda e: (abs(e.step - anchor_edge.step), e.step, e.edge_id))[:k_dense]
+    coherent = sorted(edges, key=lambda e: (abs(e.amount - anchor_edge.amount), e.step, e.edge_id))[:k_coherent]
 
     selected_dict = {}
     for e in earliest + top_amount + dense + coherent:
@@ -1824,7 +1830,7 @@ def cap_edges(
                 if len(selected_dict) >= max_candidates:
                     break
 
-    return sorted(selected_dict.values(), key=lambda e: (e.step, e.edge_id))
+    return sorted(selected_dict.values(), key=lambda e: (e.step, e.edge_id))[:max_candidates]
 
 
 def select_edges_by_hybrid_policy(

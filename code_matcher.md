@@ -2135,7 +2135,7 @@ MATCHER_REGISTRY = {
     "fan_in": FanMatcher(
         direction="in",
         cap_schedule=FAN_IN_CAP_SCHEDULE,
-        max_instances_per_window=MAX_INSTANCES_PER_WINDOW,
+        max_instances_per_window=MAX_FAN_INSTANCES_PER_WINDOW,
         max_instances_per_center=100,
         amount_min=AMOUNT_MIN,
         amount_coherence_ratio=3.0,
@@ -2144,7 +2144,7 @@ MATCHER_REGISTRY = {
     "fan_out": FanMatcher(
         direction="out",
         cap_schedule=FAN_OUT_CAP_SCHEDULE,
-        max_instances_per_window=MAX_INSTANCES_PER_WINDOW,
+        max_instances_per_window=MAX_FAN_INSTANCES_PER_WINDOW,
         max_instances_per_center=100,
         amount_min=AMOUNT_MIN,
         amount_coherence_ratio=3.0,
