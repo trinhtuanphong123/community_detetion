@@ -13,6 +13,10 @@ from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 from bisect import bisect_right
 
+# Add to the existing import block:
+from itertools import combinations, product
+from dataclasses import dataclass, field    # already imported in Cell 5; add here too
+                                            # so Cell 5 can stay self-contained
 import polars as pl
 
 from google.colab import drive
@@ -20,6 +24,8 @@ drive.mount("/content/drive")
 
 print("Environment ready.")
 print("Polars version:", pl.__version__)
+
+
 
 
 
@@ -276,8 +282,6 @@ if non_positive_amount.height > 0:
 
 print("\nCell 3 completed.")
 
-
-
 # ============================================================
 # Cell 4: Standardize Schema
 # ============================================================
@@ -454,8 +458,6 @@ print("\ndf_edge_metadata shape:", df_edge_metadata.shape)
 print("Metadata columns:", EDGE_METADATA_COLUMNS)
 
 print("\nCell 4 completed.")
-
-
 
 # ============================================================
 # Cell 5: Pattern Definitions
@@ -962,8 +964,6 @@ pattern_summary = pl.DataFrame([
 display(pattern_summary)
 print("\nCell 5 completed.")
 
-
-
  # ============================================================
 # Cell 5a: Window Candidate Summary
 # ============================================================
@@ -1045,8 +1045,6 @@ def build_window_candidate_summary(
 # print("  nodes with out >= 3:   ", len(test_summary.fan_out_candidate_srcs))
 # print("  center candidates:     ", len(test_summary.center_candidate_nodes))
 print("\nCell 5a completed.")
-
-
 
 # ============================================================
 # Cell 6: Temporal Window Manager
@@ -1266,6 +1264,7 @@ print("\nHead of df_primary_test:")
 display(df_primary_test.head(5))
 
 print("\nCell 6 completed.")
+
 
 
 
@@ -1502,26 +1501,51 @@ class TemporalIndex:
         right = bisect_right(times, t_max)
         return right > left
 
+    def has_any_incoming(
+        self,
+        dst: int,
+        t_min: int,
+        t_max: int,
+    ) -> bool:
+        """
+        Return True if there is at least one incoming edge to dst
+        with step in (t_min, t_max].
+        Used for cheap feasibility checks in lookback queries.
+        """
+        times = self.in_times.get(dst)
+        if not times:
+            return False
+        left  = bisect_right(times, t_min)
+        right = bisect_right(times, t_max)
+        return right > left
+
+
 
 def build_temporal_index_from_polars(df_window_edges: pl.DataFrame) -> TemporalIndex:
-    """
-    Build TemporalIndex from a Polars dataframe.
-
-    Expected columns:
-        edge_id, src, dst, step, amount, is_sar
-    """
-
     required_cols = ["edge_id", "src", "dst", "step", "amount", "is_sar"]
     missing_cols = [c for c in required_cols if c not in df_window_edges.columns]
-
     if missing_cols:
         raise ValueError(f"Missing columns for TemporalIndex: {missing_cols}")
-
-    # Convert only the current extended window to Python records.
-    # This is acceptable because processing is windowed.
-    edges = df_window_edges.select(required_cols).to_dicts()
-
-    return TemporalIndex(edges)
+    # Tối ưu hoá tốc độ: chuyển đổi sang lists và zip thay vì dùng to_dicts() chậm
+    edge_ids = df_window_edges["edge_id"].to_list()
+    srcs = df_window_edges["src"].to_list()
+    dsts = df_window_edges["dst"].to_list()
+    steps = df_window_edges["step"].to_list()
+    amounts = df_window_edges["amount"].to_list()
+    is_sars = df_window_edges["is_sar"].to_list()
+    edge_records = [
+        EdgeRecord(
+            edge_id=eid,
+            src=s,
+            dst=d,
+            step=t,
+            amount=a,
+            is_sar=sar,
+        )
+        for eid, s, d, t, a, sar in zip(edge_ids, srcs, dsts, steps, amounts, is_sars)
+    ]
+    edge_records.sort(key=lambda e: (e.step, e.edge_id))
+    return TemporalIndex(edge_records)
 
 
 # ------------------------------------------------------------
@@ -1872,64 +1896,90 @@ def motif_instance_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
     """
     Convert motif instance rows to Polars DataFrame with stable schema.
     """
-
+    schema = {
+        "motif_instance_id": pl.String,
+        "motif_type": pl.String,
+        "matcher_type": pl.String,
+        "window_id": pl.Int64,
+        "anchor_edge_id": pl.Int64,
+        "edge_ids": pl.List(pl.Int64),
+        "node_ids": pl.List(pl.Int64),
+        "node_map_json": pl.String,
+        "role_map_json": pl.String,
+        "canonical_key": pl.String,
+        "start_step": pl.Int64,
+        "end_step": pl.Int64,
+        "duration": pl.Int64,
+        "num_edges": pl.Int64,
+        "num_nodes": pl.Int64,
+        "sar_edge_count": pl.Int64,
+        "sar_ratio": pl.Float64,
+        "motif_is_sar_any": pl.Int8,
+        "motif_is_sar_all": pl.Int8,
+        "amount_sum": pl.Float64,
+        "amount_min": pl.Float64,
+        "amount_max": pl.Float64,
+        "amount_mean": pl.Float64,
+        "amount_consistency": pl.Float64,
+        "in_sum": pl.Float64,
+        "out_sum": pl.Float64,
+        "flow_ratio": pl.Float64,
+        "handoff_gap": pl.Float64,
+        "amount_coherence": pl.Float64,
+        "time_span": pl.Int64,
+        "dst_in_degree_window": pl.Int64,
+        "src_out_degree_window": pl.Int64,
+    }
     if len(rows) == 0:
-        return pl.DataFrame(
-            schema={
-                "motif_instance_id": pl.String,
-                "motif_type": pl.String,
-                "matcher_type": pl.String,
-                "window_id": pl.Int64,
-                "anchor_edge_id": pl.Int64,
-                "edge_ids": pl.List(pl.Int64),
-                "node_ids": pl.List(pl.Int64),
-                "node_map_json": pl.String,
-                "role_map_json": pl.String,
-                "canonical_key": pl.String,
-                "start_step": pl.Int64,
-                "end_step": pl.Int64,
-                "duration": pl.Int64,
-                "num_edges": pl.Int64,
-                "num_nodes": pl.Int64,
-                "sar_edge_count": pl.Int64,
-                "sar_ratio": pl.Float64,
-                "motif_is_sar_any": pl.Int8,
-                "motif_is_sar_all": pl.Int8,
-                "amount_sum": pl.Float64,
-                "amount_min": pl.Float64,
-                "amount_max": pl.Float64,
-                "amount_mean": pl.Float64,
-            }
-        )
+        return pl.DataFrame(schema=schema)
 
-    return pl.DataFrame(rows)
+    df = pl.DataFrame(rows)
+    
+    # Enforce stable schema and order for concatenation compatibility
+    select_exprs = []
+    for col_name, col_type in schema.items():
+        if col_name in df.columns:
+            select_exprs.append(pl.col(col_name).cast(col_type))
+        else:
+            select_exprs.append(pl.lit(None, dtype=col_type).alias(col_name))
+            
+    return df.select(select_exprs)
 
 
 def membership_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
     """
     Convert edge membership rows to Polars DataFrame with stable schema.
     """
-
+    schema = {
+        "edge_id": pl.Int64,
+        "motif_instance_id": pl.String,
+        "motif_type": pl.String,
+        "matcher_type": pl.String,
+        "window_id": pl.Int64,
+        "role_in_motif": pl.String,
+        "pattern_edge_name": pl.String,
+        "pattern_edge_order": pl.Int64,
+        "edge_step": pl.Int64,
+        "edge_src": pl.Int64,
+        "edge_dst": pl.Int64,
+        "edge_amount": pl.Float64,
+        "edge_is_sar": pl.Int8,
+    }
     if len(rows) == 0:
-        return pl.DataFrame(
-            schema={
-                "edge_id": pl.Int64,
-                "motif_instance_id": pl.String,
-                "motif_type": pl.String,
-                "matcher_type": pl.String,
-                "window_id": pl.Int64,
-                "role_in_motif": pl.String,
-                "pattern_edge_name": pl.String,
-                "pattern_edge_order": pl.Int64,
-                "edge_step": pl.Int64,
-                "edge_src": pl.Int64,
-                "edge_dst": pl.Int64,
-                "edge_amount": pl.Float64,
-                "edge_is_sar": pl.Int8,
-            }
-        )
+        return pl.DataFrame(schema=schema)
 
-    return pl.DataFrame(rows)
+    df = pl.DataFrame(rows)
+    
+    # Enforce stable schema and order for concatenation compatibility
+    select_exprs = []
+    for col_name, col_type in schema.items():
+        if col_name in df.columns:
+            select_exprs.append(pl.col(col_name).cast(col_type))
+        else:
+            select_exprs.append(pl.lit(None, dtype=col_type).alias(col_name))
+            
+    return df.select(select_exprs)
+
 
 
 def write_motif_outputs(
