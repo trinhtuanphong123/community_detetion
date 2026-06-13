@@ -128,11 +128,15 @@ def run_matchers_over_windows(
         for pattern in patterns_to_run:
             pattern_start_time = time.time()
             
-            motif_path = f"{motif_dir}/{pattern.name}.parquet"
-            membership_path = f"{membership_dir}/{pattern.name}.parquet"
+            pattern_motif_dir = f"{motif_dir}/{pattern.name}"
+            pattern_membership_dir = f"{membership_dir}/{pattern.name}"
+
+            # Check if output already exists (shard directories containing any parquets)
+            has_motifs = os.path.exists(pattern_motif_dir) and any(f.endswith('.parquet') for f in os.listdir(pattern_motif_dir)) if os.path.exists(pattern_motif_dir) else False
+            has_memberships = os.path.exists(pattern_membership_dir) and any(f.endswith('.parquet') for f in os.listdir(pattern_membership_dir)) if os.path.exists(pattern_membership_dir) else False
 
             # Check if output already exists
-            if skip_existing and os.path.exists(motif_path) and os.path.exists(membership_path):
+            if skip_existing and has_motifs and has_memberships:
                 print(f"  [{pattern.name}] outputs already exist. Skipping.")
                 stats_rows.append({
                     "window_id": w_id,
@@ -161,38 +165,33 @@ def run_matchers_over_windows(
             # Failure isolation wrapper
             try:
                 matcher = matcher_registry[pattern.matcher_type]
-                motif_df, membership_df, stats = matcher.match(
+                output_buffer = MatcherOutputBuffer(
+                    motif_dir=pattern_motif_dir,
+                    membership_dir=pattern_membership_dir,
+                    flush_every_instances=500,
+                )
+                stats = matcher.match(
                     df_primary=df_primary,
                     df_extended=df_extended,
                     index=temporal_index,
                     window=window,
                     pattern=pattern,
-                    write_output=False,
+                    output_buffer=output_buffer,
                 )
-
-                if write_empty_outputs or motif_df.height > 0:
-                    motif_df.write_parquet(motif_path)
-                    membership_df.write_parquet(membership_path)
-
+                output_buffer.close(write_empty_outputs=write_empty_outputs)
                 pattern_elapsed = time.time() - pattern_start_time
                 stats["status"] = "completed"
                 stats["index_build_seconds"] = float(index_elapsed)
                 stats["total_pattern_seconds"] = float(pattern_elapsed)
-                stats["motif_path"] = motif_path
-                stats["membership_path"] = membership_path
+                stats["motif_path"] = pattern_motif_dir
+                stats["membership_path"] = pattern_membership_dir
                 stats_rows.append(stats)
-
                 print(
                     f"  [{pattern.name}] "
-                    f"instances={motif_df.height}, "
-                    f"membership_rows={membership_df.height}, "
+                    f"instances={stats['num_instances']}, "
+                    f"membership_rows={stats['num_membership_rows']}, "
                     f"time={round(pattern_elapsed, 3)}s"
                 )
-
-                # Explicit memory cleanup
-                del motif_df
-                del membership_df
-                gc.collect()
 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -309,12 +308,12 @@ if 'df_edges' in globals() and 'windows' in globals():
 
     if motif_dir_path.exists() and membership_dir_path.exists():
         for pattern in VALIDATION_PATTERNS:
-            motif_file = motif_dir_path / f"{pattern.name}.parquet"
-            membership_file = membership_dir_path / f"{pattern.name}.parquet"
+            motif_files = sorted((motif_dir_path / pattern.name).glob("*.parquet"))
+            membership_files = sorted((membership_dir_path / pattern.name).glob("*.parquet"))
+            df_motifs = pl.scan_parquet([str(p) for p in motif_files]).collect() if motif_files else pl.DataFrame()
+            df_members = pl.scan_parquet([str(p) for p in membership_files]).collect() if membership_files else pl.DataFrame()
             
-            if motif_file.exists() and membership_file.exists():
-                df_motifs = pl.read_parquet(motif_file)
-                df_members = pl.read_parquet(membership_file)
+            if motif_files and membership_files:
                 
                 num_instances = df_motifs.height
                 num_members = df_members.height
@@ -324,16 +323,18 @@ if 'df_edges' in globals() and 'windows' in globals():
                 
                 # Check schema correctness
                 expected_motif_cols = {
-                    "motif_instance_id", "window_id", "motif_type", "anchor_edge_id",
-                    "canonical_key", "instance_score", "candidate_rank",
-                    "time_compactness", "amount_consistency", "amount_sum_log",
-                    "degree_penalty", "flow_ratio", "flow_gap", "center_degree"
+                    "motif_instance_id", "window_id", "motif_type", "matcher_type", "canonical_key",
+                    "anchor_edge_id", "edge_ids", "instance_score", "candidate_rank", "num_edges",
+                    "start_step", "end_step", "duration"
                 }
                 missing_motif_cols = expected_motif_cols - set(df_motifs.columns)
                 if missing_motif_cols:
                     raise ValueError(f"Validation failed: motif instances schema missing columns: {missing_motif_cols}")
                 
-                expected_member_cols = {"motif_instance_id", "edge_id", "role_in_motif"}
+                expected_member_cols = {
+                    "edge_id", "motif_instance_id", "window_id", "motif_type", "matcher_type",
+                    "instance_score", "role_in_motif"
+                }
                 missing_member_cols = expected_member_cols - set(df_members.columns)
                 if missing_member_cols:
                     raise ValueError(f"Validation failed: membership schema missing columns: {missing_member_cols}")
@@ -473,38 +474,63 @@ def build_edge_participation_summary(
 ) -> pl.DataFrame:
     """
     For each edge_id, aggregate all motif memberships into summary statistics.
-
-    Output columns:
-        edge_id, num_motif_instances, num_motif_types,
-        motif_types_list, roles_list,
-        + all original df_edges columns (joined)
+    Uses lazy scanning of parquet shards to keep memory usage low.
     """
     paths = sorted(Path(membership_dir).glob("**/*.parquet"))
     valid_paths = [str(p) for p in paths if p.stat().st_size > 0]
-
     if not valid_paths:
         print("No membership shards found.")
-        return df_edges
-
+        return df_edges.with_columns([
+            pl.lit(0).alias("num_motif_instances"),
+            pl.lit(0).alias("num_motif_types"),
+            pl.lit([], dtype=pl.List(pl.String)).alias("motif_types_list"),
+            pl.lit(0.0).alias("motif_score_sum"),
+            pl.lit(0.0).alias("motif_score_max"),
+            pl.lit(0.0).alias("motif_score_mean"),
+            pl.lit(0).alias("fan_in_count"),
+            pl.lit(0).alias("fan_out_count"),
+            pl.lit(0).alias("split_merge_count"),
+            pl.lit(0).alias("center_in_out_count"),
+            pl.lit(0.0).alias("edge_motif_score"),
+        ])
+    lf = pl.scan_parquet(valid_paths)
     summary = (
-        pl.scan_parquet(valid_paths)
-        .unique(subset=["edge_id", "motif_instance_id"])
+        lf
         .group_by("edge_id")
         .agg([
             pl.col("motif_instance_id").n_unique().alias("num_motif_instances"),
             pl.col("motif_type").n_unique().alias("num_motif_types"),
             pl.col("motif_type").unique().alias("motif_types_list"),
-            pl.col("role_in_motif").unique().alias("roles_list"),
+            pl.col("instance_score").sum().alias("motif_score_sum"),
+            pl.col("instance_score").max().alias("motif_score_max"),
+            pl.col("instance_score").mean().alias("motif_score_mean"),
+            (pl.col("matcher_type") == "fan_in").sum().alias("fan_in_count"),
+            (pl.col("matcher_type") == "fan_out").sum().alias("fan_out_count"),
+            (pl.col("matcher_type") == "split_merge").sum().alias("split_merge_count"),
+            (pl.col("matcher_type") == "center_in_out").sum().alias("center_in_out_count"),
+        ])
+        .with_columns([
+            (
+                pl.col("num_motif_instances").log1p() * 0.4
+                + pl.col("num_motif_types") * 0.3
+                + pl.col("motif_score_max") * 0.3
+            ).alias("edge_motif_score")
         ])
         .collect(streaming=True)
     )
-
     result = df_edges.join(summary, on="edge_id", how="left")
     result = result.with_columns([
         pl.col("num_motif_instances").fill_null(0),
         pl.col("num_motif_types").fill_null(0),
+        pl.col("motif_score_sum").fill_null(0.0),
+        pl.col("motif_score_max").fill_null(0.0),
+        pl.col("motif_score_mean").fill_null(0.0),
+        pl.col("fan_in_count").fill_null(0),
+        pl.col("fan_out_count").fill_null(0),
+        pl.col("split_merge_count").fill_null(0),
+        pl.col("center_in_out_count").fill_null(0),
+        pl.col("edge_motif_score").fill_null(0.0),
     ])
-
     return result
 
 # Select the run namespace to aggregate (e.g., "production", "validation")

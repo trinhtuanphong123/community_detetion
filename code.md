@@ -1880,6 +1880,10 @@ def select_edges_by_hybrid_policy(
 
 print("Cell 7b: Common validation, scoring, and candidate selection helpers ready.")
 
+   
+
+
+
 
 # ============================================================
 # Cell 8: Helper Functions for Motif Instance Output
@@ -1982,531 +1986,171 @@ def make_motif_instance_row(
     window_id: int,
     pattern: MotifPattern,
     edges: List[EdgeRecord],
-    node_map: Dict[str, int],
-    role_map: Dict[str, int],
     anchor_edge_id: Optional[int] = None,
-    validate: bool = False,
     index: Optional[TemporalIndex] = None,
     candidate_rank: int = -1,
 ) -> Dict[str, Any]:
-    """
-    Create one row for motif_instances.
-
-    Parameters:
-        window_id:
-            Temporal window ID.
-
-        pattern:
-            MotifPattern object.
-
-        edges:
-            Ordered list of EdgeRecord objects according to pattern edge order.
-
-        node_map:
-            Mapping from abstract pattern node to real node.
-
-        role_map:
-            Mapping from pattern edge role/name to real edge_id.
-
-        anchor_edge_id:
-            Edge used as anchor. If None, use the first edge.
-
-        validate:
-            Whether to run structural validation.
-
-        index:
-            TemporalIndex object (optional, for scoring and degrees).
-
-        candidate_rank:
-            Rank of candidate anchor edge (optional).
-    """
-
-    if validate:
-        validate_instance_edges(edges, pattern)
-
-    if len(node_map) == 0:
-        raise ValueError("node_map must not be empty.")
-
     edge_ids = [int(e.edge_id) for e in edges]
-    node_ids = sorted(set(int(v) for v in node_map.values()))
-
     steps = [int(e.step) for e in edges]
-    amounts = [float(e.amount) for e in edges]
-    sar_values = [int(e.is_sar) for e in edges]
-
-    start_step = min(steps)
-    end_step = max(steps)
-    duration = end_step - start_step
-
-    sar_edge_count = int(sum(sar_values))
-    sar_ratio = float(sar_edge_count / len(edges)) if len(edges) > 0 else 0.0
-
-    amount_sum = float(sum(amounts))
-    amount_min = float(min(amounts)) if amounts else 0.0
-    amount_max = float(max(amounts)) if amounts else 0.0
-    amount_mean = float(amount_sum / len(amounts)) if amounts else 0.0
-
-    ordered = infer_ordered_flag(pattern)
+    if anchor_edge_id is None:
+        anchor_edge_id = edge_ids[0]
     canonical_key = make_canonical_key(
         motif_type=pattern.name,
         edge_ids=edge_ids,
-        ordered=ordered,
+        ordered=infer_ordered_flag(pattern),
     )
-
     motif_instance_id = make_motif_instance_id(
         window_id=window_id,
         motif_type=pattern.name,
         canonical_key=canonical_key,
     )
-
-    if anchor_edge_id is None:
-        anchor_edge_id = edge_ids[0]
-
-    # Flow ratio, handoff_gap/flow_gap, in_sum, out_sum
-    in_sum_val = 0.0
-    out_sum_val = 0.0
-    flow_ratio_val = 0.0
-    flow_gap_val = 0.0
-
-    if pattern.matcher_type in {"split_merge", "center_in_out"}:
-        if pattern.matcher_type == "split_merge":
-            n = len(edges) // 2
-            in_edges = edges[:n]
-            out_edges = edges[n:]
-        else: # center_in_out
-            n_in = sum(1 for e in pattern.edges if e.dst == "center")
-            in_edges = edges[:n_in]
-            out_edges = edges[n_in:]
-
-        in_sum_val = float(sum(e.amount for e in in_edges))
-        out_sum_val = float(sum(e.amount for e in out_edges))
-        flow_ratio_val = out_sum_val / in_sum_val if in_sum_val > 0 else 0.0
-
-        in_end = max(e.step for e in in_edges)
-        out_start = min(e.step for e in out_edges)
-        flow_gap_val = float(out_start - in_end)
-
-    # Center degree
-    center_degree_val = 0
-    if index is not None:
-        if pattern.matcher_type == "fan_in":
-            center_node = node_map.get("dst")
-            if center_node is not None:
-                center_degree_val = index.node_in_degree.get(center_node, 0) + index.node_out_degree.get(center_node, 0)
-        elif pattern.matcher_type == "fan_out":
-            center_node = node_map.get("src")
-            if center_node is not None:
-                center_degree_val = index.node_in_degree.get(center_node, 0) + index.node_out_degree.get(center_node, 0)
-        elif pattern.matcher_type == "center_in_out":
-            center_node = node_map.get("center")
-            if center_node is not None:
-                center_degree_val = index.node_in_degree.get(center_node, 0) + index.node_out_degree.get(center_node, 0)
-        else:
-            center_degree_val = max(index.node_in_degree.get(n, 0) + index.node_out_degree.get(n, 0) for n in node_map.values()) if node_map else 0
-
-    # Suspicion score and degree penalty
-    if index is not None:
-        instance_score_val = score_instance(edges, index, pattern)
-        degree_penalty_val = score_degree_penalty(edges, index.node_in_degree, index.node_out_degree)
-    else:
-        # Fallback calculations without index
-        compactness = score_temporal_compactness(edges, pattern.max_duration)
-        consistency = amount_consistency(edges)
-        overall = (compactness * 0.4) + (consistency * 0.4) + (flow_ratio_val * 0.2 if in_sum_val > 0 else 0.2)
-        instance_score_val = float(overall)
-        degree_penalty_val = 1.0
-
-    time_compactness_val = score_temporal_compactness(edges, pattern.max_duration)
-    amount_consistency_val = amount_consistency(edges)
-    amount_sum_log_val = math.log1p(amount_sum) if amount_sum > 0 else 0.0
-
-    # Compatibility features
-    amount_coherence_val = float(min(amounts) / max(amounts)) if amounts else 1.0
-    time_span_val = int(max(steps) - min(steps)) if steps else 0
-
-    dst_in_degree_window_val = 0
-    src_out_degree_window_val = 0
-    if index is not None:
-        if pattern.matcher_type == "fan_in":
-            center_node = node_map.get("dst")
-            if center_node is not None:
-                dst_in_degree_window_val = index.node_in_degree.get(center_node, 0)
-        elif pattern.matcher_type == "fan_out":
-            center_node = node_map.get("src")
-            if center_node is not None:
-                src_out_degree_window_val = index.node_out_degree.get(center_node, 0)
-
-    row = {
+    instance_score = score_instance(edges, index, pattern) if index is not None else 0.0
+    return {
         "motif_instance_id": motif_instance_id,
+        "window_id": int(window_id),
         "motif_type": pattern.name,
         "matcher_type": pattern.matcher_type,
-        "window_id": int(window_id),
-        "anchor_edge_id": int(anchor_edge_id),
-
-        "edge_ids": edge_ids,
-        "node_ids": node_ids,
-
-        "node_map_json": json.dumps(
-            {str(k): int(v) for k, v in node_map.items()},
-            sort_keys=True,
-        ),
-        "role_map_json": json.dumps(
-            {str(k): int(v) for k, v in role_map.items()},
-            sort_keys=True,
-        ),
         "canonical_key": canonical_key,
-
-        "start_step": int(start_step),
-        "end_step": int(end_step),
-        "duration": int(duration),
-
-        "num_edges": int(len(edges)),
-        "num_nodes": int(len(node_ids)),
-
-        "sar_edge_count": int(sar_edge_count),
-        "sar_ratio": float(sar_ratio),
-        "motif_is_sar_any": int(sar_edge_count > 0),
-        "motif_is_sar_all": int(sar_edge_count == len(edges)),
-
-        "amount_sum": float(amount_sum),
-        "amount_min": float(amount_min),
-        "amount_max": float(amount_max),
-        "amount_mean": float(amount_mean),
-
-        # New ranking fields
-        "instance_score": float(instance_score_val),
-        "time_compactness": float(time_compactness_val),
-        "amount_consistency": float(amount_consistency_val),
-        "amount_sum_log": float(amount_sum_log_val),
-        "degree_penalty": float(degree_penalty_val),
-        "flow_ratio": float(flow_ratio_val),
-        "flow_gap": float(flow_gap_val),
-        "center_degree": int(center_degree_val),
+        "anchor_edge_id": int(anchor_edge_id),
+        "edge_ids": edge_ids,
+        "instance_score": float(instance_score),
         "candidate_rank": int(candidate_rank),
-
-        # Compatibility fields
-        "in_sum": float(in_sum_val),
-        "out_sum": float(out_sum_val),
-        "handoff_gap": float(flow_gap_val),
-        "amount_coherence": float(amount_coherence_val),
-        "time_span": int(time_span_val),
-        "dst_in_degree_window": int(dst_in_degree_window_val),
-        "src_out_degree_window": int(src_out_degree_window_val),
+        "num_edges": int(len(edges)),
+        "start_step": int(min(steps)),
+        "end_step": int(max(steps)),
+        "duration": int(max(steps) - min(steps)),
     }
 
-    return row
-
-
+# Simplify make_edge_motif_membership_rows
 def make_edge_motif_membership_rows(
     motif_row: Dict[str, Any],
     pattern: MotifPattern,
     edges: List[EdgeRecord],
 ) -> List[Dict[str, Any]]:
-    """
-    Create edge_motif_membership rows from one motif instance.
-    """
-
-    if len(edges) != len(pattern.edges):
-        raise ValueError(
-            f"Pattern {pattern.name} expects {len(pattern.edges)} edges, "
-            f"but got {len(edges)} edges."
-        )
-
     pattern_edges_sorted = sorted(pattern.edges, key=lambda x: x.order)
-
-    # Reconstruct edges in the correct role order using role_map_json from motif_row if available
-    ordered_edges = edges
-    role_map_str = motif_row.get("role_map_json")
-    if role_map_str:
-        try:
-            role_map = json.loads(role_map_str)
-            edge_by_id = {e.edge_id: e for e in edges}
-            ordered_edges = [edge_by_id[int(role_map[p_e.role])] for p_e in pattern_edges_sorted]
-        except Exception:
-            ordered_edges = edges
-
     rows = []
-
-    for p_edge, real_edge in zip(pattern_edges_sorted, ordered_edges):
+    for p_edge, real_edge in zip(pattern_edges_sorted, edges):
         role = p_edge.role if p_edge.role else p_edge.name
-
         rows.append({
             "edge_id": int(real_edge.edge_id),
             "motif_instance_id": motif_row["motif_instance_id"],
+            "window_id": int(motif_row["window_id"]),
             "motif_type": motif_row["motif_type"],
             "matcher_type": motif_row["matcher_type"],
-            "window_id": int(motif_row["window_id"]),
+            "instance_score": float(motif_row["instance_score"]),
             "role_in_motif": role,
-            "pattern_edge_name": p_edge.name,
-            "pattern_edge_order": int(p_edge.order),
-            "edge_step": int(real_edge.step),
-            "edge_src": int(real_edge.src),
-            "edge_dst": int(real_edge.dst),
-            "edge_amount": float(real_edge.amount),
-            "edge_is_sar": int(real_edge.is_sar),
         })
-
     return rows
 
-
+# Simplify schemas
 def motif_instance_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
-    """
-    Convert motif instance rows to Polars DataFrame with stable schema.
-    """
     schema = {
         "motif_instance_id": pl.String,
+        "window_id": pl.Int64,
         "motif_type": pl.String,
         "matcher_type": pl.String,
-        "window_id": pl.Int64,
+        "canonical_key": pl.String,
         "anchor_edge_id": pl.Int64,
         "edge_ids": pl.List(pl.Int64),
-        "node_ids": pl.List(pl.Int64),
-        "node_map_json": pl.String,
-        "role_map_json": pl.String,
-        "canonical_key": pl.String,
+        "instance_score": pl.Float64,
+        "candidate_rank": pl.Int64,
+        "num_edges": pl.Int64,
         "start_step": pl.Int64,
         "end_step": pl.Int64,
         "duration": pl.Int64,
-        "num_edges": pl.Int64,
-        "num_nodes": pl.Int64,
-        "sar_edge_count": pl.Int64,
-        "sar_ratio": pl.Float64,
-        "motif_is_sar_any": pl.Int8,
-        "motif_is_sar_all": pl.Int8,
-        "amount_sum": pl.Float64,
-        "amount_min": pl.Float64,
-        "amount_max": pl.Float64,
-        "amount_mean": pl.Float64,
-        
-        # New ranking fields
-        "instance_score": pl.Float64,
-        "time_compactness": pl.Float64,
-        "amount_consistency": pl.Float64,
-        "amount_sum_log": pl.Float64,
-        "degree_penalty": pl.Float64,
-        "flow_ratio": pl.Float64,
-        "flow_gap": pl.Float64,
-        "center_degree": pl.Int64,
-        "candidate_rank": pl.Int64,
-
-        # Compatibility fields
-        "in_sum": pl.Float64,
-        "out_sum": pl.Float64,
-        "handoff_gap": pl.Float64,
-        "amount_coherence": pl.Float64,
-        "time_span": pl.Int64,
-        "dst_in_degree_window": pl.Int64,
-        "src_out_degree_window": pl.Int64,
     }
     if len(rows) == 0:
         return pl.DataFrame(schema=schema)
-
     df = pl.DataFrame(rows)
-
-    select_exprs = []
-    for col_name, col_type in schema.items():
-        if col_name in df.columns:
-            select_exprs.append(pl.col(col_name).cast(col_type))
-        else:
-            select_exprs.append(pl.lit(None, dtype=col_type).alias(col_name))
-
-    return df.select(select_exprs)
-
+    return df.select([
+        pl.col(c).cast(t) if c in df.columns else pl.lit(None, dtype=t).alias(c)
+        for c, t in schema.items()
+    ])
 
 def membership_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
-    """
-    Convert edge membership rows to Polars DataFrame with stable schema.
-    """
     schema = {
         "edge_id": pl.Int64,
         "motif_instance_id": pl.String,
+        "window_id": pl.Int64,
         "motif_type": pl.String,
         "matcher_type": pl.String,
-        "window_id": pl.Int64,
+        "instance_score": pl.Float64,
         "role_in_motif": pl.String,
-        "pattern_edge_name": pl.String,
-        "pattern_edge_order": pl.Int64,
-        "edge_step": pl.Int64,
-        "edge_src": pl.Int64,
-        "edge_dst": pl.Int64,
-        "edge_amount": pl.Float64,
-        "edge_is_sar": pl.Int8,
     }
     if len(rows) == 0:
         return pl.DataFrame(schema=schema)
-
     df = pl.DataFrame(rows)
+    return df.select([
+        pl.col(c).cast(t) if c in df.columns else pl.lit(None, dtype=t).alias(c)
+        for c, t in schema.items()
+    ])
 
-    select_exprs = []
-    for col_name, col_type in schema.items():
-        if col_name in df.columns:
-            select_exprs.append(pl.col(col_name).cast(col_type))
-        else:
-            select_exprs.append(pl.lit(None, dtype=col_type).alias(col_name))
-
-    return df.select(select_exprs)
-
-
-def make_membership_df_from_motif_rows(
-    motif_rows: List[Dict[str, Any]],
-    pattern: MotifPattern,
-    emitted_edges: List[List[EdgeRecord]],
-) -> pl.DataFrame:
-    """
-    Build membership DataFrame from motif_rows and their corresponding EdgeRecords
-    in a memory-efficient chunked manner to avoid RAM overflow.
-    """
-    if not motif_rows:
-        return membership_rows_to_polars([])
-
-    chunk_size = 10000
-    membership_dfs = []
-    current_chunk = []
-
-    for motif_row, edges_val in zip(motif_rows, emitted_edges):
-        current_chunk.extend(make_edge_motif_membership_rows(motif_row, pattern, edges_val))
-        if len(current_chunk) >= chunk_size:
-            membership_dfs.append(membership_rows_to_polars(current_chunk))
-            current_chunk = []
-
-    if current_chunk:
-        membership_dfs.append(membership_rows_to_polars(current_chunk))
-
-    return pl.concat(membership_dfs)
-
-
-class MatcherOutputBuffer:
-    """
-    Flush matcher outputs into parquet shards so matchers do not retain
-    full-window Python dicts, EdgeRecord lists, or DataFrame chunks in RAM.
-    """
-
+# Define new MotifOutputBuffer
+class MotifOutputBuffer:
     def __init__(
         self,
-        pattern: MotifPattern,
-        flush_every_instances: int = MATCHER_OUTPUT_FLUSH_EVERY,
-        spill_to_disk: bool = True,
+        motif_dir: str,
+        membership_dir: str,
+        motif_flush_size: int = 2000,
+        membership_flush_size: int = 10000,
+        flush_every_instances: Optional[int] = None,
     ):
-        self.pattern = pattern
-        self.flush_every_instances = max(1, int(flush_every_instances))
-        self.spill_to_disk = spill_to_disk
-
-        self._motif_rows: List[Dict[str, Any]] = []
-        self._emitted_edges: List[List[EdgeRecord]] = []
-        self._motif_chunks: List[pl.DataFrame] = []
-        self._membership_chunks: List[pl.DataFrame] = []
-        self._motif_chunk_paths: List[str] = []
-        self._membership_chunk_paths: List[str] = []
-        self._spill_dir: Optional[str] = None
-        self._flush_index = 0
-        self.num_instances = 0
-        self.num_membership_rows = 0
-
-    def _ensure_spill_dir(self) -> str:
-        if self._spill_dir is None:
-            self._spill_dir = tempfile.mkdtemp(prefix="matcher_output_")
-        return self._spill_dir
-
-    def add_instance(
-        self,
-        motif_row: Dict[str, Any],
-        edges: List[EdgeRecord],
-    ) -> None:
-        self._motif_rows.append(motif_row)
-        self._emitted_edges.append(edges)
-        self.num_instances += 1
-
-        if len(self._motif_rows) >= self.flush_every_instances:
-            self.flush()
-
-    def flush(self) -> None:
-        if not self._motif_rows:
-            return
-
-        motif_df = motif_instance_rows_to_polars(self._motif_rows)
-        membership_df = make_membership_df_from_motif_rows(
-            self._motif_rows,
-            self.pattern,
-            self._emitted_edges,
-        )
-        self.num_membership_rows += int(membership_df.height)
-
-        if self.spill_to_disk:
-            spill_dir = self._ensure_spill_dir()
-            motif_chunk_path = os.path.join(
-                spill_dir,
-                f"motif_chunk_{self._flush_index:06d}.parquet",
-            )
-            membership_chunk_path = os.path.join(
-                spill_dir,
-                f"membership_chunk_{self._flush_index:06d}.parquet",
-            )
-            motif_df.write_parquet(motif_chunk_path)
-            membership_df.write_parquet(membership_chunk_path)
-            self._motif_chunk_paths.append(motif_chunk_path)
-            self._membership_chunk_paths.append(membership_chunk_path)
-            self._flush_index += 1
+        self.motif_dir = motif_dir
+        self.membership_dir = membership_dir
+        if flush_every_instances is not None:
+            self.motif_flush_size = flush_every_instances
+            self.membership_flush_size = flush_every_instances * 5
         else:
-            self._motif_chunks.append(motif_df)
-            self._membership_chunks.append(membership_df)
+            self.motif_flush_size = motif_flush_size
+            self.membership_flush_size = membership_flush_size
+        self.motif_rows = []
+        self.membership_rows = []
+        self.motif_shard_id = 0
+        self.membership_shard_id = 0
+        os.makedirs(self.motif_dir, exist_ok=True)
+        os.makedirs(self.membership_dir, exist_ok=True)
 
-        self._motif_rows = []
-        self._emitted_edges = []
+    def add(self, motif_row: Dict[str, Any], membership_rows: List[Dict[str, Any]]):
+        self.motif_rows.append(motif_row)
+        self.membership_rows.extend(membership_rows)
+        if len(self.motif_rows) >= self.motif_flush_size:
+            self.flush_motifs()
+        if len(self.membership_rows) >= self.membership_flush_size:
+            self.flush_memberships()
+
+    def flush_motifs(self):
+        if not self.motif_rows:
+            return
+        path = f"{self.motif_dir}/motif_shard_{self.motif_shard_id:06d}.parquet"
+        df = motif_instance_rows_to_polars(self.motif_rows)
+        df.write_parquet(path)
+        self.motif_rows.clear()
+        self.motif_shard_id += 1
+        del df
         gc.collect()
 
-    def finalize(self) -> Tuple[pl.DataFrame, pl.DataFrame]:
-        self.flush()
-        try:
-            if self._motif_chunk_paths:
-                motif_df = pl.scan_parquet(self._motif_chunk_paths).collect(streaming=True)
-            elif self._motif_chunks:
-                motif_df = pl.concat(self._motif_chunks, rechunk=False)
-            else:
-                motif_df = motif_instance_rows_to_polars([])
+    def flush_memberships(self):
+        if not self.membership_rows:
+            return
+        path = f"{self.membership_dir}/membership_shard_{self.membership_shard_id:06d}.parquet"
+        df = membership_rows_to_polars(self.membership_rows)
+        df.write_parquet(path)
+        self.membership_rows.clear()
+        self.membership_shard_id += 1
+        del df
+        gc.collect()
 
-            if self._membership_chunk_paths:
-                membership_df = pl.scan_parquet(self._membership_chunk_paths).collect(streaming=True)
-            elif self._membership_chunks:
-                membership_df = pl.concat(self._membership_chunks, rechunk=False)
-            else:
-                membership_df = membership_rows_to_polars([])
-
-            return motif_df, membership_df
-        finally:
-            if self._spill_dir is not None:
-                shutil.rmtree(self._spill_dir, ignore_errors=True)
-                self._spill_dir = None
-
-
-def write_motif_outputs(
-    motif_rows: Any,
-    membership_rows: Any,
-    window_id: int,
-    motif_type: str,
-    motif_instance_dir: str = MOTIF_INSTANCE_DIR,
-    membership_dir: str = MEMBERSHIP_DIR,
-) -> Tuple[str, str]:
-    """
-    Write motif_instances and edge_motif_membership parquet shards.
-    """
-
-    if isinstance(motif_rows, pl.DataFrame):
-        motif_df = motif_rows
-    else:
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-
-    if isinstance(membership_rows, pl.DataFrame):
-        membership_df = membership_rows
-    else:
-        membership_df = membership_rows_to_polars(membership_rows)
-
-    motif_path = f"{motif_instance_dir}/window_{int(window_id):06d}_{motif_type}.parquet"
-    membership_path = f"{membership_dir}/window_{int(window_id):06d}_{motif_type}.parquet"
-
-    motif_df.write_parquet(motif_path)
-    membership_df.write_parquet(membership_path)
-
-    return motif_path, membership_path
+    def close(self, write_empty_outputs: bool = True):
+        self.flush_motifs()
+        self.flush_memberships()
+        if write_empty_outputs:
+            if self.motif_shard_id == 0:
+                df = motif_instance_rows_to_polars([])
+                df.write_parquet(f"{self.motif_dir}/motif_shard_000000.parquet")
+            if self.membership_shard_id == 0:
+                df = membership_rows_to_polars([])
+                df.write_parquet(f"{self.membership_dir}/membership_shard_000000.parquet")
 
 
-# End of code.md
+
+
