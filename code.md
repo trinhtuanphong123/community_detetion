@@ -8,6 +8,9 @@
 import os
 import gc
 import time
+import numpy as np
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
@@ -65,6 +68,8 @@ DELTA_HOP = 5
 # This is also used as lookahead for extended windows.
 MAX_MOTIF_DURATION = 20
 
+assert DELTA_HOP <= MAX_MOTIF_DURATION
+
 # ----------------------------
 # Candidate / output caps
 # ----------------------------
@@ -76,6 +81,7 @@ MAX_INSTANCES_PER_ANCHOR = 1_000
 MAX_INSTANCES_PER_WINDOW = 1_000_000
 MAX_FAN_INSTANCES_PER_WINDOW = 10_000
 MAX_FAN_INSTANCES_PER_CENTER = 20
+MATCHER_OUTPUT_FLUSH_EVERY = 5_000
 
 # ----------------------------
 # Amount constraints
@@ -146,7 +152,7 @@ CENTER_INOUT_OUT_CAP = {2: 20, 3: 12,  4: 8}
 # Cycle sizes
 # ----------------------------
 CYCLE_SIZES           = list(range(5, 11))   # 5, 6, 7, 8, 9, 10
-BIDIRECTIONAL_CYCLE_THRESHOLD = 999            # use bidirectional DFS for k >= this
+BIDIRECTIONAL_CYCLE_THRESHOLD = 999            # retained for compatibility; cycle matching uses forward DFS only
 
 CYCLE_MAX_BRANCHING = {5: 8, 6: 6, 7: 5, 8: 4, 9: 4, 10: 4}
 
@@ -1099,18 +1105,29 @@ def summarize_windows(
     Counts are computed for all windows because current dataset is moderate size.
     """
 
+    step_counts_df = (
+        df_edges
+        .group_by("step")
+        .len()
+        .sort("step")
+    )
+
+    steps = step_counts_df["step"].to_list()
+    counts = step_counts_df["len"].to_list()
+    prefix = [0]
+    for count in counts:
+        prefix.append(prefix[-1] + int(count))
+
+    def count_in_range(start_step: int, end_step: int) -> int:
+        left = bisect_right(steps, start_step - 1)
+        right = bisect_right(steps, end_step)
+        return prefix[right] - prefix[left]
+
     rows = []
 
     for w in windows:
-        primary_count = df_edges.filter(
-            (pl.col("step") >= w.primary_start) &
-            (pl.col("step") <= w.primary_end)
-        ).height
-
-        extended_count = df_edges.filter(
-            (pl.col("step") >= w.extended_start) &
-            (pl.col("step") <= w.extended_end)
-        ).height
+        primary_count = count_in_range(w.primary_start, w.primary_end)
+        extended_count = count_in_range(w.extended_start, w.extended_end)
 
         rows.append({
             "window_id": w.window_id,
@@ -1212,6 +1229,33 @@ class EdgeRecord:
     is_sar: int
 
 
+class EdgeIndexView:
+    """
+    Read-only mapping view that materializes EdgeRecord lists on demand
+    from integer edge indices stored in TemporalIndex.
+    """
+
+    def __init__(self, index: "TemporalIndex", idx_dict: Dict[Any, List[int]]):
+        self._index = index
+        self._idx_dict = idx_dict
+
+    def get(self, key: Any, default=None) -> List[EdgeRecord]:
+        indices = self._idx_dict.get(key)
+        if indices is None:
+            return [] if default is None else default
+        return self._index._materialize_edges(indices)
+
+    def keys(self):
+        return self._idx_dict.keys()
+
+    def items(self):
+        for key, indices in self._idx_dict.items():
+            yield key, self._index._materialize_edges(indices)
+
+    def __len__(self) -> int:
+        return len(self._idx_dict)
+
+
 class TemporalIndex:
     """
     Temporal index for directed transaction edges.
@@ -1225,42 +1269,57 @@ class TemporalIndex:
     """
 
     def __init__(self, edges: List[EdgeRecord]):
-        import numpy as np
-
-        self.out_edges = defaultdict(list)
-        self.in_edges = defaultdict(list)
-
         self.num_edges = len(edges)
 
-        # Sort once globally to ensure temporal order.
-        edge_records = sorted(edges, key=lambda e: (e.step, e.edge_id))
+        # Single sorted edge store. All query structures index into this list.
+        self._edges = sorted(edges, key=lambda e: (e.step, e.edge_id))
+        self._out_idx = defaultdict(list)
+        self._in_idx = defaultdict(list)
+        self._pair_idx = defaultdict(list)
 
         # Initialize metadata
         self.node_in_degree = defaultdict(int)
         self.node_out_degree = defaultdict(int)
         self.pair_count = defaultdict(int)
 
-        for e in edge_records:
-            self.out_edges[e.src].append(e)
-            self.in_edges[e.dst].append(e)
+        for idx, e in enumerate(self._edges):
+            self._out_idx[e.src].append(idx)
+            self._in_idx[e.dst].append(idx)
+            self._pair_idx[(e.src, e.dst)].append(idx)
 
             # Increment degrees and pair counts
             self.node_out_degree[e.src] += 1
             self.node_in_degree[e.dst] += 1
             self.pair_count[(e.src, e.dst)] += 1
 
-        # Convert defaultdicts to regular dicts to save space
+        self._out_idx = dict(self._out_idx)
+        self._in_idx = dict(self._in_idx)
+        self._pair_idx = dict(self._pair_idx)
+        self._out_steps = {
+            key: [self._edges[i].step for i in indices]
+            for key, indices in self._out_idx.items()
+        }
+        self._in_steps = {
+            key: [self._edges[i].step for i in indices]
+            for key, indices in self._in_idx.items()
+        }
+        self._pair_steps = {
+            key: [self._edges[i].step for i in indices]
+            for key, indices in self._pair_idx.items()
+        }
+
+        # Convert defaultdicts to regular dicts to save space.
         self.node_in_degree = dict(self.node_in_degree)
         self.node_out_degree = dict(self.node_out_degree)
         self.pair_count = dict(self.pair_count)
-        self.out_edges = dict(self.out_edges)
-        self.in_edges = dict(self.in_edges)
+        self.out_edges = EdgeIndexView(self, self._out_idx)
+        self.in_edges = EdgeIndexView(self, self._in_idx)
 
         # Index-level metadata
-        total_sar = sum(1 for e in edge_records if e.is_sar)
+        total_sar = sum(1 for e in self._edges if e.is_sar)
         self.sar_rate_window = float(total_sar / self.num_edges) if self.num_edges > 0 else 0.0
 
-        amounts = [e.amount for e in edge_records]
+        amounts = [e.amount for e in self._edges]
         quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
         if amounts:
             q_vals = np.quantile(amounts, quantiles)
@@ -1268,9 +1327,13 @@ class TemporalIndex:
         else:
             self.amount_quantiles = {q: 0.0 for q in quantiles}
 
+    def _materialize_edges(self, indices: List[int]) -> List[EdgeRecord]:
+        return [self._edges[i] for i in indices]
+
     def _range_query(
         self,
-        edge_dict: Dict[Any, List[EdgeRecord]],
+        idx_dict: Dict[Any, List[int]],
+        steps_dict: Dict[Any, List[int]],
         key: Any,
         t_min: int,
         t_max: int,
@@ -1286,29 +1349,24 @@ class TemporalIndex:
             t_next > t_current
         """
 
-        edges = edge_dict.get(key)
-        if not edges:
+        indices = idx_dict.get(key)
+        if not indices:
             return []
+        steps = steps_dict[key]
 
         if include_left:
-            # First index with step >= t_min.
-            # bisect_right(t_min - 1) works for integer steps.
-            left = bisect_right(edges, t_min - 1, key=lambda e: e.step)
+            left = bisect_right(steps, t_min - 1)
         else:
-            # First index with step > t_min.
-            left = bisect_right(edges, t_min, key=lambda e: e.step)
+            left = bisect_right(steps, t_min)
 
-        # Last index with step <= t_max.
-        right = bisect_right(edges, t_max, key=lambda e: e.step)
+        right = bisect_right(steps, t_max)
 
-        result = edges[left:right]
+        result_idx = indices[left:right]
 
-        if max_candidates is not None and len(result) > max_candidates:
-            # Keep earliest candidates by temporal order.
-            # Later, this can be replaced by top-K amount/risk selection if needed.
-            result = result[:max_candidates]
+        if max_candidates is not None and len(result_idx) > max_candidates:
+            result_idx = result_idx[:max_candidates]
 
-        return result
+        return self._materialize_edges(result_idx)
 
     def outgoing(
         self,
@@ -1322,7 +1380,8 @@ class TemporalIndex:
         Query src -> ? edges in temporal range.
         """
         return self._range_query(
-            self.out_edges,
+            self._out_idx,
+            self._out_steps,
             src,
             t_min,
             t_max,
@@ -1342,7 +1401,8 @@ class TemporalIndex:
         Query ? -> dst edges in temporal range.
         """
         return self._range_query(
-            self.in_edges,
+            self._in_idx,
+            self._in_steps,
             dst,
             t_min,
             t_max,
@@ -1362,11 +1422,15 @@ class TemporalIndex:
         """
         Query src -> dst edges in temporal range.
         """
-        candidates = self.outgoing(src, t_min, t_max, include_left=include_left)
-        result = [e for e in candidates if e.dst == dst]
-        if max_candidates is not None and len(result) > max_candidates:
-            result = result[:max_candidates]
-        return result
+        return self._range_query(
+            self._pair_idx,
+            self._pair_steps,
+            (src, dst),
+            t_min,
+            t_max,
+            include_left=include_left,
+            max_candidates=max_candidates,
+        )
 
     def stats(self) -> Dict[str, int]:
         """
@@ -1374,8 +1438,8 @@ class TemporalIndex:
         """
         return {
             "num_edges": self.num_edges,
-            "num_src_nodes": len(self.out_edges),
-            "num_dst_nodes": len(self.in_edges),
+            "num_src_nodes": len(self._out_idx),
+            "num_dst_nodes": len(self._in_idx),
             "num_pairs": len(self.pair_count),
         }
 
@@ -1390,11 +1454,11 @@ class TemporalIndex:
         with step in (t_min, t_max].
         Used for cheap return-to-start feasibility checks in cycle DFS.
         """
-        edges = self.out_edges.get(src)
-        if not edges:
+        steps = self._out_steps.get(src)
+        if not steps:
             return False
-        left  = bisect_right(edges, t_min, key=lambda e: e.step)
-        right = bisect_right(edges, t_max, key=lambda e: e.step)
+        left = bisect_right(steps, t_min)
+        right = bisect_right(steps, t_max)
         return right > left
 
     def has_any_pair(
@@ -1409,17 +1473,12 @@ class TemporalIndex:
         with step in (t_min, t_max].
         Used for cheap cycle-close feasibility checks.
         """
-        edges = self.out_edges.get(src)
-        if not edges:
+        steps = self._pair_steps.get((src, dst))
+        if not steps:
             return False
-        left  = bisect_right(edges, t_min, key=lambda e: e.step)
-        right = bisect_right(edges, t_max, key=lambda e: e.step)
-        if right <= left:
-            return False
-        for i in range(left, right):
-            if edges[i].dst == dst:
-                return True
-        return False
+        left = bisect_right(steps, t_min)
+        right = bisect_right(steps, t_max)
+        return right > left
 
     def has_any_incoming(
         self,
@@ -1432,11 +1491,11 @@ class TemporalIndex:
         with step in (t_min, t_max].
         Used for cheap feasibility checks in lookback queries.
         """
-        edges = self.in_edges.get(dst)
-        if not edges:
+        steps = self._in_steps.get(dst)
+        if not steps:
             return False
-        left  = bisect_right(edges, t_min, key=lambda e: e.step)
-        right = bisect_right(edges, t_max, key=lambda e: e.step)
+        left = bisect_right(steps, t_min)
+        right = bisect_right(steps, t_max)
         return right > left
 
 
@@ -1527,7 +1586,6 @@ print("\nCell 7 completed.")
 
 import json
 import math
-import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
 
 def has_unique_edge_ids(edges: List[EdgeRecord]) -> bool:
@@ -2317,8 +2375,111 @@ def make_membership_df_from_motif_rows(
     return pl.concat(membership_dfs)
 
 
+class MatcherOutputBuffer:
+    """
+    Flush matcher outputs into parquet shards so matchers do not retain
+    full-window Python dicts, EdgeRecord lists, or DataFrame chunks in RAM.
+    """
+
+    def __init__(
+        self,
+        pattern: MotifPattern,
+        flush_every_instances: int = MATCHER_OUTPUT_FLUSH_EVERY,
+        spill_to_disk: bool = True,
+    ):
+        self.pattern = pattern
+        self.flush_every_instances = max(1, int(flush_every_instances))
+        self.spill_to_disk = spill_to_disk
+
+        self._motif_rows: List[Dict[str, Any]] = []
+        self._emitted_edges: List[List[EdgeRecord]] = []
+        self._motif_chunks: List[pl.DataFrame] = []
+        self._membership_chunks: List[pl.DataFrame] = []
+        self._motif_chunk_paths: List[str] = []
+        self._membership_chunk_paths: List[str] = []
+        self._spill_dir: Optional[str] = None
+        self._flush_index = 0
+        self.num_instances = 0
+        self.num_membership_rows = 0
+
+    def _ensure_spill_dir(self) -> str:
+        if self._spill_dir is None:
+            self._spill_dir = tempfile.mkdtemp(prefix="matcher_output_")
+        return self._spill_dir
+
+    def add_instance(
+        self,
+        motif_row: Dict[str, Any],
+        edges: List[EdgeRecord],
+    ) -> None:
+        self._motif_rows.append(motif_row)
+        self._emitted_edges.append(edges)
+        self.num_instances += 1
+
+        if len(self._motif_rows) >= self.flush_every_instances:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._motif_rows:
+            return
+
+        motif_df = motif_instance_rows_to_polars(self._motif_rows)
+        membership_df = make_membership_df_from_motif_rows(
+            self._motif_rows,
+            self.pattern,
+            self._emitted_edges,
+        )
+        self.num_membership_rows += int(membership_df.height)
+
+        if self.spill_to_disk:
+            spill_dir = self._ensure_spill_dir()
+            motif_chunk_path = os.path.join(
+                spill_dir,
+                f"motif_chunk_{self._flush_index:06d}.parquet",
+            )
+            membership_chunk_path = os.path.join(
+                spill_dir,
+                f"membership_chunk_{self._flush_index:06d}.parquet",
+            )
+            motif_df.write_parquet(motif_chunk_path)
+            membership_df.write_parquet(membership_chunk_path)
+            self._motif_chunk_paths.append(motif_chunk_path)
+            self._membership_chunk_paths.append(membership_chunk_path)
+            self._flush_index += 1
+        else:
+            self._motif_chunks.append(motif_df)
+            self._membership_chunks.append(membership_df)
+
+        self._motif_rows = []
+        self._emitted_edges = []
+        gc.collect()
+
+    def finalize(self) -> Tuple[pl.DataFrame, pl.DataFrame]:
+        self.flush()
+        try:
+            if self._motif_chunk_paths:
+                motif_df = pl.scan_parquet(self._motif_chunk_paths).collect(streaming=True)
+            elif self._motif_chunks:
+                motif_df = pl.concat(self._motif_chunks, rechunk=False)
+            else:
+                motif_df = motif_instance_rows_to_polars([])
+
+            if self._membership_chunk_paths:
+                membership_df = pl.scan_parquet(self._membership_chunk_paths).collect(streaming=True)
+            elif self._membership_chunks:
+                membership_df = pl.concat(self._membership_chunks, rechunk=False)
+            else:
+                membership_df = membership_rows_to_polars([])
+
+            return motif_df, membership_df
+        finally:
+            if self._spill_dir is not None:
+                shutil.rmtree(self._spill_dir, ignore_errors=True)
+                self._spill_dir = None
+
+
 def write_motif_outputs(
-    motif_rows: List[Dict[str, Any]],
+    motif_rows: Any,
     membership_rows: Any,
     window_id: int,
     motif_type: str,
@@ -2329,7 +2490,11 @@ def write_motif_outputs(
     Write motif_instances and edge_motif_membership parquet shards.
     """
 
-    motif_df = motif_instance_rows_to_polars(motif_rows)
+    if isinstance(motif_rows, pl.DataFrame):
+        motif_df = motif_rows
+    else:
+        motif_df = motif_instance_rows_to_polars(motif_rows)
+
     if isinstance(membership_rows, pl.DataFrame):
         membership_df = membership_rows
     else:

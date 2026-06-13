@@ -156,8 +156,7 @@ class FanMatcher:
             raise ValueError(f"fan pattern needs >= 3 edges, got {n_branches}")
 
         start_time = time.time()
-        motif_rows:      List[Dict] = []
-        emitted_edges:   List[List[EdgeRecord]] = []
+        output_buffer = MatcherOutputBuffer(pattern=pattern)
 
         n_centers_scanned     = 0
         n_centers_skipped_deg = 0
@@ -288,7 +287,7 @@ class FanMatcher:
 
             # Emit the ranked top K
             for rank_idx, (score, edges, node_map, role_map, anchor, ck) in enumerate(top_k_candidates):
-                if len(motif_rows) >= self.max_instances_per_window:
+                if output_buffer.num_instances >= self.max_instances_per_window:
                     break
 
                 seen_canonical_keys.add(ck)
@@ -305,17 +304,15 @@ class FanMatcher:
                         index=index,
                         candidate_rank=rank_idx,
                     )
-                    motif_rows.append(motif_row)
-                    emitted_edges.append(edges)
+                    output_buffer.add_instance(motif_row, edges)
                 except Exception:
                     continue
 
             n_combos_checked += center_combos_count
-            if len(motif_rows) >= self.max_instances_per_window:
+            if output_buffer.num_instances >= self.max_instances_per_window:
                 break
 
-        motif_df      = motif_instance_rows_to_polars(motif_rows)
-        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
+        motif_df, membership_df = output_buffer.finalize()
         elapsed       = time.time() - start_time
 
         max_deg = int(max(scanned_center_degrees)) if scanned_center_degrees else 0
@@ -344,13 +341,13 @@ class FanMatcher:
             "n_rej_anchor":                 int(n_rej_anchor),
             "n_rej_lookback":               int(n_rej_lookback),
             "n_rej_center_cap":             int(n_rej_center_cap),
-            "hit_max_instances_per_window": int(len(motif_rows) >= self.max_instances_per_window),
+            "hit_max_instances_per_window": int(output_buffer.num_instances >= self.max_instances_per_window),
             "elapsed_seconds":              float(elapsed),
         }
 
         if write_output:
             mp, mep = write_motif_outputs(
-                motif_rows, membership_df, window.window_id, pattern.name
+                motif_df, membership_df, window.window_id, pattern.name
             )
             stats["motif_path"]      = mp
             stats["membership_path"] = mep
@@ -532,9 +529,7 @@ class SplitMergeMatcher:
             )
 
         start_time = time.time()
-
-        motif_rows = []
-        emitted_edges = []
+        output_buffer = MatcherOutputBuffer(pattern=pattern)
 
         num_sources_scanned = 0
         num_split_combinations = 0
@@ -773,7 +768,7 @@ class SplitMergeMatcher:
 
             # Emit the ranked top K
             for rank_idx, (score, edges_val, node_map, role_map, anchor) in enumerate(top_k_candidates):
-                if len(motif_rows) >= self.max_instances_per_window:
+                if output_buffer.num_instances >= self.max_instances_per_window:
                     break
 
                 try:
@@ -788,16 +783,14 @@ class SplitMergeMatcher:
                         index=index,
                         candidate_rank=rank_idx,
                     )
-                    motif_rows.append(motif_row)
-                    emitted_edges.append(edges_val)
+                    output_buffer.add_instance(motif_row, edges_val)
                 except Exception:
                     continue
 
-            if len(motif_rows) >= self.max_instances_per_window:
+            if output_buffer.num_instances >= self.max_instances_per_window:
                 break
 
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
+        motif_df, membership_df = output_buffer.finalize()
 
         elapsed = time.time() - start_time
 
@@ -826,14 +819,14 @@ class SplitMergeMatcher:
             "num_rejected_source_cap": int(num_rejected_source_cap),
 
             "hit_max_instances_per_window": int(
-                len(motif_rows) >= self.max_instances_per_window
+                output_buffer.num_instances >= self.max_instances_per_window
             ),
             "elapsed_seconds": float(elapsed),
         }
 
         if write_output:
             motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
+                motif_rows=motif_df,
                 membership_rows=membership_df,
                 window_id=window.window_id,
                 motif_type=pattern.name,
@@ -894,9 +887,7 @@ class CenterInOutMatcher:
             )
 
         start_time = time.time()
-
-        motif_rows = []
-        emitted_edges = []
+        output_buffer = MatcherOutputBuffer(pattern=pattern)
 
         num_centers_scanned = 0
         num_in_combinations_checked = 0
@@ -1125,7 +1116,7 @@ class CenterInOutMatcher:
 
             # Emit the ranked top K
             for rank_idx, (score, edges_val, node_map, role_map, anchor, flow_features) in enumerate(top_k_candidates):
-                if len(motif_rows) >= self.max_instances_per_window:
+                if output_buffer.num_instances >= self.max_instances_per_window:
                     break
 
                 try:
@@ -1142,16 +1133,14 @@ class CenterInOutMatcher:
                     )
                     # Add flow features into motif row.
                     motif_row.update(flow_features)
-                    motif_rows.append(motif_row)
-                    emitted_edges.append(edges_val)
+                    output_buffer.add_instance(motif_row, edges_val)
                 except Exception:
                     continue
 
-            if len(motif_rows) >= self.max_instances_per_window:
+            if output_buffer.num_instances >= self.max_instances_per_window:
                 break
 
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
+        motif_df, membership_df = output_buffer.finalize()
 
         elapsed = time.time() - start_time
 
@@ -1184,14 +1173,14 @@ class CenterInOutMatcher:
             "num_rejected_low_outgoing_for_group": int(num_rejected_low_outgoing_for_group),
 
             "hit_max_instances_per_window": int(
-                len(motif_rows) >= self.max_instances_per_window
+                output_buffer.num_instances >= self.max_instances_per_window
             ),
             "elapsed_seconds": float(elapsed),
         }
 
         if write_output:
             motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
+                motif_rows=motif_df,
                 membership_rows=membership_df,
                 window_id=window.window_id,
                 motif_type=pattern.name,
@@ -1211,7 +1200,7 @@ print("Cell 10 completed.")
 # Cell 11: Cycle matcher, diagnostic only
 # ============================================================
 
-BIDIRECTIONAL_CYCLE_THRESHOLD = 999
+BIDIRECTIONAL_CYCLE_THRESHOLD = 999  # retained for stats compatibility; cycles use forward DFS only
 
 def passes_pairwise_amount_ratio(
     edges: List[EdgeRecord],
@@ -1325,19 +1314,26 @@ class CycleKMatcher:
         )
 
     def _get_primary_edges(self, df_primary: pl.DataFrame) -> List[EdgeRecord]:
-        primary_edges = []
+        edge_ids = df_primary["edge_id"].to_list()
+        srcs = df_primary["src"].to_list()
+        dsts = df_primary["dst"].to_list()
+        steps = df_primary["step"].to_list()
+        amounts = df_primary["amount"].to_list()
+        is_sars = df_primary["is_sar"].to_list()
 
-        for row in df_primary.iter_rows(named=True):
-            primary_edges.append(
-                EdgeRecord(
-                    edge_id=int(row["edge_id"]),
-                    src=int(row["src"]),
-                    dst=int(row["dst"]),
-                    step=int(row["step"]),
-                    amount=float(row["amount"]),
-                    is_sar=int(row["is_sar"]),
-                )
+        primary_edges = [
+            EdgeRecord(
+                edge_id=int(edge_id),
+                src=int(src),
+                dst=int(dst),
+                step=int(step),
+                amount=float(amount),
+                is_sar=int(is_sar),
             )
+            for edge_id, src, dst, step, amount, is_sar in zip(
+                edge_ids, srcs, dsts, steps, amounts, is_sars
+            )
+        ]
 
         primary_edges = sorted(primary_edges, key=lambda e: (e.step, e.edge_id))
 
@@ -1348,8 +1344,7 @@ class CycleKMatcher:
 
     def _emit_cycle_instance(
         self,
-        motif_rows: List[Dict[str, Any]],
-        emitted_edges: List[List[EdgeRecord]],
+        output_buffer: MatcherOutputBuffer,
         window: WindowSpec,
         pattern: MotifPattern,
         edges: List[EdgeRecord],
@@ -1388,8 +1383,7 @@ class CycleKMatcher:
 
             motif_row["amount_consistency"] = compute_amount_consistency(edges)
 
-            motif_rows.append(motif_row)
-            emitted_edges.append(edges)
+            output_buffer.add_instance(motif_row, edges)
 
             return True
 
@@ -1423,12 +1417,12 @@ class CycleKMatcher:
                 f"Got nodes={len(pattern.nodes)}, edges={len(pattern.edges)}."
             )
 
-        use_bidirectional = (k >= BIDIRECTIONAL_CYCLE_THRESHOLD)
+        # Always use the forward DFS path. The bidirectional variant is
+        # disabled because its temporal merge logic is incorrect for cycles.
+        use_bidirectional = False
 
         start_time = time.time()
-
-        motif_rows = []
-        emitted_edges = []
+        output_buffer = MatcherOutputBuffer(pattern=pattern)
 
         num_anchor_edges = 0
         num_dfs_expansions = 0
@@ -1449,228 +1443,61 @@ class CycleKMatcher:
         primary_edges = self._get_primary_edges(df_primary)
         cycle_branching = self._get_cycle_branching(k)
 
-        # ============================================================
-        # Branch 1: Bidirectional search for long cycles
-        # ============================================================
-        if use_bidirectional:
-            bidi_searcher = BidirectionalCycleSearch(
-                max_branching=cycle_branching,
-                delta_hop=self.delta_hop,
-                candidate_policy=self.candidate_policy,
-                amount_min=self.amount_min,
-                max_instances_per_window=self.max_instances_per_window,
-            )
+        for anchor_edge in primary_edges:
+            num_anchor_edges += 1
 
-            all_cycle_edge_lists = bidi_searcher.search_all_windows(
-                df_primary=df_primary,
-                index=index,
-                pattern=pattern,
-                window=window,
-            )
+            if not is_edge_in_primary_window(anchor_edge, window):
+                num_rejected_anchor += 1
+                continue
 
-            num_anchor_edges = int(df_primary.height)
+            if self.amount_min is not None and anchor_edge.amount < self.amount_min:
+                num_rejected_amount += 1
+                continue
 
-            for cycle_edges in all_cycle_edge_lists:
-                if len(motif_rows) >= self.max_instances_per_window:
+            start_node = int(anchor_edge.src)
+            second_node = int(anchor_edge.dst)
+
+            if start_node == second_node:
+                num_rejected_nodes += 1
+                continue
+
+            stack = [
+                (
+                    [anchor_edge],
+                    [start_node, second_node],
+                )
+            ]
+
+            while stack:
+                path_edges, path_nodes = stack.pop()
+
+                if output_buffer.num_instances >= self.max_instances_per_window:
                     break
 
-                edges = list(cycle_edges)
-                num_paths_checked += 1
+                anchor_key = (anchor_edge.step, anchor_edge.edge_id)
 
-                if len(edges) != k:
-                    num_rejected_nodes += 1
-                    continue
-
-                if not has_unique_edge_ids(edges):
-                    num_rejected_duplicate_edge += 1
-                    continue
-
-                if not is_within_total_duration(edges, pattern.max_duration):
-                    num_rejected_duration += 1
-                    continue
-
-                anchor_edge = edges[0]
-
-                if self.amount_min is not None:
-                    if any(e.amount < self.amount_min for e in edges):
-                        num_rejected_amount += 1
-                        continue
-
-                if not is_edge_in_primary_window(anchor_edge, window):
-                    num_rejected_anchor += 1
-                    continue
-
-                earliest_edge = min(edges, key=lambda e: (e.step, e.edge_id))
-                if earliest_edge.edge_id != anchor_edge.edge_id:
+                if any((e.step, e.edge_id) < anchor_key for e in path_edges[1:]):
                     num_rejected_canonical += 1
+                    num_pruned_by_canonical_rotation += 1
                     continue
 
-                path_nodes = [int(edges[0].src)]
-                for e in edges[:-1]:
-                    path_nodes.append(int(e.dst))
+                remaining_hops = k - len(path_edges)
 
-                if not has_distinct_nodes(path_nodes):
-                    num_rejected_nodes += 1
+                if not remaining_hops_feasible(
+                    current_step=path_edges[-1].step,
+                    anchor_step=path_edges[0].step,
+                    max_duration=pattern.max_duration,
+                    remaining_hops=remaining_hops,
+                    delta_hop=self.delta_hop,
+                ):
+                    num_rejected_duration += 1
+                    num_pruned_by_hop_budget += 1
                     continue
 
-                if int(edges[-1].dst) != int(edges[0].src):
-                    num_rejected_nodes += 1
-                    continue
+                current_edge = path_edges[-1]
+                current_node = path_nodes[-1]
 
-                if self.use_amount_ratio:
-                    if not passes_pairwise_amount_ratio(
-                        edges,
-                        pattern.amount_ratio_min,
-                        pattern.amount_ratio_max,
-                    ):
-                        num_rejected_amount += 1
-                        continue
-
-                emitted = self._emit_cycle_instance(
-                    motif_rows=motif_rows,
-                    emitted_edges=emitted_edges,
-                    window=window,
-                    pattern=pattern,
-                    edges=edges,
-                    anchor_edge=anchor_edge,
-                    k=k,
-                    validate=True,
-                )
-
-        # ============================================================
-        # Branch 2: DFS search for short cycles
-        # ============================================================
-        else:
-            for anchor_edge in primary_edges:
-                num_anchor_edges += 1
-
-                if not is_edge_in_primary_window(anchor_edge, window):
-                    num_rejected_anchor += 1
-                    continue
-
-                if self.amount_min is not None and anchor_edge.amount < self.amount_min:
-                    num_rejected_amount += 1
-                    continue
-
-                start_node = int(anchor_edge.src)
-                second_node = int(anchor_edge.dst)
-
-                if start_node == second_node:
-                    num_rejected_nodes += 1
-                    continue
-
-                stack = [
-                    (
-                        [anchor_edge],
-                        [start_node, second_node],
-                    )
-                ]
-
-                while stack:
-                    path_edges, path_nodes = stack.pop()
-
-                    if len(motif_rows) >= self.max_instances_per_window:
-                        break
-
-                    anchor_key = (anchor_edge.step, anchor_edge.edge_id)
-
-                    if any((e.step, e.edge_id) < anchor_key for e in path_edges[1:]):
-                        num_rejected_canonical += 1
-                        num_pruned_by_canonical_rotation += 1
-                        continue
-
-                    remaining_hops = k - len(path_edges)
-
-                    if not remaining_hops_feasible(
-                        current_step=path_edges[-1].step,
-                        anchor_step=path_edges[0].step,
-                        max_duration=pattern.max_duration,
-                        remaining_hops=remaining_hops,
-                        delta_hop=self.delta_hop,
-                    ):
-                        num_rejected_duration += 1
-                        num_pruned_by_hop_budget += 1
-                        continue
-
-                    current_edge = path_edges[-1]
-                    current_node = path_nodes[-1]
-
-                    if len(path_edges) == k - 1:
-                        t_min = current_edge.step
-
-                        if self.delta_hop is not None:
-                            t_max = min(
-                                current_edge.step + self.delta_hop,
-                                path_edges[0].step + pattern.max_duration,
-                            )
-                        else:
-                            t_max = path_edges[0].step + pattern.max_duration
-
-                        close_candidates = index.pair(
-                            src=current_node,
-                            dst=start_node,
-                            t_min=t_min,
-                            t_max=t_max,
-                            include_left=False,
-                        )
-
-                        close_candidates = self._filter_candidates(
-                            close_candidates,
-                            pattern=pattern,
-                        )
-                        num_close_queries += 1
-
-                        for close_edge in close_candidates:
-                            if len(motif_rows) >= self.max_instances_per_window:
-                                break
-
-                            edges = path_edges + [close_edge]
-                            num_paths_checked += 1
-
-                            if not has_unique_edge_ids(edges):
-                                num_rejected_duplicate_edge += 1
-                                continue
-
-                            if not is_within_total_duration(edges, pattern.max_duration):
-                                num_rejected_duration += 1
-                                continue
-
-                            if not has_distinct_nodes(path_nodes):
-                                num_rejected_nodes += 1
-                                continue
-
-                            earliest_edge = min(edges, key=lambda e: (e.step, e.edge_id))
-
-                            if earliest_edge.edge_id != anchor_edge.edge_id:
-                                num_rejected_canonical += 1
-                                continue
-
-                            if not is_edge_in_primary_window(anchor_edge, window):
-                                num_rejected_anchor += 1
-                                continue
-
-                            if self.use_amount_ratio:
-                                if not passes_pairwise_amount_ratio(
-                                    edges,
-                                    pattern.amount_ratio_min,
-                                    pattern.amount_ratio_max,
-                                ):
-                                    num_rejected_amount += 1
-                                    continue
-
-                            emitted = self._emit_cycle_instance(
-                                motif_rows=motif_rows,
-                                emitted_edges=emitted_edges,
-                                window=window,
-                                pattern=pattern,
-                                edges=edges,
-                                anchor_edge=anchor_edge,
-                                k=k,
-                                validate=True,
-                            )
-
-                        continue
-
+                if len(path_edges) == k - 1:
                     t_min = current_edge.step
 
                     if self.delta_hop is not None:
@@ -1681,80 +1508,153 @@ class CycleKMatcher:
                     else:
                         t_max = path_edges[0].step + pattern.max_duration
 
-                    next_candidates = index.outgoing(
+                    close_candidates = index.pair(
                         src=current_node,
+                        dst=start_node,
                         t_min=t_min,
                         t_max=t_max,
                         include_left=False,
                     )
 
-                    next_candidates = self._filter_candidates(
-                        next_candidates,
+                    close_candidates = self._filter_candidates(
+                        close_candidates,
                         pattern=pattern,
                     )
+                    num_close_queries += 1
 
-                    for next_edge in reversed(next_candidates):
-                        if len(motif_rows) >= self.max_instances_per_window:
+                    for close_edge in close_candidates:
+                        if output_buffer.num_instances >= self.max_instances_per_window:
                             break
 
-                        next_node = int(next_edge.dst)
+                        edges = path_edges + [close_edge]
+                        num_paths_checked += 1
 
-                        if next_node in path_nodes:
-                            num_rejected_nodes += 1
-                            continue
-
-                        if next_node == start_node:
-                            num_rejected_nodes += 1
-                            continue
-
-                        new_edges = path_edges + [next_edge]
-
-                        if not has_unique_edge_ids(new_edges):
+                        if not has_unique_edge_ids(edges):
                             num_rejected_duplicate_edge += 1
                             continue
 
-                        if not is_within_total_duration(new_edges, pattern.max_duration):
+                        if not is_within_total_duration(edges, pattern.max_duration):
                             num_rejected_duration += 1
                             continue
 
-                        if len(new_edges) >= k - 1:
-                            time_budget = (
-                                path_edges[0].step + pattern.max_duration
-                                - next_edge.step
-                            )
+                        if not has_distinct_nodes(path_nodes):
+                            num_rejected_nodes += 1
+                            continue
 
-                            if time_budget < 0:
-                                num_rejected_duration += 1
-                                continue
+                        earliest_edge = min(edges, key=lambda e: (e.step, e.edge_id))
 
-                            if self.delta_hop is not None:
-                                max_return_step = next_edge.step + min(
-                                    self.delta_hop,
-                                    time_budget,
-                                )
-                            else:
-                                max_return_step = next_edge.step + time_budget
+                        if earliest_edge.edge_id != anchor_edge.edge_id:
+                            num_rejected_canonical += 1
+                            continue
 
-                            if not index.has_any_pair(
-                                src=next_node,
-                                dst=start_node,
-                                t_min=next_edge.step,
-                                t_max=max_return_step,
+                        if not is_edge_in_primary_window(anchor_edge, window):
+                            num_rejected_anchor += 1
+                            continue
+
+                        if self.use_amount_ratio:
+                            if not passes_pairwise_amount_ratio(
+                                edges,
+                                pattern.amount_ratio_min,
+                                pattern.amount_ratio_max,
                             ):
-                                num_rejected_nodes += 1
-                                num_pruned_by_return_feasibility += 1
+                                num_rejected_amount += 1
                                 continue
 
-                        new_nodes = path_nodes + [next_node]
+                        self._emit_cycle_instance(
+                            output_buffer=output_buffer,
+                            window=window,
+                            pattern=pattern,
+                            edges=edges,
+                            anchor_edge=anchor_edge,
+                            k=k,
+                            validate=True,
+                        )
 
-                        stack.append((new_edges, new_nodes))
-                        num_dfs_expansions += 1
+                    continue
 
-                if len(motif_rows) >= self.max_instances_per_window:
-                    break
+                t_min = current_edge.step
 
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = make_membership_df_from_motif_rows(motif_rows, pattern, emitted_edges)
+                if self.delta_hop is not None:
+                    t_max = min(
+                        current_edge.step + self.delta_hop,
+                        path_edges[0].step + pattern.max_duration,
+                    )
+                else:
+                    t_max = path_edges[0].step + pattern.max_duration
+
+                next_candidates = index.outgoing(
+                    src=current_node,
+                    t_min=t_min,
+                    t_max=t_max,
+                    include_left=False,
+                )
+
+                next_candidates = self._filter_candidates(
+                    next_candidates,
+                    pattern=pattern,
+                )
+
+                for next_edge in reversed(next_candidates):
+                    if output_buffer.num_instances >= self.max_instances_per_window:
+                        break
+
+                    next_node = int(next_edge.dst)
+
+                    if next_node in path_nodes:
+                        num_rejected_nodes += 1
+                        continue
+
+                    if next_node == start_node:
+                        num_rejected_nodes += 1
+                        continue
+
+                    new_edges = path_edges + [next_edge]
+
+                    if not has_unique_edge_ids(new_edges):
+                        num_rejected_duplicate_edge += 1
+                        continue
+
+                    if not is_within_total_duration(new_edges, pattern.max_duration):
+                        num_rejected_duration += 1
+                        continue
+
+                    if len(new_edges) >= k - 1:
+                        time_budget = (
+                            path_edges[0].step + pattern.max_duration
+                            - next_edge.step
+                        )
+
+                        if time_budget < 0:
+                            num_rejected_duration += 1
+                            continue
+
+                        if self.delta_hop is not None:
+                            max_return_step = next_edge.step + min(
+                                self.delta_hop,
+                                time_budget,
+                            )
+                        else:
+                            max_return_step = next_edge.step + time_budget
+
+                        if not index.has_any_pair(
+                            src=next_node,
+                            dst=start_node,
+                            t_min=next_edge.step,
+                            t_max=max_return_step,
+                        ):
+                            num_rejected_nodes += 1
+                            num_pruned_by_return_feasibility += 1
+                            continue
+
+                    new_nodes = path_nodes + [next_node]
+
+                    stack.append((new_edges, new_nodes))
+                    num_dfs_expansions += 1
+
+            if output_buffer.num_instances >= self.max_instances_per_window:
+                break
+
+        motif_df, membership_df = output_buffer.finalize()
 
         elapsed = time.time() - start_time
 
@@ -1794,14 +1694,14 @@ class CycleKMatcher:
             "num_pruned_by_canonical_rotation": int(num_pruned_by_canonical_rotation),
 
             "hit_max_instances_per_window": int(
-                len(motif_rows) >= self.max_instances_per_window
+                output_buffer.num_instances >= self.max_instances_per_window
             ),
             "elapsed_seconds": float(elapsed),
         }
 
         if write_output:
             motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
+                motif_rows=motif_df,
                 membership_rows=membership_df,
                 window_id=window.window_id,
                 motif_type=pattern.name,

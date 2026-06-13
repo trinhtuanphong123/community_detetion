@@ -94,6 +94,9 @@ def run_matchers_over_windows(
                     "status": "skipped_empty_primary",
                     "elapsed_seconds": 0.0,
                 })
+            del df_primary
+            del df_extended
+            gc.collect()
             continue
 
         if df_extended.height == 0:
@@ -106,6 +109,9 @@ def run_matchers_over_windows(
                     "status": "skipped_empty_extended",
                     "elapsed_seconds": 0.0,
                 })
+            del df_primary
+            del df_extended
+            gc.collect()
             continue
 
         index_start_time = time.time()
@@ -210,7 +216,16 @@ def run_matchers_over_windows(
 
         if 'temporal_index' in locals():
             del temporal_index
-            gc.collect()
+        del df_primary
+        del df_extended
+        gc.collect()
+
+        try:
+            import psutil
+            ram_mb = psutil.Process(os.getpid()).memory_info().rss / 1e6
+            print(f"  RAM after window {w_id}: {ram_mb:.0f} MB")
+        except ImportError:
+            pass
 
     # Aggregate and return stats
     if len(stats_rows) == 0:
@@ -464,18 +479,16 @@ def build_edge_participation_summary(
         motif_types_list, roles_list,
         + all original df_edges columns (joined)
     """
-    paths  = sorted(Path(membership_dir).glob("**/*.parquet"))
-    shards = [pl.read_parquet(p) for p in paths if p.stat().st_size > 0]
+    paths = sorted(Path(membership_dir).glob("**/*.parquet"))
+    valid_paths = [str(p) for p in paths if p.stat().st_size > 0]
 
-    if not shards:
+    if not valid_paths:
         print("No membership shards found.")
         return df_edges
 
-    df_membership = pl.concat(shards)
-    df_membership = df_membership.unique(subset=["edge_id", "motif_instance_id"])
-
     summary = (
-        df_membership
+        pl.scan_parquet(valid_paths)
+        .unique(subset=["edge_id", "motif_instance_id"])
         .group_by("edge_id")
         .agg([
             pl.col("motif_instance_id").n_unique().alias("num_motif_instances"),
@@ -483,6 +496,7 @@ def build_edge_participation_summary(
             pl.col("motif_type").unique().alias("motif_types_list"),
             pl.col("role_in_motif").unique().alias("roles_list"),
         ])
+        .collect(streaming=True)
     )
 
     result = df_edges.join(summary, on="edge_id", how="left")
@@ -810,8 +824,12 @@ AUTO_RUN_EVALUATION = False
 if AUTO_RUN_EVALUATION and 'df_motif_deduped' in globals() and 'df_edges' in globals():
     # RUN_ID and CURRENT_RUN_MEMBERSHIP_DIR are inherited from Cell 16 globals
     print(f"Running evaluation on '{RUN_ID}' outputs...")
-    df_all_members = pl.read_parquet(CURRENT_RUN_MEMBERSHIP_DIR + "/**/*.parquet")
-    df_deduped_members = df_all_members.filter(pl.col("motif_instance_id").is_in(df_motif_deduped["motif_instance_id"]))
+    deduped_instance_ids = df_motif_deduped["motif_instance_id"].to_list()
+    df_deduped_members = (
+        pl.scan_parquet(CURRENT_RUN_MEMBERSHIP_DIR + "/**/*.parquet")
+        .filter(pl.col("motif_instance_id").is_in(deduped_instance_ids))
+        .collect(streaming=True)
+    )
     motif_family_eval, window_eval, top_instances_by_score, top_instances_by_sar_ratio = evaluate_motif_performance(
         df_edges=df_edges,
         df_motifs=df_motif_deduped,
