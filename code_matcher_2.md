@@ -1,2208 +1,414 @@
 # ============================================================
-# Cell 12: Common Helpers for Complex Motif Matchers
+# Cell 13: Runner and orchestration
 # ============================================================
 
-from itertools import product
+import os
+import gc
+import time
+import traceback
+import polars as pl
+from typing import List, Dict, Any, Optional, Tuple
 
-
-def is_strictly_after(e_next: EdgeRecord, e_prev: EdgeRecord) -> bool:
-    return e_next.step > e_prev.step
-
-
-def is_within_delta_hop(e_next: EdgeRecord, e_prev: EdgeRecord, delta_hop: int) -> bool:
-    return 0 < (e_next.step - e_prev.step) <= delta_hop
-
-
-def is_within_total_duration(edges: List[EdgeRecord], max_duration: int) -> bool:
-    steps = [e.step for e in edges]
-    return (max(steps) - min(steps)) <= max_duration
-
-
-def has_unique_edge_ids(edges: List[EdgeRecord]) -> bool:
-    edge_ids = [e.edge_id for e in edges]
-    return len(edge_ids) == len(set(edge_ids))
-
-
-def has_distinct_nodes(node_values: List[int]) -> bool:
-    return len(node_values) == len(set(node_values))
-
-
-def passes_pairwise_amount_ratio(
-    edges: List[EdgeRecord],
-    ratio_min: Optional[float],
-    ratio_max: Optional[float],
-) -> bool:
+def run_matchers_over_windows(
+    df_edges: pl.DataFrame,
+    windows: List[WindowSpec],
+    patterns_to_run: Optional[List[MotifPattern]] = None,
+    matcher_registry: Optional[Dict[str, Any]] = None,
+    run_mode: str = "production",
+    max_windows: Optional[int] = None,
+    skip_existing: bool = True,
+    write_empty_outputs: bool = True,
+    pattern_group: Optional[str] = None,
+) -> pl.DataFrame:
     """
-    Check adjacent amount ratios in the given edge order.
-
-    This is optional and should be used carefully.
-    For initial exploration, matchers below allow turning this off.
+    Orchestrates the running of motif matchers over temporal windows.
+    Supports debug, validation, and production modes, failure isolation,
+    and structured output directory partitioning.
     """
-    if ratio_min is None or ratio_max is None:
-        return True
-
-    for i in range(len(edges) - 1):
-        prev_amount = edges[i].amount
-        curr_amount = edges[i + 1].amount
-
-        if prev_amount <= 0:
-            return False
-
-        ratio = curr_amount / prev_amount
-
-        if ratio < ratio_min or ratio > ratio_max:
-            return False
-
-    return True
-def passes_consecutive_step_gap(
-    edges: List[EdgeRecord],
-    max_gap: Optional[int],
-) -> bool:
-    """
-    Check whether consecutive edges after sorting are close enough in time.
-    """
-    if max_gap is None:
-        return True
-
-    if len(edges) <= 1:
-        return True
-
-    edges_sorted = sorted(edges, key=lambda e: (e.step, e.edge_id))
-    steps = [int(e.step) for e in edges_sorted]
-
-    for i in range(len(steps) - 1):
-        if steps[i + 1] - steps[i] > max_gap:
-            return False
-
-    return True
-
-
-def phase_gap_ok(
-    earlier_edges: List[EdgeRecord],
-    later_edges: List[EdgeRecord],
-    max_gap: Optional[int],
-) -> bool:
-    """
-    Check whether the later phase starts soon after the earlier phase ends.
-    """
-    if max_gap is None:
-        return True
-
-    if len(earlier_edges) == 0 or len(later_edges) == 0:
-        return False
-
-    earlier_end = max(int(e.step) for e in earlier_edges)
-    later_start = min(int(e.step) for e in later_edges)
-
-    return 0 < (later_start - earlier_end) <= max_gap
-
-def select_edges_by_hybrid_policy(
-    edges: List[EdgeRecord],
-    max_candidates: int,
-    early_ratio: float = 0.5,
-) -> List[EdgeRecord]:
-    """
-    Hybrid candidate selection:
-        keep part earliest edges and part largest-amount edges.
-
-    This is safer than earliest-only for AML because it keeps both temporal
-    coverage and high-value transactions.
-    """
-    if max_candidates is None or len(edges) <= max_candidates:
-        return sorted(edges, key=lambda e: (e.step, e.edge_id))
-
-    k_early = int(max_candidates * early_ratio)
-    k_amount = max_candidates - k_early
-
-    earliest_edges = sorted(edges, key=lambda e: (e.step, e.edge_id))[:k_early]
-    top_amount_edges = sorted(edges, key=lambda e: (-e.amount, e.step, e.edge_id))[:k_amount]
-
-    selected = {}
-    for e in earliest_edges + top_amount_edges:
-        selected[e.edge_id] = e
-
-    if len(selected) < max_candidates:
-        for e in sorted(edges, key=lambda e: (e.step, e.edge_id)):
-            selected[e.edge_id] = e
-            if len(selected) >= max_candidates:
-                break
-
-    return sorted(selected.values(), key=lambda e: (e.step, e.edge_id))
-
-
-def cap_edges(
-    edges: List[EdgeRecord],
-    max_candidates: int,
-    policy: str = "hybrid",
-) -> List[EdgeRecord]:
-    """
-    Candidate cap wrapper.
-
-    Supported policies:
-        earliest
-        top_amount
-        hybrid
-    """
-    if max_candidates is None or len(edges) <= max_candidates:
-        return sorted(edges, key=lambda e: (e.step, e.edge_id))
-
-    if policy == "earliest":
-        return sorted(edges, key=lambda e: (e.step, e.edge_id))[:max_candidates]
-
-    if policy == "top_amount":
-        selected = sorted(edges, key=lambda e: (-e.amount, e.step, e.edge_id))[:max_candidates]
-        return sorted(selected, key=lambda e: (e.step, e.edge_id))
-
-    if policy == "hybrid":
-        return select_edges_by_hybrid_policy(edges, max_candidates=max_candidates, early_ratio=0.5)
-
-    raise ValueError(f"Unknown candidate selection policy: {policy}")
-
-
-def create_empty_matcher_stats(
-    window: WindowSpec,
-    pattern: MotifPattern,
-    df_primary: pl.DataFrame,
-    df_extended: pl.DataFrame,
-    start_time: float,
-) -> Dict[str, Any]:
-    elapsed = time.time() - start_time
-
-    return {
-        "window_id": int(window.window_id),
-        "motif_type": pattern.name,
-        "matcher_type": pattern.matcher_type,
-        "primary_start": int(window.primary_start),
-        "primary_end": int(window.primary_end),
-        "extended_start": int(window.extended_start),
-        "extended_end": int(window.extended_end),
-        "primary_num_edges": int(df_primary.height),
-        "extended_num_edges": int(df_extended.height),
-        "num_instances": 0,
-        "num_membership_rows": 0,
-        "hit_max_instances_per_window": 0,
-        "elapsed_seconds": float(elapsed),
-    }
-
-def remaining_hops_feasible(
-    current_step:    int,
-    anchor_step:     int,
-    max_duration:    int,
-    remaining_hops:  int,
-    delta_hop:       Optional[int],
-) -> bool:
-    """
-    Guard A for cycle DFS: check whether the remaining hops can still fit
-    within the time budget.
-
-    time_used    = current_step - anchor_step
-    time_budget  = max_duration - time_used
-
-    If delta_hop is set, each hop costs at least 1 step.
-    So we need time_budget >= remaining_hops (minimum 1 step per hop).
-
-    If delta_hop is None, only max_duration applies; this check is trivially True.
-    """
-    if delta_hop is None:
-        return True
-    time_used   = current_step - anchor_step
-    time_budget = max_duration - time_used
-    return time_budget >= remaining_hops
-
-print("Cell 12 completed.")
-
-
-
-
-
-
-
-# ============================================================
-# Cell 13: CycleKMatcher
-# ============================================================
-# General matcher for directed temporal cycles:
-#   cycle_k: v1 -> v2 -> ... -> vk -> v1
-#
-# Supports:
-#   cycle_5, cycle_6, ..., cycle_12
-#
-# Dispatch policy:
-#   - For k < BIDIRECTIONAL_CYCLE_THRESHOLD: use DFS with Guards A, B, C.
-#   - For k >= BIDIRECTIONAL_CYCLE_THRESHOLD: use BidirectionalCycleSearch.
-#
-# Changes in this version:
-#   1. max_branching is selected by cycle length k using CYCLE_MAX_BRANCHING.
-#   2. amount_consistency is computed as min(amount) / max(amount)
-#      and stored in each motif_row.
-#
-# Important:
-#   Long cycles are much more expensive than cycle_5.
-#   Use tight max_branching and max_instances_per_window.
-
-
-def compute_amount_consistency(edges: List[EdgeRecord]) -> float:
-    """
-    Measure amount consistency inside one cycle instance.
-
-    Definition:
-        amount_consistency = min_positive_amount / max_positive_amount
-
-    Interpretation:
-        - close to 1.0: amounts are highly consistent
-        - close to 0.0: amounts are very different
-
-    This is NOT used as a hard filter.
-    It is stored in motif_row for later ranking or analysis.
-    """
-    amounts = [float(e.amount) for e in edges if float(e.amount) > 0]
-
-    if not amounts:
-        return 0.0
-
-    max_amount = max(amounts)
-    if max_amount <= 0:
-        return 0.0
-
-    return float(min(amounts) / max_amount)
-
-
-class CycleKMatcher:
-    """
-    Generalized matcher for path_cycle motifs.
-
-    Pattern:
-        v1 -> v2 -> ... -> vk -> v1
-
-    Strategy:
-        1. Anchor on primary edge e1: v1 -> v2.
-        2. If cycle length is small, use forward DFS.
-        3. If cycle length is large, dispatch to bidirectional search.
-        4. Enforce strict temporal order.
-        5. Enforce distinct intermediate nodes.
-        6. Enforce total duration.
-        7. Use canonical anchor to reduce duplicate cycle rotations.
-        8. Store amount_consistency for post-hoc ranking.
-    """
-
-    def __init__(
-        self,
-        max_branching: int = 5,
-        branching_schedule: Optional[Dict[int, int]] = None,
-        max_instances_per_window: int = 20_000,
-        amount_min: Optional[float] = None,
-        use_amount_ratio: bool = False,
-        candidate_policy: str = "hybrid",
-        delta_hop: Optional[int] = DELTA_HOP,
-        max_anchors_per_window: Optional[int] = None,
-    ):
-        # Fallback branching value if k is not found in branching_schedule.
-        self.max_branching = int(max_branching)
-
-        # k -> max_branching, for example:
-        # {5: 8, 6: 6, 7: 5, 8: 4, 9: 4, 10: 4}
-        self.branching_schedule = branching_schedule or {}
-
-        self.max_instances_per_window = max_instances_per_window
-        self.amount_min = amount_min
-        self.use_amount_ratio = use_amount_ratio
-        self.candidate_policy = candidate_policy
-        self.delta_hop = delta_hop
-        self.max_anchors_per_window = max_anchors_per_window
-
-    def _get_cycle_branching(self, k: int) -> int:
-        """
-        Get max_branching according to cycle length k.
-
-        If k is not present in branching_schedule, fall back to self.max_branching.
-        """
-        return int(self.branching_schedule.get(k, self.max_branching))
-
-    def _filter_candidates(
-        self,
-        edges: List[EdgeRecord],
-        pattern: MotifPattern,
-    ) -> List[EdgeRecord]:
-        """
-        Apply amount filter and candidate cap.
-
-        Important:
-            pattern is passed in so this method can read k = len(pattern.edges).
-        """
-        if self.amount_min is not None:
-            edges = [e for e in edges if e.amount >= self.amount_min]
-
-        k = len(pattern.edges)
-        branching = self._get_cycle_branching(k)
-
-        return cap_edges(
-            edges,
-            branching,
-            policy=self.candidate_policy,
-        )
-
-    def _get_primary_edges(self, df_primary: pl.DataFrame) -> List[EdgeRecord]:
-        """
-        Convert primary window edges to EdgeRecord list.
-        """
-        primary_edges = []
-
-        for row in df_primary.iter_rows(named=True):
-            primary_edges.append(
-                EdgeRecord(
-                    edge_id=int(row["edge_id"]),
-                    src=int(row["src"]),
-                    dst=int(row["dst"]),
-                    step=int(row["step"]),
-                    amount=float(row["amount"]),
-                    is_sar=int(row["is_sar"]),
-                )
-            )
-
-        primary_edges = sorted(primary_edges, key=lambda e: (e.step, e.edge_id))
-
-        if self.max_anchors_per_window is not None:
-            primary_edges = primary_edges[: self.max_anchors_per_window]
-
-        return primary_edges
-
-    def _emit_cycle_instance(
-        self,
-        motif_rows: List[Dict[str, Any]],
-        membership_rows: List[Dict[str, Any]],
-        window: WindowSpec,
-        pattern: MotifPattern,
-        edges: List[EdgeRecord],
-        anchor_edge: EdgeRecord,
-        k: int,
-        validate: bool = True,
-    ) -> bool:
-        """
-        Build node_map, role_map, motif row, and membership rows for one cycle.
-
-        Returns:
-            True if an instance is emitted.
-            False if output construction fails.
-        """
-        try:
-            # Cycle edge order:
-            #   edges[0]: v1 -> v2
-            #   edges[1]: v2 -> v3
-            #   ...
-            #   edges[k-1]: vk -> v1
-            #
-            # Therefore node sequence is:
-            #   v1 = edges[0].src
-            #   v2 = edges[0].dst
-            #   v3 = edges[1].dst
-            #   ...
-            #   vk = edges[k-2].dst
-            path_nodes = [int(edges[0].src)]
-
-            for e in edges[:-1]:
-                path_nodes.append(int(e.dst))
-
-            if len(path_nodes) != k:
-                return False
-
-            node_map = {
-                f"v{i + 1}": int(node_id)
-                for i, node_id in enumerate(path_nodes)
-            }
-
-            role_map = {
-                pattern.edges[i].role: int(edges[i].edge_id)
-                for i in range(k)
-            }
-
-            motif_row = make_motif_instance_row(
-                window_id=window.window_id,
-                pattern=pattern,
-                edges=edges,
-                node_map=node_map,
-                role_map=role_map,
-                anchor_edge_id=anchor_edge.edge_id,
-                validate=validate,
-            )
-
-            # New field:
-            # Store amount consistency for later ranking or filtering.
-            motif_row["amount_consistency"] = compute_amount_consistency(edges)
-
-            membership = make_edge_motif_membership_rows(
-                motif_row=motif_row,
-                pattern=pattern,
-                edges=edges,
-            )
-
-            motif_rows.append(motif_row)
-            membership_rows.extend(membership)
-
-            return True
-
-        except Exception:
-            return False
-
-    def match(
-        self,
-        df_primary: pl.DataFrame,
-        df_extended: pl.DataFrame,
-        index: TemporalIndex,
-        window: WindowSpec,
-        pattern: MotifPattern,
-        write_output: bool = False,
-    ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
-
-        if pattern.matcher_type != "path_cycle":
-            raise ValueError(
-                f"CycleKMatcher expects matcher_type='path_cycle'. "
-                f"Got {pattern.matcher_type}"
-            )
-
-        k = len(pattern.edges)
-
-        if k < 3:
-            raise ValueError(f"Cycle pattern must have at least 3 edges. Got {k}.")
-
-        if len(pattern.nodes) != k:
-            raise ValueError(
-                f"Cycle pattern {pattern.name} should have same number of nodes and edges. "
-                f"Got nodes={len(pattern.nodes)}, edges={len(pattern.edges)}."
-            )
-
-        # ------------------------------------------------------------
-        # Dispatch decision
-        # ------------------------------------------------------------
-        use_bidirectional = (k >= BIDIRECTIONAL_CYCLE_THRESHOLD)
-
-        start_time = time.time()
-
-        motif_rows = []
-        membership_rows = []
-
-        num_anchor_edges = 0
-        num_dfs_expansions = 0
-        num_close_queries = 0
-        num_paths_checked = 0
-
-        num_rejected_nodes = 0
-        num_rejected_duration = 0
-        num_rejected_anchor = 0
-        num_rejected_amount = 0
-        num_rejected_duplicate_edge = 0
-        num_rejected_canonical = 0
-
-        num_pruned_by_hop_budget = 0
-        num_pruned_by_return_feasibility = 0
-        num_pruned_by_canonical_rotation = 0
-
-        primary_edges = self._get_primary_edges(df_primary)
-
-        # Select max_branching for this specific cycle length k.
-        cycle_branching = self._get_cycle_branching(k)
-
-        # ============================================================
-        # Branch 1: Bidirectional search for long cycles
-        # ============================================================
-        if use_bidirectional:
-            bidi_searcher = BidirectionalCycleSearch(
-                max_branching=cycle_branching,
-                delta_hop=self.delta_hop,
-                candidate_policy=self.candidate_policy,
-                amount_min=self.amount_min,
-                max_instances_per_window=self.max_instances_per_window,
-            )
-
-            all_cycle_edge_lists = bidi_searcher.search_all_windows(
-                df_primary=df_primary,
-                index=index,
-                pattern=pattern,
-                window=window,
-            )
-
-            # Approximate anchor count if BidirectionalCycleSearch does not expose stats.
-            num_anchor_edges = int(df_primary.height)
-
-            for cycle_edges in all_cycle_edge_lists:
-                if len(motif_rows) >= self.max_instances_per_window:
-                    break
-
-                edges = list(cycle_edges)
-                num_paths_checked += 1
-
-                if len(edges) != k:
-                    num_rejected_nodes += 1
-                    continue
-
-                if not has_unique_edge_ids(edges):
-                    num_rejected_duplicate_edge += 1
-                    continue
-
-                if not is_within_total_duration(edges, pattern.max_duration):
-                    num_rejected_duration += 1
-                    continue
-
-                anchor_edge = edges[0]
-
-                if self.amount_min is not None:
-                    if any(e.amount < self.amount_min for e in edges):
-                        num_rejected_amount += 1
-                        continue
-
-                if not is_edge_in_primary_window(anchor_edge, window):
-                    num_rejected_anchor += 1
-                    continue
-
-                earliest_edge = min(edges, key=lambda e: (e.step, e.edge_id))
-                if earliest_edge.edge_id != anchor_edge.edge_id:
-                    num_rejected_canonical += 1
-                    continue
-
-                # Reconstruct path nodes:
-                # edges[0]: v1 -> v2
-                # edges[1]: v2 -> v3
-                # ...
-                # edges[-1]: vk -> v1
-                path_nodes = [int(edges[0].src)]
-                for e in edges[:-1]:
-                    path_nodes.append(int(e.dst))
-
-                if not has_distinct_nodes(path_nodes):
-                    num_rejected_nodes += 1
-                    continue
-
-                # Closing edge must return to start node.
-                if int(edges[-1].dst) != int(edges[0].src):
-                    num_rejected_nodes += 1
-                    continue
-
-                if self.use_amount_ratio:
-                    if not passes_pairwise_amount_ratio(
-                        edges,
-                        pattern.amount_ratio_min,
-                        pattern.amount_ratio_max,
-                    ):
-                        num_rejected_amount += 1
-                        continue
-
-                emitted = self._emit_cycle_instance(
-                    motif_rows=motif_rows,
-                    membership_rows=membership_rows,
-                    window=window,
-                    pattern=pattern,
-                    edges=edges,
-                    anchor_edge=anchor_edge,
-                    k=k,
-                    validate=True,
-                )
-
-                if not emitted:
-                    continue
-
-        # ============================================================
-        # Branch 2: Existing DFS search for short cycles
-        # ============================================================
+    run_start_time = time.time()
+    run_mode = run_mode.lower()
+    if matcher_registry is None:
+        matcher_registry = globals().get("MATCHER_REGISTRY", {})
+
+    if patterns_to_run is None:
+        if run_mode in ["debug", "validation"]:
+            patterns_to_run = globals().get("VALIDATION_PATTERNS", [])
         else:
-            for anchor_edge in primary_edges:
-                num_anchor_edges += 1
-
-                if not is_edge_in_primary_window(anchor_edge, window):
-                    num_rejected_anchor += 1
-                    continue
-
-                if self.amount_min is not None and anchor_edge.amount < self.amount_min:
-                    num_rejected_amount += 1
-                    continue
-
-                start_node = int(anchor_edge.src)
-                second_node = int(anchor_edge.dst)
-
-                if start_node == second_node:
-                    num_rejected_nodes += 1
-                    continue
-
-                # Current partial path:
-                #   edges: [v1 -> v2]
-                #   nodes: [v1, v2]
-                stack = [
-                    (
-                        [anchor_edge],
-                        [start_node, second_node],
-                    )
-                ]
-
-                while stack:
-                    path_edges, path_nodes = stack.pop()
-
-                    if len(motif_rows) >= self.max_instances_per_window:
-                        break
-
-                    # ------------------------------------------------
-                    # Guard C — early canonical rotation pruning.
-                    # If any edge in the current partial path is earlier
-                    # than the anchor, this path cannot produce a canonical cycle.
-                    # ------------------------------------------------
-                    anchor_key = (anchor_edge.step, anchor_edge.edge_id)
-
-                    if any((e.step, e.edge_id) < anchor_key for e in path_edges[1:]):
-                        num_rejected_canonical += 1
-                        num_pruned_by_canonical_rotation += 1
-                        continue
-
-                    # ------------------------------------------------
-                    # Guard A — remaining-hop time feasibility.
-                    # remaining_hops means number of edges still needed
-                    # to complete the cycle, including the final closing edge.
-                    # ------------------------------------------------
-                    remaining_hops = k - len(path_edges)
-
-                    if not remaining_hops_feasible(
-                        current_step=path_edges[-1].step,
-                        anchor_step=path_edges[0].step,
-                        max_duration=pattern.max_duration,
-                        remaining_hops=remaining_hops,
-                        delta_hop=self.delta_hop,
-                    ):
-                        num_rejected_duration += 1
-                        num_pruned_by_hop_budget += 1
-                        continue
-
-                    current_edge = path_edges[-1]
-                    current_node = path_nodes[-1]
-
-                    # ------------------------------------------------
-                    # If we already have k-1 edges, close the cycle.
-                    # Need final edge: current_node -> start_node
-                    # ------------------------------------------------
-                    if len(path_edges) == k - 1:
-                        t_min = current_edge.step
-
-                        if self.delta_hop is not None:
-                            t_max = min(
-                                current_edge.step + self.delta_hop,
-                                path_edges[0].step + pattern.max_duration,
-                            )
-                        else:
-                            t_max = path_edges[0].step + pattern.max_duration
-
-                        close_candidates = index.pair(
-                            src=current_node,
-                            dst=start_node,
-                            t_min=t_min,
-                            t_max=t_max,
-                            include_left=False,
-                        )
-
-                        close_candidates = self._filter_candidates(
-                            close_candidates,
-                            pattern=pattern,
-                        )
-                        num_close_queries += 1
-
-                        for close_edge in close_candidates:
-                            if len(motif_rows) >= self.max_instances_per_window:
-                                break
-
-                            edges = path_edges + [close_edge]
-                            num_paths_checked += 1
-
-                            if not has_unique_edge_ids(edges):
-                                num_rejected_duplicate_edge += 1
-                                continue
-
-                            if not is_within_total_duration(edges, pattern.max_duration):
-                                num_rejected_duration += 1
-                                continue
-
-                            # Distinct cycle nodes only.
-                            # Closing returns to start_node, so path_nodes should already be distinct.
-                            if not has_distinct_nodes(path_nodes):
-                                num_rejected_nodes += 1
-                                continue
-
-                            # Canonical anchor rule:
-                            # keep only cycles whose anchor is the earliest edge.
-                            earliest_edge = min(edges, key=lambda e: (e.step, e.edge_id))
-
-                            if earliest_edge.edge_id != anchor_edge.edge_id:
-                                num_rejected_canonical += 1
-                                continue
-
-                            if not is_edge_in_primary_window(anchor_edge, window):
-                                num_rejected_anchor += 1
-                                continue
-
-                            if self.use_amount_ratio:
-                                if not passes_pairwise_amount_ratio(
-                                    edges,
-                                    pattern.amount_ratio_min,
-                                    pattern.amount_ratio_max,
-                                ):
-                                    num_rejected_amount += 1
-                                    continue
-
-                            emitted = self._emit_cycle_instance(
-                                motif_rows=motif_rows,
-                                membership_rows=membership_rows,
-                                window=window,
-                                pattern=pattern,
-                                edges=edges,
-                                anchor_edge=anchor_edge,
-                                k=k,
-                                validate=True,
-                            )
-
-                            if not emitted:
-                                continue
-
-                        continue
-
-                    # ------------------------------------------------
-                    # Otherwise extend forward:
-                    #   current_node -> next_node
-                    # ------------------------------------------------
-                    t_min = current_edge.step
-
-                    if self.delta_hop is not None:
-                        t_max = min(
-                            current_edge.step + self.delta_hop,
-                            path_edges[0].step + pattern.max_duration,
-                        )
-                    else:
-                        t_max = path_edges[0].step + pattern.max_duration
-
-                    next_candidates = index.outgoing(
-                        src=current_node,
-                        t_min=t_min,
-                        t_max=t_max,
-                        include_left=False,
-                    )
-
-                    next_candidates = self._filter_candidates(
-                        next_candidates,
-                        pattern=pattern,
-                    )
-
-                    for next_edge in reversed(next_candidates):
-                        # reversed because stack is LIFO; this keeps earlier edges explored first.
-                        if len(motif_rows) >= self.max_instances_per_window:
-                            break
-
-                        next_node = int(next_edge.dst)
-
-                        # Do not revisit nodes before final closing edge.
-                        if next_node in path_nodes:
-                            num_rejected_nodes += 1
-                            continue
-
-                        # Do not close to start node too early.
-                        if next_node == start_node:
-                            num_rejected_nodes += 1
-                            continue
-
-                        new_edges = path_edges + [next_edge]
-
-                        if not has_unique_edge_ids(new_edges):
-                            num_rejected_duplicate_edge += 1
-                            continue
-
-                        if not is_within_total_duration(new_edges, pattern.max_duration):
-                            num_rejected_duration += 1
-                            continue
-
-                        # ------------------------------------------------
-                        # Guard B — return-to-start reachability.
-                        #
-                        # Apply only when the new path already has k-1 edges.
-                        # At that depth, the next step must be the closing edge:
-                        #   next_node -> start_node
-                        #
-                        # If no such closing edge exists in the temporal index,
-                        # do not push this partial path into the stack.
-                        # ------------------------------------------------
-                        if len(new_edges) >= k - 1:
-                            time_budget = (
-                                path_edges[0].step + pattern.max_duration
-                                - next_edge.step
-                            )
-
-                            if time_budget < 0:
-                                num_rejected_duration += 1
-                                continue
-
-                            if self.delta_hop is not None:
-                                max_return_step = next_edge.step + min(
-                                    self.delta_hop,
-                                    time_budget,
-                                )
-                            else:
-                                max_return_step = next_edge.step + time_budget
-
-                            if not index.has_any_pair(
-                                src=next_node,
-                                dst=start_node,
-                                t_min=next_edge.step,
-                                t_max=max_return_step,
-                            ):
-                                num_rejected_nodes += 1
-                                num_pruned_by_return_feasibility += 1
-                                continue
-
-                        new_nodes = path_nodes + [next_node]
-
-                        stack.append((new_edges, new_nodes))
-                        num_dfs_expansions += 1
-
-                if len(motif_rows) >= self.max_instances_per_window:
-                    break
-
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
-
-        elapsed = time.time() - start_time
-
-        stats = {
-            "window_id": int(window.window_id),
-            "motif_type": pattern.name,
-            "matcher_type": pattern.matcher_type,
-            "cycle_length": int(k),
-            "cycle_branching": int(cycle_branching),
-            "use_bidirectional": int(use_bidirectional),
-            "bidirectional_threshold": int(BIDIRECTIONAL_CYCLE_THRESHOLD),
-
-            "primary_start": int(window.primary_start),
-            "primary_end": int(window.primary_end),
-            "extended_start": int(window.extended_start),
-            "extended_end": int(window.extended_end),
-            "primary_num_edges": int(df_primary.height),
-            "extended_num_edges": int(df_extended.height),
-
-            "num_anchor_edges": int(num_anchor_edges),
-            "num_dfs_expansions": int(num_dfs_expansions),
-            "num_close_queries": int(num_close_queries),
-            "num_paths_checked": int(num_paths_checked),
-
-            "num_instances": int(motif_df.height),
-            "num_membership_rows": int(membership_df.height),
-
-            "num_rejected_nodes": int(num_rejected_nodes),
-            "num_rejected_duration": int(num_rejected_duration),
-            "num_rejected_anchor": int(num_rejected_anchor),
-            "num_rejected_amount": int(num_rejected_amount),
-            "num_rejected_duplicate_edge": int(num_rejected_duplicate_edge),
-            "num_rejected_canonical": int(num_rejected_canonical),
-
-            "num_pruned_by_hop_budget": int(num_pruned_by_hop_budget),
-            "num_pruned_by_return_feasibility": int(num_pruned_by_return_feasibility),
-            "num_pruned_by_canonical_rotation": int(num_pruned_by_canonical_rotation),
-
-            "hit_max_instances_per_window": int(
-                len(motif_rows) >= self.max_instances_per_window
-            ),
-            "elapsed_seconds": float(elapsed),
-        }
-
-        if write_output:
-            motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
-                membership_rows=membership_rows,
-                window_id=window.window_id,
-                motif_type=pattern.name,
-            )
-
-            stats["motif_path"] = motif_path
-            stats["membership_path"] = membership_path
-
-        return motif_df, membership_df, stats
-
-
-# ============================================================
-# Bidirectional cycle search for k >= BIDIRECTIONAL_CYCLE_THRESHOLD
-# ============================================================
-
-@dataclass
-class FrontierState:
-    """
-    One partial path state in bidirectional cycle search.
-
-    forward=True:  path starts from anchor edge, grows forward.
-    forward=False: path starts from anchor.src, grows backward in time.
-    """
-    endpoint:       int
-    min_step:       int
-    max_step:       int
-    used_nodes:     frozenset
-    used_edge_ids:  frozenset
-    edges:          List[EdgeRecord]
-
-
-class BidirectionalCycleSearch:
-    """
-    Bidirectional DFS for directed temporal cycles of length k >= 7.
-
-    Forward frontier:
-        paths of length floor(k/2) from anchor_edge forward.
-
-    Backward frontier:
-        paths of length ceil(k/2) starting at anchor.src,
-        traversed by following incoming edges backward in time.
-
-    Join condition:
-        forward.endpoint == backward.endpoint
-        AND temporal compatibility
-        AND disjoint node sets except anchor.src
-        AND disjoint edge sets.
-    """
-
-    def __init__(
-        self,
-        max_branching: int,
-        delta_hop: Optional[int],
-        candidate_policy: str,
-        amount_min: Optional[float],
-        max_instances_per_window: int,
-    ):
-        self.max_branching = int(max_branching)
-        self.delta_hop = delta_hop
-        self.candidate_policy = candidate_policy
-        self.amount_min = amount_min
-        self.max_instances_per_window = max_instances_per_window
-
-    def _filter(self, edges: List[EdgeRecord]) -> List[EdgeRecord]:
-        if self.amount_min is not None:
-            edges = [e for e in edges if e.amount >= self.amount_min]
-
-        return cap_edges(
-            edges,
-            self.max_branching,
-            policy=self.candidate_policy,
-        )
-
-    def _build_forward_states(
-        self,
-        anchor_edge: EdgeRecord,
-        depth: int,
-        index: TemporalIndex,
-        pattern: MotifPattern,
-    ) -> List[FrontierState]:
-        """
-        Build all forward partial paths of exactly depth edges,
-        starting from anchor_edge.
-        """
-        k = len(pattern.edges)
-
-        initial = FrontierState(
-            endpoint=anchor_edge.dst,
-            min_step=anchor_edge.step,
-            max_step=anchor_edge.step,
-            used_nodes=frozenset([anchor_edge.src, anchor_edge.dst]),
-            used_edge_ids=frozenset([anchor_edge.edge_id]),
-            edges=[anchor_edge],
-        )
-
-        frontier = [initial]
-
-        for _ in range(depth - 1):
-            next_frontier = []
-
-            for state in frontier:
-                remaining = k - len(state.edges)
-
-                t_max = min(
-                    state.max_step + (self.delta_hop or pattern.max_duration),
-                    anchor_edge.step + pattern.max_duration - remaining * 1,
-                )
-
-                candidates = self._filter(
-                    index.outgoing(
-                        src=state.endpoint,
-                        t_min=state.max_step,
-                        t_max=t_max,
-                        include_left=False,
-                    )
-                )
-
-                for e in candidates:
-                    if e.edge_id in state.used_edge_ids:
-                        continue
-
-                    next_node = e.dst
-                    if next_node in state.used_nodes:
-                        continue
-
-                    next_frontier.append(
-                        FrontierState(
-                            endpoint=next_node,
-                            min_step=state.min_step,
-                            max_step=e.step,
-                            used_nodes=state.used_nodes | {next_node},
-                            used_edge_ids=state.used_edge_ids | {e.edge_id},
-                            edges=state.edges + [e],
-                        )
-                    )
-
-            frontier = next_frontier
-
-            if not frontier:
-                break
-
-        return frontier
-
-    def _build_backward_states(
-        self,
-        anchor_edge: EdgeRecord,
-        depth: int,
-        index: TemporalIndex,
-        pattern: MotifPattern,
-    ) -> List[FrontierState]:
-        """
-        Build all backward partial paths of exactly depth edges,
-        ending at anchor_edge.src by traversing incoming edges in reverse time.
-        """
-        initial = FrontierState(
-            endpoint=anchor_edge.src,
-            min_step=anchor_edge.step,
-            max_step=anchor_edge.step,
-            used_nodes=frozenset([anchor_edge.src]),
-            used_edge_ids=frozenset([anchor_edge.edge_id]),
-            edges=[],
-        )
-
-        frontier = [initial]
-
-        for _ in range(depth):
-            next_frontier = []
-
-            for state in frontier:
-                # Walk backward: find edges arriving at state.endpoint
-                # with step < state.min_step.
-                t_min = anchor_edge.step - pattern.max_duration
-                t_max = state.min_step - 1
-
-                if t_max < t_min:
-                    continue
-
-                candidates = self._filter(
-                    index.incoming(
-                        dst=state.endpoint,
-                        t_min=t_min,
-                        t_max=t_max,
-                        include_left=True,
-                    )
-                )
-
-                for e in reversed(candidates):
-                    if e.edge_id in state.used_edge_ids:
-                        continue
-
-                    prev_node = e.src
-                    if prev_node in state.used_nodes:
-                        continue
-
-                    next_frontier.append(
-                        FrontierState(
-                            endpoint=prev_node,
-                            min_step=e.step,
-                            max_step=state.max_step,
-                            used_nodes=state.used_nodes | {prev_node},
-                            used_edge_ids=state.used_edge_ids | {e.edge_id},
-                            edges=[e] + state.edges,
-                        )
-                    )
-
-            frontier = next_frontier
-
-            if not frontier:
-                break
-
-        return frontier
-
-    def search_all_windows(
-        self,
-        df_primary: pl.DataFrame,
-        index: TemporalIndex,
-        pattern: MotifPattern,
-        window: WindowSpec,
-    ) -> List[List[EdgeRecord]]:
-        """
-        Run bidirectional search over all anchor edges in the primary window.
-
-        Returns:
-            list of complete cycle edge lists.
-        """
-        k = len(pattern.edges)
-        half_fwd = k // 2
-        half_bwd = k - half_fwd
-
-        results: List[List[EdgeRecord]] = []
-        seen_canonical_keys: set = set()
-
-        for row in df_primary.iter_rows(named=True):
-            anchor_edge = EdgeRecord(
-                edge_id=int(row["edge_id"]),
-                src=int(row["src"]),
-                dst=int(row["dst"]),
-                step=int(row["step"]),
-                amount=float(row["amount"]),
-                is_sar=int(row["is_sar"]),
-            )
-
-            if not is_edge_in_primary_window(anchor_edge, window):
+            patterns_to_run = globals().get("PATTERNS_TO_RUN_ALL", [])
+
+    if max_windows is None:
+        if run_mode == "debug":
+            max_windows = 2
+        elif run_mode == "validation":
+            max_windows = 1
+
+    if pattern_group is not None:
+        pattern_group = pattern_group.lower()
+        if pattern_group == "fan":
+            patterns_to_run = [p for p in patterns_to_run if p.matcher_type in ["fan_in", "fan_out"]]
+        elif pattern_group == "flow":
+            patterns_to_run = [p for p in patterns_to_run if p.matcher_type in ["split_merge", "center_in_out"]]
+        elif pattern_group == "cycle":
+            patterns_to_run = [p for p in patterns_to_run if p.matcher_type == "path_cycle"]
+        else:
+            patterns_to_run = [
+                p for p in patterns_to_run 
+                if pattern_group in p.name.lower() or pattern_group in p.matcher_type.lower()
+            ]
+
+    windows_to_run = windows[:max_windows] if max_windows is not None else windows
+
+    print("=" * 60)
+    print(f"Starting motif mining runner (Mode: {run_mode.upper()})")
+    print(f"Windows to run: {len(windows_to_run)}")
+    print(f"Patterns ({len(patterns_to_run)}): {[p.name for p in patterns_to_run]}")
+    print(f"Skip existing: {skip_existing}, Write empty outputs: {write_empty_outputs}")
+    print("=" * 60)
+
+    stats_rows = []
+
+    for idx, window in enumerate(windows_to_run):
+        window_start_time = time.time()
+        w_id = int(window.window_id)
+
+        print(f"\n[Window {idx + 1}/{len(windows_to_run)}] window_id={w_id}")
+        
+        # Setup paths
+        motif_dir = f"{MOTIF_INSTANCE_DIR}/window_id={w_id:06d}"
+        membership_dir = f"{MEMBERSHIP_DIR}/window_id={w_id:06d}"
+        log_dir = f"logs/window_id={w_id:06d}"
+
+        os.makedirs(motif_dir, exist_ok=True)
+        os.makedirs(membership_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+
+        df_primary, df_extended = slice_window_edges(df_edges, window)
+
+        if df_primary.height == 0:
+            print("  Primary window is empty. Skipping window.")
+            for pattern in patterns_to_run:
+                stats_rows.append({
+                    "window_id": w_id,
+                    "motif_type": pattern.name,
+                    "matcher_type": pattern.matcher_type,
+                    "status": "skipped_empty_primary",
+                    "elapsed_seconds": 0.0,
+                })
+            continue
+
+        if df_extended.height == 0:
+            print("  Extended window is empty. Skipping window.")
+            for pattern in patterns_to_run:
+                stats_rows.append({
+                    "window_id": w_id,
+                    "motif_type": pattern.name,
+                    "matcher_type": pattern.matcher_type,
+                    "status": "skipped_empty_extended",
+                    "elapsed_seconds": 0.0,
+                })
+            continue
+
+        index_start_time = time.time()
+        temporal_index = build_temporal_index_from_polars(df_extended)
+        index_elapsed = time.time() - index_start_time
+
+        print(f"  Extended edges: {df_extended.height}, Primary edges: {df_primary.height}")
+        print(f"  Temporal index build time: {round(index_elapsed, 3)}s")
+
+        for pattern in patterns_to_run:
+            pattern_start_time = time.time()
+            
+            motif_path = f"{motif_dir}/{pattern.name}.parquet"
+            membership_path = f"{membership_dir}/{pattern.name}.parquet"
+
+            # Check if output already exists
+            if skip_existing and os.path.exists(motif_path) and os.path.exists(membership_path):
+                print(f"  [{pattern.name}] outputs already exist. Skipping.")
+                stats_rows.append({
+                    "window_id": w_id,
+                    "motif_type": pattern.name,
+                    "matcher_type": pattern.matcher_type,
+                    "status": "skipped_existing",
+                    "elapsed_seconds": 0.0,
+                })
                 continue
 
-            fwd_states = self._build_forward_states(
-                anchor_edge=anchor_edge,
-                depth=half_fwd,
-                index=index,
-                pattern=pattern,
-            )
+            if pattern.matcher_type not in matcher_registry:
+                err_msg = f"No matcher registered for type '{pattern.matcher_type}'"
+                print(f"  [ERROR] [{pattern.name}]: {err_msg}")
+                with open(f"{log_dir}/{pattern.name}_error.log", "w", encoding="utf-8") as f:
+                    f.write(err_msg)
+                stats_rows.append({
+                    "window_id": w_id,
+                    "motif_type": pattern.name,
+                    "matcher_type": pattern.matcher_type,
+                    "status": "failed",
+                    "error_message": err_msg,
+                    "elapsed_seconds": 0.0,
+                })
+                continue
 
-            bwd_states = self._build_backward_states(
-                anchor_edge=anchor_edge,
-                depth=half_bwd,
-                index=index,
-                pattern=pattern,
-            )
+            # Failure isolation wrapper
+            try:
+                matcher = matcher_registry[pattern.matcher_type]
+                motif_df, membership_df, stats = matcher.match(
+                    df_primary=df_primary,
+                    df_extended=df_extended,
+                    index=temporal_index,
+                    window=window,
+                    pattern=pattern,
+                    write_output=False,
+                )
 
-            # Index backward states by endpoint for O(1) join lookup.
-            bwd_by_endpoint: Dict[int, List[FrontierState]] = defaultdict(list)
+                if write_empty_outputs or motif_df.height > 0:
+                    motif_df.write_parquet(motif_path)
+                    membership_df.write_parquet(membership_path)
 
-            for bwd in bwd_states:
-                bwd_by_endpoint[bwd.endpoint].append(bwd)
+                pattern_elapsed = time.time() - pattern_start_time
+                stats["status"] = "completed"
+                stats["index_build_seconds"] = float(index_elapsed)
+                stats["total_pattern_seconds"] = float(pattern_elapsed)
+                stats["motif_path"] = motif_path
+                stats["membership_path"] = membership_path
+                stats_rows.append(stats)
 
-            for fwd in fwd_states:
-                for bwd in bwd_by_endpoint.get(fwd.endpoint, []):
-                    # Temporal order compatibility.
-                    if fwd.max_step >= bwd.min_step:
-                        continue
+                print(
+                    f"  [{pattern.name}] "
+                    f"instances={motif_df.height}, "
+                    f"membership_rows={membership_df.height}, "
+                    f"time={round(pattern_elapsed, 3)}s"
+                )
 
-                    if self.delta_hop is not None:
-                        if bwd.min_step - fwd.max_step > self.delta_hop:
-                            continue
+                # Explicit memory cleanup
+                del motif_df
+                del membership_df
+                gc.collect()
 
-                    shared = fwd.used_nodes & bwd.used_nodes
-                    if shared != {anchor_edge.src}:
-                        continue
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"  [ERROR] [{pattern.name}] Failed: {e}")
+                
+                # Write detailed error log
+                with open(f"{log_dir}/{pattern.name}_error.log", "w", encoding="utf-8") as f:
+                    f.write(f"Exception: {str(e)}\n\nTraceback:\n{tb}")
 
-                    if fwd.used_edge_ids & bwd.used_edge_ids:
-                        continue
+                stats_rows.append({
+                    "window_id": w_id,
+                    "motif_type": pattern.name,
+                    "matcher_type": pattern.matcher_type,
+                    "status": "failed",
+                    "error_message": str(e),
+                    "elapsed_seconds": float(time.time() - pattern_start_time),
+                })
 
-                    cycle_edges = fwd.edges + bwd.edges
+        window_elapsed = time.time() - window_start_time
+        print(f"  Window {w_id} completed in {round(window_elapsed, 3)}s")
 
-                    if len(cycle_edges) != k:
-                        continue
+    # Aggregate and return stats
+    if len(stats_rows) == 0:
+        run_stats_df = pl.DataFrame()
+    else:
+        run_stats_df = pl.DataFrame(stats_rows)
 
-                    if not is_within_total_duration(cycle_edges, pattern.max_duration):
-                        continue
+    # Save aggregated run stats to the last active logs folder
+    if len(windows_to_run) > 0:
+        last_w_id = int(windows_to_run[-1].window_id)
+        stats_dir = f"logs/window_id={last_w_id:06d}"
+        os.makedirs(stats_dir, exist_ok=True)
+        run_stats_df.write_parquet(f"{stats_dir}/run_stats.parquet")
+        print(f"\nRun stats saved to {stats_dir}/run_stats.parquet")
 
-                    # Canonical deduplication.
-                    earliest = min(cycle_edges, key=lambda e: (e.step, e.edge_id))
-                    if earliest.edge_id != anchor_edge.edge_id:
-                        continue
+    print(f"\nMotif mining runner finished in {round(time.time() - run_start_time, 3)}s")
+    return run_stats_df
 
-                    ck = make_canonical_key(
-                        pattern.name,
-                        [e.edge_id for e in cycle_edges],
-                        ordered=True,
-                    )
-
-                    if ck in seen_canonical_keys:
-                        continue
-
-                    seen_canonical_keys.add(ck)
-                    results.append(cycle_edges)
-
-                    if len(results) >= self.max_instances_per_window:
-                        return results
-
-        return results
-
-
-# Register cycle matcher.
-cycle_k_matcher = CycleKMatcher(
-    max_branching=4,  # fallback if k is not found in CYCLE_MAX_BRANCHING
-    branching_schedule=CYCLE_MAX_BRANCHING,
-    max_instances_per_window=20_000,
-    amount_min=None,
-    use_amount_ratio=False,  # amount_consistency is stored, not used as hard filter
-    candidate_policy="hybrid",
-    delta_hop=DELTA_HOP,
-    max_anchors_per_window=None,
-)
-
-MATCHER_REGISTRY["path_cycle"] = cycle_k_matcher
-
-print("CycleKMatcher (per-k branching + amount_consistency) registered.")
-print("Branching schedule:", CYCLE_MAX_BRANCHING)
-print("MATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
 print("Cell 13 completed.")
 
 
-
-
 # ============================================================
-# Cell 14: SplitMergeMatcher and CenterInOutMatcher
+# Cell 14: Validation run
 # ============================================================
 
-def _build_split_merge_roles(
-    split_edges: List[EdgeRecord],
-    merge_edges_tuple: tuple,
-    intermediates: List[int],
-    n_branches: int,
-) -> Tuple[List[EdgeRecord], List[EdgeRecord], Dict[str, int]]:
-    """
-    Build role_map while preserving the correct mid_i -> merge_i mapping.
+import os
+import polars as pl
+from pathlib import Path
 
-    Important:
-        merge_edges_tuple[i] is the selected merge edge from intermediates[i] -> sink.
+# Run exactly 1 window using validation mode
+print("Running validation pipeline...")
 
-    Therefore:
-        merge_{i+1} must refer to merge_edges_tuple[i],
-        not to the i-th edge after sorting by step.
+# Select validation patterns (exactly: fan_in_4, fan_out_4, center_inout_3in_2out, split_merge_6, cycle_5 if ENABLE_CYCLES)
+VALIDATION_PATTERNS = [
+    fan_in_patterns[0],       # fan_in_4
+    fan_out_patterns[0],      # fan_out_4
+    center_inout_patterns[0],  # center_inout_3in_2out
+    split_merge_patterns[0]   # split_merge_6
+]
 
-    Returns:
-        merge_edges_by_intermediate:
-            Merge edges in the same order as intermediates.
+if globals().get("ENABLE_CYCLES", False):
+    VALIDATION_PATTERNS.append(cycle_patterns[0])  # cycle_5
 
-        merge_edges_sorted:
-            Merge edges sorted by temporal order.
-            Use this only for temporal validation.
-
-        role_map:
-            Correct pattern-role to real edge_id mapping.
-    """
-    merge_edges_by_intermediate = list(merge_edges_tuple)
-
-    if len(split_edges) != n_branches:
-        raise ValueError(
-            f"Expected {n_branches} split edges, got {len(split_edges)}"
-        )
-
-    if len(merge_edges_by_intermediate) != n_branches:
-        raise ValueError(
-            f"Expected {n_branches} merge edges, got {len(merge_edges_by_intermediate)}"
-        )
-
-    if len(intermediates) != n_branches:
-        raise ValueError(
-            f"Expected {n_branches} intermediates, got {len(intermediates)}"
-        )
-
-    role_map: Dict[str, int] = {}
-
-    for i in range(n_branches):
-        role_map[f"split_{i + 1}"] = int(split_edges[i].edge_id)
-        role_map[f"merge_{i + 1}"] = int(merge_edges_by_intermediate[i].edge_id)
-
-    merge_edges_sorted = sorted(
-        merge_edges_by_intermediate,
-        key=lambda e: (e.step, e.edge_id),
+# Run matchers over validation settings (run_mode="validation" targets 1 window by default)
+if 'df_edges' in globals() and 'windows' in globals():
+    validation_stats_df = run_matchers_over_windows(
+        df_edges=df_edges,
+        windows=windows,
+        patterns_to_run=VALIDATION_PATTERNS,
+        matcher_registry=MATCHER_REGISTRY,
+        run_mode="validation",
+        skip_existing=False,
+        write_empty_outputs=True
     )
 
-    return merge_edges_by_intermediate, merge_edges_sorted, role_map
-
-
-def _build_split_merge_node_map(
-    source: int,
-    intermediates: List[int],
-    sink: int,
-) -> Dict[str, int]:
-    """
-    Build node_map while preserving the correct intermediate index.
-
-    mid_{i+1} corresponds to intermediates[i].
-    """
-    node_map = {
-        "src": int(source),
-        "sink": int(sink),
-    }
-
-    node_map.update({
-        f"mid_{i + 1}": int(intermediates[i])
-        for i in range(len(intermediates))
-    })
-
-    return node_map
-
-
-class SplitMergeMatcher:
-    """
-    Matcher for split_merge motifs.
-
-    Pattern:
-        src -> mid_1
-        src -> mid_2
-        ...
-        src -> mid_n
-
-        mid_1 -> sink
-        mid_2 -> sink
-        ...
-        mid_n -> sink
-
-    Strategy:
-        1. Choose source src.
-        2. Select n outgoing split edges from src.
-        3. For intermediate nodes mid_1..mid_n, find common sink.
-        4. Pick one merge edge from each intermediate to that common sink.
-        5. Preserve role mapping:
-             split_i = src -> mid_i
-             merge_i = mid_i -> sink
-    """
-
-    def __init__(
-        self,
-        max_out_candidates: int = 12,
-        max_merge_candidates_per_intermediate: int = 3,
-        max_instances_per_window: int = 30_000,
-        amount_min: Optional[float] = None,
-        use_amount_ratio: bool = True,
-        candidate_policy: str = "hybrid",
-        split_phase_delta: Optional[int] = DELTA_HOP,
-        merge_phase_delta: Optional[int] = DELTA_HOP,
-        split_to_merge_delta: Optional[int] = DELTA_HOP,
-        max_instances_per_source: Optional[int] = 2_000,
-    ):
-        self.max_out_candidates = max_out_candidates
-        self.max_merge_candidates_per_intermediate = max_merge_candidates_per_intermediate
-        self.max_instances_per_window = max_instances_per_window
-        self.amount_min = amount_min
-        self.use_amount_ratio = use_amount_ratio
-        self.candidate_policy = candidate_policy
-        self.split_phase_delta = split_phase_delta
-        self.merge_phase_delta = merge_phase_delta
-        self.split_to_merge_delta = split_to_merge_delta
-        self.max_instances_per_source = max_instances_per_source
-
-    def match(
-        self,
-        df_primary: pl.DataFrame,
-        df_extended: pl.DataFrame,
-        index: TemporalIndex,
-        window: WindowSpec,
-        pattern: MotifPattern,
-        write_output: bool = False,
-    ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
-
-        if pattern.matcher_type != "split_merge":
-            raise ValueError(
-                f"SplitMergeMatcher expects matcher_type='split_merge'. "
-                f"Got {pattern.matcher_type}"
-            )
-
-        start_time = time.time()
-
-        motif_rows = []
-        membership_rows = []
-
-        num_sources_scanned = 0
-        num_split_combinations = 0
-        num_merge_products_checked = 0
-
-        num_rejected_duration = 0
-        num_rejected_nodes = 0
-        num_rejected_anchor = 0
-        num_rejected_amount = 0
-        num_rejected_split_phase_delta = 0
-        num_rejected_merge_phase_delta = 0
-        num_rejected_phase_gap = 0
-        num_rejected_source_cap = 0
-
-        # Pattern has n split edges and n merge edges.
-        n_branches = len(pattern.edges) // 2
-
-        for source, out_edges in index.out_edges.items():
-            source_instance_count = 0
-            num_sources_scanned += 1
-
-            split_candidates = cap_edges(
-                out_edges,
-                max_candidates=self.max_out_candidates,
-                policy=self.candidate_policy,
-            )
-
-            if self.amount_min is not None:
-                split_candidates = [
-                    e for e in split_candidates
-                    if e.amount >= self.amount_min
-                ]
-
-            if len(split_candidates) < n_branches:
-                continue
-
-            for split_combo in combinations(split_candidates, n_branches):
-                split_edges = sorted(
-                    list(split_combo),
-                    key=lambda e: (e.step, e.edge_id),
-                )
-
-                num_split_combinations += 1
-
-                if not passes_consecutive_step_gap(
-                    split_edges,
-                    self.split_phase_delta,
-                ):
-                    num_rejected_split_phase_delta += 1
-                    continue
-
-                if not has_unique_edge_ids(split_edges):
-                    continue
-
-                a = split_edges[0].src
-
-                if any(e.src != a for e in split_edges):
-                    continue
-
-                intermediates = [e.dst for e in split_edges]
-
-                if not has_distinct_nodes([a] + intermediates):
-                    num_rejected_nodes += 1
-                    continue
-
-                split_end_step = max(e.step for e in split_edges)
-
-                max_end_step = min(
-                    split_edges[0].step + pattern.max_duration,
-                    split_end_step + pattern.max_duration,
-                )
-
-                # ----------------------------------------------------
-                # Build merge candidates for each intermediate.
-                # merge_by_intermediate[i] contains candidates from
-                # intermediates[i] -> some sink.
-                # ----------------------------------------------------
-                merge_by_intermediate = []
-
-                for mid in intermediates:
-                    cands = index.outgoing(
-                        src=mid,
-                        t_min=split_end_step,
-                        t_max=max_end_step,
-                        include_left=False,
-                        max_candidates=None,
-                    )
-
-                    if self.amount_min is not None:
-                        cands = [
-                            e for e in cands
-                            if e.amount >= self.amount_min
-                        ]
-
-                    cands = cap_edges(
-                        cands,
-                        max_candidates=self.max_merge_candidates_per_intermediate,
-                        policy=self.candidate_policy,
-                    )
-
-                    merge_by_intermediate.append(cands)
-
-                if any(len(x) == 0 for x in merge_by_intermediate):
-                    continue
-
-                # ----------------------------------------------------
-                # Group merge candidates by sink for each intermediate.
-                # sink_maps[i][sink] = list of edges:
-                #     intermediates[i] -> sink
-                # ----------------------------------------------------
-                sink_maps = []
-
-                for cands in merge_by_intermediate:
-                    sink_map = defaultdict(list)
-
-                    for e in cands:
-                        sink_map[e.dst].append(e)
-
-                    sink_maps.append(sink_map)
-
-                common_sinks = set(sink_maps[0].keys())
-
-                for sm in sink_maps[1:]:
-                    common_sinks &= set(sm.keys())
-
-                if len(common_sinks) == 0:
-                    continue
-
-                for sink in common_sinks:
-                    e_node = sink
-
-                    if e_node in [a] + intermediates:
-                        num_rejected_nodes += 1
-                        continue
-
-                    # lists[i] contains candidate edges from intermediates[i] -> e_node.
-                    lists = [sm[e_node] for sm in sink_maps]
-
-                    for merge_edges_tuple in product(*lists):
-                        num_merge_products_checked += 1
-
-                        try:
-                            (
-                                merge_edges_by_intermediate,
-                                merge_edges_sorted,
-                                role_map,
-                            ) = _build_split_merge_roles(
-                                split_edges=split_edges,
-                                merge_edges_tuple=merge_edges_tuple,
-                                intermediates=intermediates,
-                                n_branches=n_branches,
-                            )
-                        except Exception:
-                            continue
-
-                        # For validation, use temporal order.
-                        edges_for_validation = split_edges + merge_edges_sorted
-
-                        # For role semantics, use mapping by intermediate.
-                        # We still pass edges_for_validation to the row builder
-                        # because duration, anchor, and membership should use
-                        # the actual edge set in temporal-friendly order.
-                        if not passes_consecutive_step_gap(
-                            merge_edges_sorted,
-                            self.merge_phase_delta,
-                        ):
-                            num_rejected_merge_phase_delta += 1
-                            continue
-
-                        if not phase_gap_ok(
-                            split_edges,
-                            merge_edges_sorted,
-                            self.split_to_merge_delta,
-                        ):
-                            num_rejected_phase_gap += 1
-                            continue
-
-                        if not has_unique_edge_ids(edges_for_validation):
-                            continue
-
-                        if not is_within_total_duration(
-                            edges_for_validation,
-                            pattern.max_duration,
-                        ):
-                            num_rejected_duration += 1
-                            continue
-
-                        anchor = get_anchor_edge(edges_for_validation)
-
-                        if not is_edge_in_primary_window(anchor, window):
-                            num_rejected_anchor += 1
-                            continue
-
-                        if self.use_amount_ratio:
-                            split_sum = sum(e.amount for e in split_edges)
-                            merge_sum = sum(e.amount for e in merge_edges_by_intermediate)
-
-                            if split_sum <= 0:
-                                num_rejected_amount += 1
-                                continue
-
-                            ratio = merge_sum / split_sum
-
-                            if (
-                                pattern.amount_ratio_min is not None
-                                and ratio < pattern.amount_ratio_min
-                            ):
-                                num_rejected_amount += 1
-                                continue
-
-                            if (
-                                pattern.amount_ratio_max is not None
-                                and ratio > pattern.amount_ratio_max
-                            ):
-                                num_rejected_amount += 1
-                                continue
-
-                        node_map = _build_split_merge_node_map(
-                            source=a,
-                            intermediates=intermediates,
-                            sink=e_node,
-                        )
-
-                        try:
-                            motif_row = make_motif_instance_row(
-                                window_id=window.window_id,
-                                pattern=pattern,
-                                edges=edges_for_validation,
-                                node_map=node_map,
-                                role_map=role_map,
-                                anchor_edge_id=anchor.edge_id,
-                                validate=True,
-                            )
-                        except Exception:
-                            continue
-
-                        membership = make_edge_motif_membership_rows(
-                            motif_row=motif_row,
-                            pattern=pattern,
-                            edges=edges_for_validation,
-                        )
-
-                        motif_rows.append(motif_row)
-                        membership_rows.extend(membership)
-
-                        source_instance_count += 1
-
-                        if (
-                            self.max_instances_per_source is not None
-                            and source_instance_count >= self.max_instances_per_source
-                        ):
-                            num_rejected_source_cap += 1
-                            break
-
-                        if len(motif_rows) >= self.max_instances_per_window:
-                            break
-
-                    if (
-                        self.max_instances_per_source is not None
-                        and source_instance_count >= self.max_instances_per_source
-                    ):
-                        break
-
-                    if len(motif_rows) >= self.max_instances_per_window:
-                        break
-
-                if (
-                    self.max_instances_per_source is not None
-                    and source_instance_count >= self.max_instances_per_source
-                ):
-                    break
-
-                if len(motif_rows) >= self.max_instances_per_window:
-                    break
-
-            if len(motif_rows) >= self.max_instances_per_window:
-                break
-
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
-
-        elapsed = time.time() - start_time
-
-        stats = {
-            "window_id": int(window.window_id),
-            "motif_type": pattern.name,
-            "matcher_type": pattern.matcher_type,
-
-            "primary_num_edges": int(df_primary.height),
-            "extended_num_edges": int(df_extended.height),
-
-            "num_sources_scanned": int(num_sources_scanned),
-            "num_split_combinations": int(num_split_combinations),
-            "num_merge_products_checked": int(num_merge_products_checked),
-
-            "num_instances": int(motif_df.height),
-            "num_membership_rows": int(membership_df.height),
-
-            "num_rejected_duration": int(num_rejected_duration),
-            "num_rejected_nodes": int(num_rejected_nodes),
-            "num_rejected_anchor": int(num_rejected_anchor),
-            "num_rejected_amount": int(num_rejected_amount),
-            "num_rejected_split_phase_delta": int(num_rejected_split_phase_delta),
-            "num_rejected_merge_phase_delta": int(num_rejected_merge_phase_delta),
-            "num_rejected_phase_gap": int(num_rejected_phase_gap),
-            "num_rejected_source_cap": int(num_rejected_source_cap),
-
-            "hit_max_instances_per_window": int(
-                len(motif_rows) >= self.max_instances_per_window
-            ),
-            "elapsed_seconds": float(elapsed),
-        }
-
-        if write_output:
-            motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
-                membership_rows=membership_rows,
-                window_id=window.window_id,
-                motif_type=pattern.name,
-            )
-
-            stats["motif_path"] = motif_path
-            stats["membership_path"] = membership_path
-
-        return motif_df, membership_df, stats
-
-
-
-# ============================================================
-# Cell 14: CenterInOutMatcher
-# ============================================================
-
-def _compute_center_inout_flow_features(
-    in_edges: List[EdgeRecord],
-    out_edges: List[EdgeRecord],
-) -> Dict[str, float]:
-    """
-    Compute flow features for one center-in-out motif instance.
-
-    Features:
-        in_sum:
-            Total amount flowing into the center.
-
-        out_sum:
-            Total amount flowing out from the center.
-
-        flow_ratio:
-            out_sum / in_sum.
-            Close to 1.0 means the center redistributes almost all received money.
-
-        handoff_gap:
-            min(out_step) - max(in_step).
-            Smaller gap means faster handoff from incoming phase to outgoing phase.
-    """
-    in_sum = float(sum(e.amount for e in in_edges))
-    out_sum = float(sum(e.amount for e in out_edges))
-
-    flow_ratio = out_sum / in_sum if in_sum > 0 else 0.0
-
-    in_end = max(int(e.step) for e in in_edges)
-    out_start = min(int(e.step) for e in out_edges)
-
-    handoff_gap = int(out_start - in_end)
-
-    return {
-        "in_sum": in_sum,
-        "out_sum": out_sum,
-        "flow_ratio": float(flow_ratio),
-        "handoff_gap": float(handoff_gap),
-    }
-
-
-class CenterInOutMatcher:
-    """
-    Matcher for center-in-out motifs.
-
-    General pattern:
-        in_1 -> center
-        in_2 -> center
-        ...
-        in_n -> center
-
-        center -> out_1
-        center -> out_2
-        ...
-        center -> out_m
-
-    AML interpretation:
-        The center account collects money from multiple sources,
-        then redistributes it to multiple destinations.
-
-    Key improvement in this version:
-        Outgoing candidates are queried after each incoming group is known.
-
-        Instead of:
-            get all outgoing edges of center
-            combine them with every incoming group
-
-        We do:
-            choose incoming group
-            compute in_end
-            query outgoing in (in_end, in_end + center_handoff_delta]
-            combine only temporally compatible outgoing edges
-    """
-
-    def __init__(
-        self,
-        max_in_candidates: int = 30,
-        max_out_candidates: int = 20,
-        max_instances_per_window: int = 50_000,
-        amount_min: Optional[float] = None,
-        use_amount_ratio: bool = False,
-        candidate_policy: str = "hybrid",
-        incoming_phase_delta: Optional[int] = DELTA_HOP,
-        outgoing_phase_delta: Optional[int] = DELTA_HOP,
-        center_handoff_delta: Optional[int] = DELTA_HOP,
-        max_instances_per_center: Optional[int] = 2_000,
-    ):
-        self.max_in_candidates = max_in_candidates
-        self.max_out_candidates = max_out_candidates
-        self.max_instances_per_window = max_instances_per_window
-        self.amount_min = amount_min
-        self.use_amount_ratio = use_amount_ratio
-        self.candidate_policy = candidate_policy
-        self.incoming_phase_delta = incoming_phase_delta
-        self.outgoing_phase_delta = outgoing_phase_delta
-        self.center_handoff_delta = center_handoff_delta
-        self.max_instances_per_center = max_instances_per_center
-
-    def match(
-        self,
-        df_primary: pl.DataFrame,
-        df_extended: pl.DataFrame,
-        index: TemporalIndex,
-        window: WindowSpec,
-        pattern: MotifPattern,
-        write_output: bool = False,
-    ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
-
-        if pattern.matcher_type != "center_in_out":
-            raise ValueError(
-                f"CenterInOutMatcher expects matcher_type='center_in_out'. "
-                f"Got {pattern.matcher_type}"
-            )
-
-        start_time = time.time()
-
-        motif_rows = []
-        membership_rows = []
-
-        num_centers_scanned = 0
-        num_in_combinations_checked = 0
-        num_products_checked = 0
-
-        num_rejected_time = 0
-        num_rejected_nodes = 0
-        num_rejected_anchor = 0
-        num_rejected_amount = 0
-        num_rejected_incoming_phase_delta = 0
-        num_rejected_outgoing_phase_delta = 0
-        num_rejected_handoff_delta = 0
-        num_rejected_center_cap = 0
-        num_rejected_low_outgoing_for_group = 0
-
-        # Generalize by reading pattern structure.
-        n_in = sum(1 for e in pattern.edges if e.dst == "center")
-        n_out = sum(1 for e in pattern.edges if e.src == "center")
-
-        candidate_centers = set(index.in_edges.keys()) & set(index.out_edges.keys())
-
-        for center in candidate_centers:
-            center_instance_count = 0
-            num_centers_scanned += 1
-
-            # Fast degree check before candidate selection.
-            if len(index.in_edges.get(center, [])) < n_in:
-                continue
-
-            if len(index.out_edges.get(center, [])) < n_out:
-                continue
-
-            # Only cap incoming globally.
-            # Outgoing will be queried per incoming group using in_end.
-            incoming = cap_edges(
-                index.in_edges.get(center, []),
-                max_candidates=self.max_in_candidates,
-                policy=self.candidate_policy,
-            )
-
-            if self.amount_min is not None:
-                incoming = [
-                    e for e in incoming
-                    if e.amount >= self.amount_min
-                ]
-
-            if len(incoming) < n_in:
-                continue
-
-            for in_combo in combinations(incoming, n_in):
-                num_in_combinations_checked += 1
-
-                in_edges = sorted(
-                    list(in_combo),
-                    key=lambda e: (e.step, e.edge_id),
-                )
-
-                if not passes_consecutive_step_gap(
-                    in_edges,
-                    self.incoming_phase_delta,
-                ):
-                    num_rejected_incoming_phase_delta += 1
-                    continue
-
-                src_nodes = [e.src for e in in_edges]
-
-                if not has_distinct_nodes(src_nodes + [center]):
-                    num_rejected_nodes += 1
-                    continue
-
-                in_end = max(int(e.step) for e in in_edges)
-
-                # ----------------------------------------------------
-                # Group-aware outgoing query:
-                # only query outgoing edges after this incoming group.
-                # ----------------------------------------------------
-                if self.center_handoff_delta is not None:
-                    t_out_max = min(
-                        in_end + self.center_handoff_delta,
-                        in_edges[0].step + pattern.max_duration,
-                    )
+    # Perform validation checks
+    print("\nRunning post-run validation checks...")
+
+    # 1. No matcher crash
+    if validation_stats_df.height > 0 and "status" in validation_stats_df.columns:
+        failed_runs = validation_stats_df.filter(pl.col("status") == "failed")
+        if failed_runs.height > 0:
+            print("[FAIL] One or more matchers crashed during execution:")
+            for row in failed_runs.iter_rows(named=True):
+                print(f"  Pattern: {row['motif_type']}, Error: {row.get('error_message', 'Unknown error')}")
+            raise ValueError("Validation failed: Matcher crashed")
+        else:
+            print("[PASS] No matcher crashes detected.")
+    else:
+        raise ValueError("Validation failed: Empty stats returned from run.")
+
+    # 2. Schema correctness, canonical_key uniqueness, membership rows count consistency
+    motif_dir_path = Path(MOTIF_INSTANCE_DIR) / "window_id=000000"
+    membership_dir_path = Path(MEMBERSHIP_DIR) / "window_id=000000"
+
+    if motif_dir_path.exists() and membership_dir_path.exists():
+        for pattern in VALIDATION_PATTERNS:
+            motif_file = motif_dir_path / f"{pattern.name}.parquet"
+            membership_file = membership_dir_path / f"{pattern.name}.parquet"
+            
+            if motif_file.exists() and membership_file.exists():
+                df_motifs = pl.read_parquet(motif_file)
+                df_members = pl.read_parquet(membership_file)
+                
+                num_instances = df_motifs.height
+                num_members = df_members.height
+                k_edges = len(pattern.edges)
+                
+                print(f"\nChecking pattern '{pattern.name}' (instances={num_instances}, expected_edges_per_instance={k_edges}):")
+                
+                # Check schema correctness
+                expected_motif_cols = {
+                    "motif_instance_id", "window_id", "motif_type", "anchor_edge_id",
+                    "canonical_key", "instance_score", "candidate_rank",
+                    "time_compactness", "amount_consistency", "amount_sum_log",
+                    "degree_penalty", "flow_ratio", "flow_gap", "center_degree"
+                }
+                missing_motif_cols = expected_motif_cols - set(df_motifs.columns)
+                if missing_motif_cols:
+                    raise ValueError(f"Validation failed: motif instances schema missing columns: {missing_motif_cols}")
+                
+                expected_member_cols = {"motif_instance_id", "edge_id", "role_in_motif"}
+                missing_member_cols = expected_member_cols - set(df_members.columns)
+                if missing_member_cols:
+                    raise ValueError(f"Validation failed: membership schema missing columns: {missing_member_cols}")
+                    
+                print(f"  [PASS] Schemas for motifs and memberships are correct.")
+                
+                # Check canonical_key uniqueness
+                if "canonical_key" in df_motifs.columns:
+                    num_unique_keys = df_motifs["canonical_key"].n_unique()
+                    if num_unique_keys != num_instances:
+                        raise ValueError(f"Validation failed: duplicate canonical_keys found in motifs ({num_unique_keys} unique vs {num_instances} total)")
+                    print(f"  [PASS] Canonical keys are unique.")
+                
+                # Check membership rows match num_instances * num_edges
+                expected_members_count = num_instances * k_edges
+                if num_members != expected_members_count:
+                    raise ValueError(f"Validation failed: membership rows mismatch for {pattern.name}. Got {num_members}, expected {expected_members_count}")
+                print(f"  [PASS] Membership rows count matches num_instances * num_edges.")
+                
+                # Check if any pattern hits max_instances_per_window
+                pattern_stats = validation_stats_df.filter(pl.col("motif_type") == pattern.name)
+                if pattern_stats.height > 0 and "hit_max_instances_per_window" in pattern_stats.columns:
+                    hit_cap = pattern_stats["hit_max_instances_per_window"][0]
+                    if hit_cap == 1:
+                        raise ValueError(f"Validation failed: Pattern {pattern.name} hit max_instances_per_window cap!")
+                    else:
+                        print(f"  [PASS] Pattern {pattern.name} did not hit max_instances_per_window cap.")
                 else:
-                    t_out_max = in_edges[0].step + pattern.max_duration
+                    print(f"  [PASS] Pattern {pattern.name} did not hit max_instances_per_window cap.")
+                        
+                # Check num_instances is reasonable
+                if num_instances < 0 or num_instances > 1_000_000:
+                    raise ValueError(f"Validation failed: unreasonable instance count ({num_instances}) for pattern {pattern.name}")
+                print(f"  [PASS] Instance count ({num_instances}) is reasonable.")
+    else:
+        raise ValueError("[FAIL] Could not locate output directories for window 0.")
 
-                outgoing_for_group = index.outgoing(
-                    src=center,
-                    t_min=in_end,
-                    t_max=t_out_max,
-                    include_left=False,
-                )
+    print("\n[SUCCESS] Validation run checks passed!")
+else:
+    print("[NOTE] df_edges or windows not found in globals. Skipping validation run execution.")
 
-                if self.amount_min is not None:
-                    outgoing_for_group = [
-                        e for e in outgoing_for_group
-                        if e.amount >= self.amount_min
-                    ]
-
-                outgoing_for_group = cap_edges(
-                    outgoing_for_group,
-                    max_candidates=self.max_out_candidates,
-                    policy=self.candidate_policy,
-                )
-
-                if len(outgoing_for_group) < n_out:
-                    num_rejected_low_outgoing_for_group += 1
-                    continue
-
-                for out_combo in combinations(outgoing_for_group, n_out):
-                    num_products_checked += 1
-
-                    out_edges = sorted(
-                        list(out_combo),
-                        key=lambda e: (e.step, e.edge_id),
-                    )
-
-                    if not passes_consecutive_step_gap(
-                        out_edges,
-                        self.outgoing_phase_delta,
-                    ):
-                        num_rejected_outgoing_phase_delta += 1
-                        continue
-
-                    dst_nodes = [e.dst for e in out_edges]
-
-                    if not has_distinct_nodes(src_nodes + [center] + dst_nodes):
-                        num_rejected_nodes += 1
-                        continue
-
-                    out_start = min(int(e.step) for e in out_edges)
-
-                    # Incoming must happen before outgoing.
-                    if out_start <= in_end:
-                        num_rejected_time += 1
-                        continue
-
-                    if not phase_gap_ok(
-                        in_edges,
-                        out_edges,
-                        self.center_handoff_delta,
-                    ):
-                        num_rejected_handoff_delta += 1
-                        continue
-
-                    edges = in_edges + out_edges
-
-                    if not has_unique_edge_ids(edges):
-                        continue
-
-                    if not is_within_total_duration(
-                        edges,
-                        pattern.max_duration,
-                    ):
-                        num_rejected_time += 1
-                        continue
-
-                    anchor = get_anchor_edge(edges)
-
-                    if not is_edge_in_primary_window(anchor, window):
-                        num_rejected_anchor += 1
-                        continue
-
-                    flow_features = _compute_center_inout_flow_features(
-                        in_edges=in_edges,
-                        out_edges=out_edges,
-                    )
-
-                    if self.use_amount_ratio:
-                        ratio = flow_features["flow_ratio"]
-
-                        if ratio <= 0:
-                            num_rejected_amount += 1
-                            continue
-
-                        if (
-                            pattern.amount_ratio_min is not None
-                            and ratio < pattern.amount_ratio_min
-                        ):
-                            num_rejected_amount += 1
-                            continue
-
-                        if (
-                            pattern.amount_ratio_max is not None
-                            and ratio > pattern.amount_ratio_max
-                        ):
-                            num_rejected_amount += 1
-                            continue
-
-                    # General node_map for any n_in, n_out.
-                    node_map = {"center": int(center)}
-
-                    node_map.update({
-                        f"in_{i + 1}": int(in_edges[i].src)
-                        for i in range(n_in)
-                    })
-
-                    node_map.update({
-                        f"out_{i + 1}": int(out_edges[i].dst)
-                        for i in range(n_out)
-                    })
-
-                    role_map = {}
-
-                    for i in range(n_in):
-                        role_map[f"incoming_{i + 1}"] = int(in_edges[i].edge_id)
-
-                    for i in range(n_out):
-                        role_map[f"outgoing_{i + 1}"] = int(out_edges[i].edge_id)
-
-                    try:
-                        motif_row = make_motif_instance_row(
-                            window_id=window.window_id,
-                            pattern=pattern,
-                            edges=edges,
-                            node_map=node_map,
-                            role_map=role_map,
-                            anchor_edge_id=anchor.edge_id,
-                            validate=True,
-                        )
-
-                        # Add flow features into motif row.
-                        motif_row.update(flow_features)
-
-                    except Exception:
-                        continue
-
-                    membership = make_edge_motif_membership_rows(
-                        motif_row=motif_row,
-                        pattern=pattern,
-                        edges=edges,
-                    )
-
-                    motif_rows.append(motif_row)
-                    membership_rows.extend(membership)
-
-                    center_instance_count += 1
-
-                    if (
-                        self.max_instances_per_center is not None
-                        and center_instance_count >= self.max_instances_per_center
-                    ):
-                        num_rejected_center_cap += 1
-                        break
-
-                    if len(motif_rows) >= self.max_instances_per_window:
-                        break
-
-                if (
-                    self.max_instances_per_center is not None
-                    and center_instance_count >= self.max_instances_per_center
-                ):
-                    break
-
-                if len(motif_rows) >= self.max_instances_per_window:
-                    break
-
-            if len(motif_rows) >= self.max_instances_per_window:
-                break
-
-        motif_df = motif_instance_rows_to_polars(motif_rows)
-        membership_df = membership_rows_to_polars(membership_rows)
-
-        elapsed = time.time() - start_time
-
-        stats = {
-            "window_id": int(window.window_id),
-            "motif_type": pattern.name,
-            "matcher_type": pattern.matcher_type,
-
-            "primary_num_edges": int(df_primary.height),
-            "extended_num_edges": int(df_extended.height),
-
-            "n_in": int(n_in),
-            "n_out": int(n_out),
-
-            "num_centers_scanned": int(num_centers_scanned),
-            "num_in_combinations_checked": int(num_in_combinations_checked),
-            "num_products_checked": int(num_products_checked),
-
-            "num_instances": int(motif_df.height),
-            "num_membership_rows": int(membership_df.height),
-
-            "num_rejected_time": int(num_rejected_time),
-            "num_rejected_nodes": int(num_rejected_nodes),
-            "num_rejected_anchor": int(num_rejected_anchor),
-            "num_rejected_amount": int(num_rejected_amount),
-            "num_rejected_incoming_phase_delta": int(num_rejected_incoming_phase_delta),
-            "num_rejected_outgoing_phase_delta": int(num_rejected_outgoing_phase_delta),
-            "num_rejected_handoff_delta": int(num_rejected_handoff_delta),
-            "num_rejected_center_cap": int(num_rejected_center_cap),
-            "num_rejected_low_outgoing_for_group": int(num_rejected_low_outgoing_for_group),
-
-            "hit_max_instances_per_window": int(
-                len(motif_rows) >= self.max_instances_per_window
-            ),
-            "elapsed_seconds": float(elapsed),
-        }
-
-        if write_output:
-            motif_path, membership_path = write_motif_outputs(
-                motif_rows=motif_rows,
-                membership_rows=membership_rows,
-                window_id=window.window_id,
-                motif_type=pattern.name,
-            )
-
-            stats["motif_path"] = motif_path
-            stats["membership_path"] = membership_path
-
-        return motif_df, membership_df, stats
-
-
-
-
-# Register split-merge matcher.
-split_merge_matcher = SplitMergeMatcher(
-    max_out_candidates=12,
-    max_merge_candidates_per_intermediate=3,
-    max_instances_per_window=30_000,
-    amount_min=None,
-    use_amount_ratio=True,
-    candidate_policy="hybrid",
-    split_phase_delta=DELTA_HOP,
-    merge_phase_delta=DELTA_HOP,
-    split_to_merge_delta=DELTA_HOP,
-    max_instances_per_source=2_000,
-)
-
-MATCHER_REGISTRY["split_merge"] = split_merge_matcher
-
-print("SplitMergeMatcher (role mapping fixed) registered.")
-print("MATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
-
-
-center_inout_matcher = CenterInOutMatcher(
-    max_in_candidates=15,
-    max_out_candidates=8,
-    max_instances_per_window=30_000,
-    amount_min=None,
-    use_amount_ratio=True,
-    candidate_policy="hybrid",
-    incoming_phase_delta=DELTA_HOP,
-    outgoing_phase_delta=DELTA_HOP,
-    center_handoff_delta=DELTA_HOP,
-    max_instances_per_center=2_000,
-)
-
-MATCHER_REGISTRY["center_in_out"] = center_inout_matcher
-
-print("CenterInOutMatcher (group-aware outgoing + flow features) registered.")
-print("MATCHER_REGISTRY keys:", list(MATCHER_REGISTRY.keys()))
 print("Cell 14 completed.")
 
 
+# ============================================================
+# Cell 15: Full Production Run
+# ============================================================
+# To make debugging and runtime control easier, motif families can be run separately
+# using the RUN_GROUP control.
+
+# Choose which group to run: "all", "fan", "flow", "cycle"
+RUN_GROUP = "all" 
+
+PATTERNS_TO_RUN_ALL = (
+    fan_in_patterns          # fan_in_4 .. fan_in_8
+    + fan_out_patterns       # fan_out_4 .. fan_out_8
+    + split_merge_patterns   # split_merge_6, _8, _10
+    + center_inout_patterns  # all CENTER_INOUT_CONFIGS
+)
+
+if globals().get("ENABLE_CYCLES", False):
+    PATTERNS_TO_RUN_ALL = PATTERNS_TO_RUN_ALL + globals().get("cycle_patterns", [])
+
+# Filter patterns based on RUN_GROUP
+if RUN_GROUP == "fan":
+    patterns_to_run = [p for p in PATTERNS_TO_RUN_ALL if p.matcher_type in ["fan_in", "fan_out"]]
+elif RUN_GROUP == "flow":
+    patterns_to_run = [p for p in PATTERNS_TO_RUN_ALL if p.matcher_type in ["split_merge", "center_in_out"]]
+elif RUN_GROUP == "cycle":
+    patterns_to_run = [p for p in PATTERNS_TO_RUN_ALL if p.matcher_type == "path_cycle"]
+else:
+    patterns_to_run = PATTERNS_TO_RUN_ALL
+
+print(f"Running production run for group: {RUN_GROUP}")
+print(f"Patterns to match: {[p.name for p in patterns_to_run]}")
+
+MAX_WINDOWS_TO_RUN_ALL    = None    # Set to small int for quick test
+SKIP_EXISTING_OUTPUTS_ALL = True
+# Write empty outputs to prevent missing parquet file errors in downstream evaluation cells
+WRITE_EMPTY_OUTPUTS_ALL   = True
+
+if 'df_edges' in globals() and 'windows' in globals():
+    all_run_stats_df = run_matchers_over_windows(
+        df_edges=df_edges,
+        windows=windows,
+        patterns_to_run=patterns_to_run,
+        matcher_registry=MATCHER_REGISTRY,
+        run_mode="production",
+        max_windows=MAX_WINDOWS_TO_RUN_ALL,
+        skip_existing=SKIP_EXISTING_OUTPUTS_ALL,
+        write_empty_outputs=WRITE_EMPTY_OUTPUTS_ALL
+    )
+    print("\nProduction run complete.")
+else:
+    print("[NOTE] df_edges or windows not found in globals. Skipping production run execution.")
+
+print("Cell 15 completed.")
+
 
 # ============================================================
-# Cell 15: Post-Run Aggregation
+# Cell 16: Post-run deduplication
 # ============================================================
-# Run this cell AFTER a full pipeline run (Cell 17) completes.
 
 from pathlib import Path
-
 
 def merge_and_deduplicate_motif_shards(
     motif_instance_dir: str,
@@ -2210,9 +416,10 @@ def merge_and_deduplicate_motif_shards(
 ) -> pl.DataFrame:
     """
     Merge all per-window motif instance shards and deduplicate by canonical_key.
-    Keeps the instance from the earliest window when duplicates exist.
+    Rule: keep the instance with the highest instance_score; if there's a tie,
+    keep the one from the earliest window_id.
     """
-    paths  = sorted(Path(motif_instance_dir).glob("*.parquet"))
+    paths  = sorted(Path(motif_instance_dir).glob("**/*.parquet"))
     shards = [pl.read_parquet(p) for p in paths if p.stat().st_size > 0]
 
     if not shards:
@@ -2221,9 +428,17 @@ def merge_and_deduplicate_motif_shards(
 
     df_all = pl.concat(shards)
 
+    # Ensure instance_score column exists (defaulting to 0.0 if not present)
+    if "instance_score" not in df_all.columns:
+        df_all = df_all.with_columns(pl.lit(0.0).alias("instance_score"))
+
+    # Sorting logic:
+    #   canonical_key: ascending
+    #   instance_score: descending (highest score first)
+    #   window_id: ascending (earliest window first)
     df_deduped = (
         df_all
-        .sort(["canonical_key", "window_id"])
+        .sort(["canonical_key", "instance_score", "window_id"], descending=[False, True, False])
         .unique(subset=["canonical_key"], keep="first")
     )
 
@@ -2244,7 +459,7 @@ def build_edge_participation_summary(
         motif_types_list, roles_list,
         + all original df_edges columns (joined)
     """
-    paths  = sorted(Path(membership_dir).glob("*.parquet"))
+    paths  = sorted(Path(membership_dir).glob("**/*.parquet"))
     shards = [pl.read_parquet(p) for p in paths if p.stat().st_size > 0]
 
     if not shards:
@@ -2252,8 +467,6 @@ def build_edge_participation_summary(
         return df_edges
 
     df_membership = pl.concat(shards)
-
-    # Deduplicate membership rows by (edge_id, motif_instance_id).
     df_membership = df_membership.unique(subset=["edge_id", "motif_instance_id"])
 
     summary = (
@@ -2275,234 +488,357 @@ def build_edge_participation_summary(
 
     return result
 
+# Run deduplication automatically if data is available
+DEDUPED_MOTIF_PATH = f"{OUTPUT_DIR}/all_motif_instances_deduped.parquet"
+if 'df_edges' in globals():
+    df_motif_deduped = merge_and_deduplicate_motif_shards(
+        motif_instance_dir=MOTIF_INSTANCE_DIR,
+        output_path=DEDUPED_MOTIF_PATH
+    )
+    edge_participation = build_edge_participation_summary(
+        membership_dir=MEMBERSHIP_DIR,
+        df_edges=df_edges
+    )
+else:
+    print("[NOTE] df_edges not found in globals. Skipping deduplication execution.")
+
+print("Cell 16 completed.")
+
+
+# ============================================================
+# Cell 17: SAR evaluation and retrieval report
+# ============================================================
 
 def compute_structural_recall(
     edge_participation: pl.DataFrame,
 ) -> Dict[str, Any]:
     """
-    POST-HOC EVALUATION ONLY. Not used during mining.
-
-    Computes what fraction of edges labelled is_sar=1 appear in
-    at least one matched motif instance.
-
-    This tells us whether our purely structural miner happens to
-    recover the same edges human analysts flagged as suspicious.
-
-    Low recall means: look at the topology of uncovered SAR edges
-    and decide whether new motif families are needed.
+    Compute what fraction of SAR-labelled edges appear in at least one motif.
     """
     if "is_sar" not in edge_participation.columns:
-        return {"error": "is_sar column not present"}
-
-    total_edges = edge_participation.height
-    sar_edges   = edge_participation.filter(pl.col("is_sar") == 1)
-    total_sar   = sar_edges.height
-
+        return {"error": "is_sar column not found"}
+    sar_edges = edge_participation.filter(pl.col("is_sar") == 1)
+    total_sar = sar_edges.height
     if total_sar == 0:
-        return {"total_sar": 0, "structural_recall": None}
-
-    covered = sar_edges.filter(pl.col("num_motif_instances") > 0)
-    n_covered = covered.height
-
-    # Breakdown by motif type for covered SAR edges.
-    if "motif_types_list" in covered.columns:
-        type_counts = (
-            covered
-            .explode("motif_types_list")
-            .group_by("motif_types_list")
-            .len()
-            .sort("len", descending=True)
-        )
-    else:
-        type_counts = pl.DataFrame()
-
+        return {"total_sar": 0, "recall": 0.0}
+    sar_in_motif = sar_edges.filter(pl.col("num_motif_instances") > 0)
+    covered_sar = sar_in_motif.height
     return {
-        "total_edges":                  total_edges,
-        "total_sar_edges":              total_sar,
-        "sar_in_at_least_one_motif":    n_covered,
-        "structural_recall":            round(n_covered / total_sar, 4),
-        "sar_in_no_motif":              total_sar - n_covered,
-        "motif_type_breakdown":         type_counts,
+        "total_sar": total_sar,
+        "covered_sar": covered_sar,
+        "recall": covered_sar / total_sar if total_sar > 0 else 0.0
     }
 
+def evaluate_motif_performance(
+    df_edges: pl.DataFrame,
+    df_motifs: pl.DataFrame,
+    df_memberships: pl.DataFrame,
+    output_dir: str = FEATURE_DIR,
+) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """
+    Computes rigorous SAR evaluation metrics on matched motifs.
+    Returns:
+        motif_family_eval, window_eval, top_instances_by_score, top_instances_by_sar_ratio
+    """
+    if df_motifs.height == 0 or df_memberships.height == 0:
+        print("No motif instances to evaluate.")
+        empty = pl.DataFrame()
+        return empty, empty, empty, empty
 
-# ============================================================
-# Run aggregation (uncomment after a full Cell 17 run)
-# ============================================================
-
-# DEDUPED_MOTIF_PATH = f"{OUTPUT_DIR}/all_motif_instances_deduped.parquet"
-
-# df_motif_deduped = merge_and_deduplicate_motif_shards(
-#     motif_instance_dir = MOTIF_INSTANCE_DIR,
-#     output_path        = DEDUPED_MOTIF_PATH,
-# )
-
-# edge_participation = build_edge_participation_summary(
-#     membership_dir = MEMBERSHIP_DIR,
-#     df_edges       = df_edges,
-# )
-
-# recall_result = compute_structural_recall(edge_participation)
-
-# print("\nStructural recall (post-hoc evaluation):")
-# for k, v in recall_result.items():
-#     if isinstance(v, pl.DataFrame):
-#         print(f"\n  {k}:")
-#         display(v)
-#     else:
-#         print(f"  {k}: {v}")
-
-# EDGE_FEATURE_PATH = f"{FEATURE_DIR}/edge_participation_summary.parquet"
-# edge_participation.write_parquet(EDGE_FEATURE_PATH)
-# print(f"\nEdge participation summary saved to {EDGE_FEATURE_PATH}")
-
-print("Cell 15 (aggregation) loaded. Uncomment run block after full pipeline completes.")
-print("Cell 15 completed.")
-
-
-
-# ============================================================
-# Cell 16: Validation Run — one window, all families
-# ============================================================
-"""
-Purpose:
-    Run exactly 1 window for each matcher type to confirm:
-    - generalized n-branch fan patterns work for all sizes
-    - cycle bidirectional search activates correctly for k >= 7
-    - split_merge and center_inout work for all configured sizes
-    - stacked_bipartite produces output without error
-
-    Check that num_instances > 0 for at least one pattern per family.
-    Check that no matcher errors or crashes.
-    Check that output schemas match the expected parquet structure.
-"""
-
-VALIDATION_PATTERNS = [
-    # One representative from each family
-    fan_in_patterns[0],     # fan_in_4 (n=3)
-    fan_in_patterns[-1],    # fan_in_8 (n=7) — largest
-    fan_out_patterns[0],
-    fan_out_patterns[-1],
-    cycle_patterns[0],      # cycle_5
-    cycle_patterns[2],      # cycle_7 — triggers bidirectional
-    split_merge_patterns[0],
-    split_merge_patterns[-1],
-    center_inout_patterns[0],
-    center_inout_patterns[-1],
-    # stacked_bipartite_patterns[0],
-]
-
-required_types = sorted(set(p.matcher_type for p in VALIDATION_PATTERNS))
-missing = [t for t in required_types if t not in MATCHER_REGISTRY]
-if missing:
-    raise ValueError(f"Missing matchers: {missing}")
-
-validation_stats_df = run_matchers_over_windows(
-    df_edges              = df_edges,
-    windows               = windows,
-    patterns_to_run       = VALIDATION_PATTERNS,
-    matcher_registry      = MATCHER_REGISTRY,
-    max_windows           = 1,
-    skip_existing         = False,
-    write_empty_outputs   = True,
-)
-
-print("\nValidation run stats:")
-display(validation_stats_df)
-
-# Check for any zero-instance patterns (might indicate bugs, worth inspecting).
-zero_instance = validation_stats_df.filter(
-    (pl.col("status") == "completed") & (pl.col("num_instances") == 0)
-)
-if zero_instance.height > 0:
-    print("\nPatterns with 0 instances in validation window:")
-    display(zero_instance.select(["motif_type", "matcher_type", "primary_num_edges"]))
-    print("(This may be expected if the first window has sparse matching topology.)")
-else:
-    print("\nAll patterns found at least one instance in the validation window.")
-
-print("\nCell 16 completed.")
-
-
-
-# ============================================================
-# Cell 17: Full Production Run — All Patterns, All Windows
-# ============================================================
-"""
-Purpose:
-    Run the complete retained motif set across all temporal windows.
-
-Recommended workflow:
-    1. Run Cell 16 (validation) first.
-    2. Confirm no matcher errors and at least some instances found.
-    3. Confirm runtime per window is acceptable (< 5 min per window total).
-    4. Set MAX_WINDOWS_TO_RUN_ALL = None and run this cell.
-"""
-
-PATTERNS_TO_RUN_ALL = (
-    fan_in_patterns          # fan_in_4 .. fan_in_8
-    + fan_out_patterns       # fan_out_4 .. fan_out_8
-    + cycle_patterns         # cycle_5 .. cycle_10
-    + split_merge_patterns   # split_merge_6, _8, _10
-    + center_inout_patterns  # all CENTER_INOUT_CONFIGS
-    # + stacked_bipartite_patterns  # all STACKED_BIPARTITE_CONFIGS
-)
-
-required_matcher_types = sorted(set(p.matcher_type for p in PATTERNS_TO_RUN_ALL))
-missing_matchers = [t for t in required_matcher_types if t not in MATCHER_REGISTRY]
-
-if missing_matchers:
-    raise ValueError(
-        f"Missing matchers in MATCHER_REGISTRY: {missing_matchers}. "
-        f"Available: {list(MATCHER_REGISTRY.keys())}"
+    # Join memberships with edges to get is_sar for each edge
+    df_edge_sar = df_edges.select(["edge_id", "is_sar"])
+    df_member_sar = df_memberships.join(df_edge_sar, on="edge_id", how="left").with_columns(
+        pl.col("is_sar").fill_null(0)
     )
 
-print(f"Full run: {len(PATTERNS_TO_RUN_ALL)} patterns across {len(windows)} windows.")
-print("Patterns:", [p.name for p in PATTERNS_TO_RUN_ALL])
-
-MAX_WINDOWS_TO_RUN_ALL    = None    # set to small int (e.g. 4) for test run
-SKIP_EXISTING_OUTPUTS_ALL = True    # resume safely if interrupted
-WRITE_EMPTY_OUTPUTS_ALL   = True
-
-all_run_stats_df = run_matchers_over_windows(
-    df_edges            = df_edges,
-    windows             = windows,
-    patterns_to_run     = PATTERNS_TO_RUN_ALL,
-    matcher_registry    = MATCHER_REGISTRY,
-    max_windows         = MAX_WINDOWS_TO_RUN_ALL,
-    skip_existing       = SKIP_EXISTING_OUTPUTS_ALL,
-    write_empty_outputs = WRITE_EMPTY_OUTPUTS_ALL,
-)
-
-print("\nFull run stats:")
-display(all_run_stats_df)
-
-# Aggregate summary.
-if all_run_stats_df.height > 0 and "status" in all_run_stats_df.columns:
-    completed = all_run_stats_df.filter(pl.col("status") == "completed")
-
-    if completed.height > 0:
-        summary = (
-            completed
-            .group_by("motif_type")
-            .agg([
-                pl.col("num_instances").sum().alias("total_instances"),
-                pl.col("num_membership_rows").sum().alias("total_membership_rows"),
-                pl.col("elapsed_seconds").sum().alias("total_match_seconds"),
-                pl.col("hit_max_instances_per_window").sum().alias("windows_hit_cap"),
-                pl.col("window_id").n_unique().alias("windows_completed"),
-            ])
-            .sort("total_instances", descending=True)
+    # Compute instance-level SAR stats
+    df_instance_sar = (
+        df_member_sar
+        .group_by("motif_instance_id")
+        .agg([
+            pl.len().alias("k_edges"),
+            pl.col("is_sar").sum().alias("sar_edges"),
+        ])
+        .with_columns(
+            (pl.col("sar_edges") / pl.col("k_edges")).alias("instance_sar_ratio")
         )
+    )
 
-        print("\nAggregate summary by motif type:")
-        display(summary)
+    # Join back to motifs
+    df_motifs_eval = df_motifs.join(df_instance_sar, on="motif_instance_id", how="left")
 
-        capped = summary.filter(pl.col("windows_hit_cap") > 0)
-        if capped.height > 0:
-            print("\nWarning: these patterns hit max_instances_per_window cap:")
-            display(capped.select(["motif_type", "windows_hit_cap",
-                                   "total_instances", "windows_completed"]))
-            print("Consider reducing candidate caps or window size for these families.")
+    # Find the windows list and create a dictionary
+    windows_list = globals().get("windows", [])
+    window_dict = {w.window_id: w for w in windows_list} if windows_list else {}
 
-print("\nCell 17 completed.")
+    # Find unique windows in this evaluation run
+    run_window_ids = df_motifs["window_id"].unique().to_list()
+    run_specs = [window_dict[w] for w in run_window_ids if w in window_dict]
+    
+    # Baseline for the entire run (union of primary windows executed)
+    if run_specs:
+        conditions = []
+        for ws in run_specs:
+            conditions.append((pl.col("step") >= ws.primary_start) & (pl.col("step") <= ws.primary_end))
+        df_run_edges = df_edges.filter(pl.any_horizontal(conditions))
+    else:
+        df_run_edges = df_edges
+
+    orig_total_edges = df_run_edges.height
+    orig_sar_edges = df_run_edges.filter(pl.col("is_sar") == 1).height
+    orig_sar_rate = orig_sar_edges / orig_total_edges if orig_total_edges > 0 else 0.0
+
+    # 1. Evaluate by Motif Family (motif_type)
+    motif_types = df_motifs_eval["motif_type"].unique().to_list()
+    family_rows = []
+
+    for mtype in motif_types:
+        df_mtype_instances = df_motifs_eval.filter(pl.col("motif_type") == mtype)
+        instance_ids = df_mtype_instances["motif_instance_id"].unique()
+        
+        # Unique edges in this family
+        df_mtype_members = df_member_sar.filter(pl.col("motif_instance_id").is_in(instance_ids))
+        unique_edges_df = df_mtype_members.unique(subset=["edge_id"])
+        
+        motif_uniq_edges = unique_edges_df.height
+        motif_uniq_sar = unique_edges_df.filter(pl.col("is_sar") == 1).height
+        
+        motif_sar_rate = motif_uniq_sar / motif_uniq_edges if motif_uniq_edges > 0 else 0.0
+        sar_precision = motif_sar_rate
+        capture_rate = motif_uniq_sar / orig_sar_edges if orig_sar_edges > 0 else 0.0
+        enrichment = motif_sar_rate / orig_sar_rate if orig_sar_rate > 0 else 1.0
+        
+        # Instance level metrics
+        mean_ratio = df_mtype_instances["instance_sar_ratio"].mean()
+        median_ratio = df_mtype_instances["instance_sar_ratio"].median()
+        any_sar = df_mtype_instances.filter(pl.col("sar_edges") > 0).height
+        all_sar = df_mtype_instances.filter(pl.col("sar_edges") == pl.col("k_edges")).height
+        
+        family_rows.append({
+            "motif_type": mtype,
+            "original_window_edges": orig_total_edges,
+            "original_window_sar_edges": orig_sar_edges,
+            "original_window_sar_rate": orig_sar_rate,
+            "motif_unique_edges": motif_uniq_edges,
+            "motif_unique_sar_edges": motif_uniq_sar,
+            "motif_edge_sar_rate": motif_sar_rate,
+            "sar_edge_capture_rate": capture_rate,
+            "sar_precision_inside_motifs": sar_precision,
+            "sar_enrichment": enrichment,
+            "mean_instance_sar_ratio": mean_ratio,
+            "median_instance_sar_ratio": median_ratio,
+            "instances_with_any_sar": any_sar,
+            "instances_with_all_sar": all_sar,
+            "num_instances": df_mtype_instances.height,
+        })
+        
+    motif_family_eval = pl.DataFrame(family_rows).sort("sar_enrichment", descending=True)
+
+    # 2. Evaluate by Window (window_id)
+    window_ids = df_motifs_eval["window_id"].unique().to_list()
+    window_rows = []
+
+    for w_id in window_ids:
+        df_w_instances = df_motifs_eval.filter(pl.col("window_id") == w_id)
+        w_instance_ids = df_w_instances["motif_instance_id"].unique()
+        
+        # Determine the baseline for this specific window
+        if w_id in window_dict:
+            ws = window_dict[w_id]
+            df_w_edges = df_edges.filter((pl.col("step") >= ws.primary_start) & (pl.col("step") <= ws.primary_end))
+        else:
+            df_w_edges = df_edges
+            
+        w_orig_total = df_w_edges.height
+        w_orig_sar = df_w_edges.filter(pl.col("is_sar") == 1).height
+        w_orig_sar_rate = w_orig_sar / w_orig_total if w_orig_total > 0 else 0.0
+        
+        # Unique edges in this window's motifs
+        df_w_members = df_member_sar.filter(pl.col("motif_instance_id").is_in(w_instance_ids))
+        w_unique_edges_df = df_w_members.unique(subset=["edge_id"])
+        
+        w_motif_uniq_edges = w_unique_edges_df.height
+        w_motif_uniq_sar = w_unique_edges_df.filter(pl.col("is_sar") == 1).height
+        
+        w_motif_sar_rate = w_motif_uniq_sar / w_motif_uniq_edges if w_motif_uniq_edges > 0 else 0.0
+        w_capture = w_motif_uniq_sar / w_orig_sar if w_orig_sar > 0 else 0.0
+        w_enrichment = w_motif_sar_rate / w_orig_sar_rate if w_orig_sar_rate > 0 else 1.0
+        
+        mean_ratio = df_w_instances["instance_sar_ratio"].mean()
+        median_ratio = df_w_instances["instance_sar_ratio"].median()
+        any_sar = df_w_instances.filter(pl.col("sar_edges") > 0).height
+        all_sar = df_w_instances.filter(pl.col("sar_edges") == pl.col("k_edges")).height
+        
+        window_rows.append({
+            "window_id": w_id,
+            "original_window_edges": w_orig_total,
+            "original_window_sar_edges": w_orig_sar,
+            "original_window_sar_rate": w_orig_sar_rate,
+            "motif_unique_edges": w_motif_uniq_edges,
+            "motif_unique_sar_edges": w_motif_uniq_sar,
+            "motif_edge_sar_rate": w_motif_sar_rate,
+            "sar_edge_capture_rate": w_capture,
+            "sar_precision_inside_motifs": w_motif_sar_rate,
+            "sar_enrichment": w_enrichment,
+            "mean_instance_sar_ratio": mean_ratio,
+            "median_instance_sar_ratio": median_ratio,
+            "instances_with_any_sar": any_sar,
+            "instances_with_all_sar": all_sar,
+            "num_instances": df_w_instances.height,
+        })
+        
+    window_eval = pl.DataFrame(window_rows).sort("window_id")
+
+    # 3. Top instances by score
+    top_instances_by_score = df_motifs_eval.sort("instance_score", descending=True).head(500)
+    
+    # 4. Top instances by SAR ratio
+    top_instances_by_sar_ratio = df_motifs_eval.sort("instance_sar_ratio", descending=True).head(500)
+
+    # Write files
+    os.makedirs(output_dir, exist_ok=True)
+    motif_family_eval.write_parquet(f"{output_dir}/motif_family_eval.parquet")
+    window_eval.write_parquet(f"{output_dir}/window_eval.parquet")
+    top_instances_by_score.write_parquet(f"{output_dir}/top_instances_by_score.parquet")
+    top_instances_by_sar_ratio.write_parquet(f"{output_dir}/top_instances_by_sar_ratio.parquet")
+    
+    print("SAR evaluation files saved successfully.")
+    return motif_family_eval, window_eval, top_instances_by_score, top_instances_by_sar_ratio
+
+# Run evaluation automatically if data is available
+if 'df_motif_deduped' in globals() and 'df_edges' in globals():
+    df_all_members = pl.read_parquet(MEMBERSHIP_DIR + "/**/*.parquet")
+    df_deduped_members = df_all_members.filter(pl.col("motif_instance_id").is_in(df_motif_deduped["motif_instance_id"]))
+    motif_family_eval, window_eval, top_instances_by_score, top_instances_by_sar_ratio = evaluate_motif_performance(
+        df_edges=df_edges,
+        df_motifs=df_motif_deduped,
+        df_memberships=df_deduped_members
+    )
+    
+    # Run structural recall
+    recall_stats = compute_structural_recall(edge_participation)
+    print("\nOverall Structural Recall on background SAR:")
+    for k, v in recall_stats.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4%}")
+        else:
+            print(f"  {k}: {v}")
+else:
+    print("[NOTE] df_motif_deduped or df_edges not found in globals. Skipping evaluation execution.")
+
+print("Cell 17 completed.")
+
+
+# ============================================================
+# Cell 18: Final summary tables
+# ============================================================
+
+def generate_summary_reports(
+    run_stats_df: Optional[pl.DataFrame] = None,
+    eval_dir: str = FEATURE_DIR,
+):
+    """
+    Reads output metrics and prints human-readable summary tables.
+    """
+    print("=" * 60)
+    print("                   FINAL MOTIF MINING SUMMARY REPORT")
+    print("=" * 60)
+    
+    family_eval_path = f"{eval_dir}/motif_family_eval.parquet"
+    
+    if not os.path.exists(family_eval_path):
+        print("Evaluation files not found. Please run aggregation and evaluation cells first.")
+        return
+        
+    family_df = pl.read_parquet(family_eval_path)
+    
+    # 1. Instance count & SAR enrichment by motif type
+    print("\n### 1. MOTIF PERFORMANCE AND ENRICHMENT SUMMARY")
+    print("-" * 75)
+    print(f"{'Motif Type':<25} | {'Instances':<10} | {'Motif SAR Rate':<14} | {'Enrichment':<10} | {'Capture Rate':<12}")
+    print("-" * 75)
+    for row in family_df.iter_rows(named=True):
+        print(f"{row['motif_type']:<25} | {row['num_instances']:<10} | {row['motif_edge_sar_rate']:<14.4%} | {row['sar_enrichment']:<10.2f}x | {row['sar_edge_capture_rate']:<12.2%}")
+        
+    # 2. Runtime by motif type
+    if run_stats_df is not None and run_stats_df.height > 0:
+        print("\n### 2. RUNTIME BY MOTIF TYPE")
+        print("-" * 65)
+        print(f"{'Motif Type':<25} | {'Total Match Time':<18} | {'Avg Window Time':<18}")
+        print("-" * 65)
+        
+        completed_stats = run_stats_df.filter(pl.col("status") == "completed")
+        if completed_stats.height > 0:
+            runtime_df = (
+                completed_stats
+                .group_by("motif_type")
+                .agg([
+                    pl.col("elapsed_seconds").sum().alias("total_time"),
+                    pl.col("elapsed_seconds").mean().alias("avg_time"),
+                ])
+                .sort("total_time", descending=True)
+            )
+            for row in runtime_df.iter_rows(named=True):
+                print(f"{row['motif_type']:<25} | {row['total_time']:<18.2f}s | {row['avg_time']:<18.2f}s")
+        else:
+            print("No completed pattern runs found in stats.")
+            
+        # 3. Windows where caps were hit
+        print("\n### 3. WINDOW CAPS SUMMARY")
+        print("-" * 60)
+        capped_df = run_stats_df.filter(
+            (pl.col("status") == "completed") & 
+            (pl.col("hit_max_instances_per_window") > 0)
+        )
+        if capped_df.height > 0:
+            print(f"{'Window ID':<10} | {'Motif Type':<25} | {'Status':<15}")
+            print("-" * 60)
+            for row in capped_df.iter_rows(named=True):
+                print(f"{row['window_id']:<10} | {row['motif_type']:<25} | {'CAP HIT':<15}")
+        else:
+            print("No windows hit the maximum instance limit cap.")
+    else:
+        print("\n[NOTE] Run stats dataframe not provided; skipping runtime & cap tables.")
+
+    # 4. Decision Rule analysis (Top families to keep / remove)
+    print("\n### 4. RECOMMENDATIONS AND MOTIF KEEP/REMOVE DECISIONS")
+    print("-" * 60)
+    
+    keep_df = family_df.filter(pl.col("sar_enrichment") >= 1.5)
+    remove_df = family_df.filter(pl.col("sar_enrichment") < 1.0)
+    monitor_df = family_df.filter((pl.col("sar_enrichment") >= 1.0) & (pl.col("sar_enrichment") < 1.5))
+    
+    print("  🟢 TOP MOTIF FAMILIES TO KEEP (Enrichment >= 1.5):")
+    if keep_df.height > 0:
+        for row in keep_df.iter_rows(named=True):
+            priority = "PRIORITIZE" if row['sar_enrichment'] > 2.0 else "USEFUL"
+            print(f"    - {row['motif_type']:<20} (Enrichment: {row['sar_enrichment']:.2f}x) -> DECISION: {priority}")
+    else:
+        print("    None")
+        
+    print("\n  🟡 MARGINAL MOTIF FAMILIES (Enrichment 1.0 - 1.5):")
+    if monitor_df.height > 0:
+        for row in monitor_df.iter_rows(named=True):
+            print(f"    - {row['motif_type']:<20} (Enrichment: {row['sar_enrichment']:.2f}x) -> DECISION: MONITOR/RE-TUNE")
+    else:
+        print("    None")
+        
+    print("\n  🔴 MOTIF FAMILIES TO REMOVE (Enrichment < 1.0):")
+    if remove_df.height > 0:
+        for row in remove_df.iter_rows(named=True):
+            print(f"    - {row['motif_type']:<20} (Enrichment: {row['sar_enrichment']:.2f}x) -> DECISION: REMOVE")
+    else:
+        print("    None")
+        
+    print("=" * 60)
+
+# Run report generation automatically
+if 'all_run_stats_df' in globals():
+    generate_summary_reports(run_stats_df=all_run_stats_df)
+elif 'validation_stats_df' in globals():
+    print("\n[NOTE] Using validation run stats for summary tables:")
+    generate_summary_reports(run_stats_df=validation_stats_df)
+else:
+    generate_summary_reports(run_stats_df=None)
+
+print("Cell 18 completed.")

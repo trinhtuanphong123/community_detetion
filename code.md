@@ -834,71 +834,71 @@ def make_center_inout_pattern(n_in: int, n_out: int) -> MotifPattern:
 
 
 # ------------------------------------------------------------
-# Pattern 6: Two-stage split
+# Pattern 6: Two-stage split (Stacked Bipartite) - Disabled/Removed
 # a -> d, b -> d, b -> e, c -> e, d -> f, d -> g, e -> h
 # ------------------------------------------------------------
 
-def make_stacked_bipartite_pattern(layer_sizes: List[int]) -> MotifPattern:
-    """
-    Layered bipartite chain.
-
-    layer_sizes defines the width of each intermediate layer.
-    Example: layer_sizes=[3, 2] means:
-        layer 0: [L0_0]       (1 source node)
-        layer 1: [L1_0..L1_2] (3 intermediate nodes)
-        layer 2: [L2_0..L2_1] (2 intermediate nodes)
-        layer 3: [L3_0]       (1 sink node)
-
-    Between each pair of adjacent layers, there is a full bipartite
-    edge set (every node in layer i connects to every node in layer i+1).
-
-    Total edges = sum over adjacent layer pairs of (width_i * width_{i+1}),
-    with width_0 = width_last = 1.
-    """
-    if not layer_sizes:
-        raise ValueError("layer_sizes must have at least one element")
-
-    all_layer_widths = [1] + list(layer_sizes) + [1]
-
-    # Build node names per layer.
-    all_layers: List[List[str]] = []
-    for l_idx, width in enumerate(all_layer_widths):
-        all_layers.append([f"L{l_idx}_{j}" for j in range(width)])
-
-    nodes = [n for layer in all_layers for n in layer]
-
-    edges: List[PatternEdge] = []
-    order = 1
-    for l_idx in range(len(all_layers) - 1):
-        for src_node in all_layers[l_idx]:
-            for dst_node in all_layers[l_idx + 1]:
-                edges.append(
-                    PatternEdge(
-                        name  = f"e{order}",
-                        src   = src_node,
-                        dst   = dst_node,
-                        order = order,
-                        role  = f"L{l_idx}_to_L{l_idx+1}_{src_node}_{dst_node}",
-                    )
-                )
-                order += 1
-
-    size_str = "_".join(str(s) for s in layer_sizes)
-
-    return MotifPattern(
-        name             = f"stacked_bipartite_{size_str}",
-        nodes            = nodes,
-        edges            = edges,
-        matcher_type     = "stacked_bipartite",
-        max_duration     = MAX_MOTIF_DURATION,
-        time_order       = "nondecreasing",
-        distinct_nodes   = True,
-        amount_ratio_min = AMOUNT_RATIO_MIN,
-        amount_ratio_max = AMOUNT_RATIO_MAX,
-        description      = (
-            f"Stacked bipartite with intermediate layer widths {layer_sizes}."
-        ),
-    )
+# def make_stacked_bipartite_pattern(layer_sizes: List[int]) -> MotifPattern:
+#     """
+#     Layered bipartite chain.
+# 
+#     layer_sizes defines the width of each intermediate layer.
+#     Example: layer_sizes=[3, 2] means:
+#         layer 0: [L0_0]       (1 source node)
+#         layer 1: [L1_0..L1_2] (3 intermediate nodes)
+#         layer 2: [L2_0..L2_1] (2 intermediate nodes)
+#         layer 3: [L3_0]       (1 sink node)
+# 
+#     Between each pair of adjacent layers, there is a full bipartite
+#     edge set (every node in layer i connects to every node in layer i+1).
+# 
+#     Total edges = sum over adjacent layer pairs of (width_i * width_{i+1}),
+#     with width_0 = width_last = 1.
+#     """
+#     if not layer_sizes:
+#         raise ValueError("layer_sizes must have at least one element")
+# 
+#     all_layer_widths = [1] + list(layer_sizes) + [1]
+# 
+#     # Build node names per layer.
+#     all_layers: List[List[str]] = []
+#     for l_idx, width in enumerate(all_layer_widths):
+#         all_layers.append([f"L{l_idx}_{j}" for j in range(width)])
+# 
+#     nodes = [n for layer in all_layers for n in layer]
+# 
+#     edges: List[PatternEdge] = []
+#     order = 1
+#     for l_idx in range(len(all_layers) - 1):
+#         for src_node in all_layers[l_idx]:
+#             for dst_node in all_layers[l_idx + 1]:
+#                 edges.append(
+#                     PatternEdge(
+#                         name  = f"e{order}",
+#                         src   = src_node,
+#                         dst   = dst_node,
+#                         order = order,
+#                         role  = f"L{l_idx}_to_L{l_idx+1}_{src_node}_{dst_node}",
+#                     )
+#                 )
+#                 order += 1
+# 
+#     size_str = "_".join(str(s) for s in layer_sizes)
+# 
+#     return MotifPattern(
+#         name             = f"stacked_bipartite_{size_str}",
+#         nodes            = nodes,
+#         edges            = edges,
+#         matcher_type     = "stacked_bipartite",
+#         max_duration     = MAX_MOTIF_DURATION,
+#         time_order       = "nondecreasing",
+#         distinct_nodes   = True,
+#         amount_ratio_min = AMOUNT_RATIO_MIN,
+#         amount_ratio_max = AMOUNT_RATIO_MAX,
+#         description      = (
+#             f"Stacked bipartite with intermediate layer widths {layer_sizes}."
+#         ),
+#     )
 
 
 # ============================================================
@@ -911,8 +911,7 @@ cycle_patterns         = [make_cycle_pattern(k)       for k in CYCLE_SIZES]
 split_merge_patterns   = [make_split_merge_pattern(n) for n in SPLIT_MERGE_SIZES]
 center_inout_patterns  = [make_center_inout_pattern(n_in, n_out)
                           for n_in, n_out in CENTER_INOUT_CONFIGS]
-stacked_bipartite_patterns = [make_stacked_bipartite_pattern(cfg)
-                              for cfg in STACKED_BIPARTITE_CONFIGS]
+stacked_bipartite_patterns = []
 
 # Convenience aliases for backward compatibility with later cells.
 fan_in_4   = fan_in_patterns[0]    # n=3 branches, 4 total nodes
@@ -921,22 +920,27 @@ cycle_5    = cycle_patterns[0]
 split_merge_5 = split_merge_patterns[0]   # 3 branch pairs, 5 total nodes
 fanin_fanout_6 = center_inout_patterns[0] # (3 in, 2 out)
 
-ALL_PATTERNS = (
+CORE_PATTERNS = (
     fan_in_patterns
     + fan_out_patterns
     + cycle_patterns
     + split_merge_patterns
     + center_inout_patterns
-    + stacked_bipartite_patterns
 )
 
-ACTIVE_PATTERNS = [
+OPTIONAL_PATTERNS = []
+
+DIAGNOSTIC_PATTERNS = [
     fan_in_4,
     fan_out_4,
     cycle_5,
     split_merge_5,
     fanin_fanout_6,
 ]
+
+# For backward compatibility
+ALL_PATTERNS = CORE_PATTERNS + OPTIONAL_PATTERNS
+ACTIVE_PATTERNS = DIAGNOSTIC_PATTERNS
 
 for p in ALL_PATTERNS:
     validate_pattern(p)
@@ -1300,32 +1304,37 @@ class TemporalIndex:
     This prevents scanning all edges in a delta_t range.
     """
 
-    def __init__(self, edges: List[Dict[str, Any]]):
+    def __init__(self, edges: List[EdgeRecord]):
+        import numpy as np
+
         self.out_edges = defaultdict(list)
         self.in_edges = defaultdict(list)
         self.pair_edges = defaultdict(list)
 
         self.num_edges = len(edges)
 
-        # Convert dicts to EdgeRecord and sort once globally.
-        edge_records = [
-            EdgeRecord(
-                edge_id=int(e["edge_id"]),
-                src=int(e["src"]),
-                dst=int(e["dst"]),
-                step=int(e["step"]),
-                amount=float(e["amount"]),
-                is_sar=int(e["is_sar"]),
-            )
-            for e in edges
-        ]
+        # Sort once globally to ensure temporal order.
+        edge_records = sorted(edges, key=lambda e: (e.step, e.edge_id))
 
-        edge_records.sort(key=lambda e: (e.step, e.edge_id))
+        # Initialize metadata
+        self.node_in_degree = defaultdict(int)
+        self.node_out_degree = defaultdict(int)
+        self.pair_count = defaultdict(int)
 
         for e in edge_records:
             self.out_edges[e.src].append(e)
             self.in_edges[e.dst].append(e)
             self.pair_edges[(e.src, e.dst)].append(e)
+
+            # Increment degrees and pair counts
+            self.node_out_degree[e.src] += 1
+            self.node_in_degree[e.dst] += 1
+            self.pair_count[(e.src, e.dst)] += 1
+
+        # Convert defaultdicts to regular dicts
+        self.node_in_degree = dict(self.node_in_degree)
+        self.node_out_degree = dict(self.node_out_degree)
+        self.pair_count = dict(self.pair_count)
 
         # Precompute step arrays for binary search.
         self.out_times = {
@@ -1342,6 +1351,18 @@ class TemporalIndex:
             key: [e.step for e in edge_list]
             for key, edge_list in self.pair_edges.items()
         }
+
+        # Index-level metadata
+        total_sar = sum(1 for e in edge_records if e.is_sar)
+        self.sar_rate_window = float(total_sar / self.num_edges) if self.num_edges > 0 else 0.0
+
+        amounts = [e.amount for e in edge_records]
+        quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+        if amounts:
+            q_vals = np.quantile(amounts, quantiles)
+            self.amount_quantiles = {q: float(v) for q, v in zip(quantiles, q_vals)}
+        else:
+            self.amount_quantiles = {q: 0.0 for q in quantiles}
 
     def _range_query(
         self,
@@ -1601,6 +1622,305 @@ else:
 print("\nCell 7 completed.")
 
 
+# ============================================================
+# Cell 7b: Common validation, scoring, and candidate selection helpers
+# ============================================================
+
+import json
+import math
+import numpy as np
+from typing import List, Dict, Tuple, Any, Optional
+
+def has_unique_edge_ids(edges: List[EdgeRecord]) -> bool:
+    edge_ids = [e.edge_id for e in edges]
+    return len(edge_ids) == len(set(edge_ids))
+
+
+def has_distinct_nodes(node_values: List[int]) -> bool:
+    return len(node_values) == len(set(node_values))
+
+
+def is_within_total_duration(edges: List[EdgeRecord], max_duration: int) -> bool:
+    if not edges:
+        return True
+    steps = [e.step for e in edges]
+    return (max(steps) - min(steps)) <= max_duration
+
+
+def passes_consecutive_step_gap(edges: List[EdgeRecord], max_gap: Optional[int]) -> bool:
+    if max_gap is None:
+        return True
+    if len(edges) <= 1:
+        return True
+    edges_sorted = sorted(edges, key=lambda e: (e.step, e.edge_id))
+    steps = [int(e.step) for e in edges_sorted]
+    for i in range(len(steps) - 1):
+        if steps[i + 1] - steps[i] > max_gap:
+            return False
+    return True
+
+
+def phase_gap_ok(
+    earlier_edges: List[EdgeRecord],
+    later_edges: List[EdgeRecord],
+    max_gap: Optional[int],
+) -> bool:
+    if max_gap is None:
+        return True
+    if len(earlier_edges) == 0 or len(later_edges) == 0:
+        return False
+    earlier_end = max(int(e.step) for e in earlier_edges)
+    later_start = min(int(e.step) for e in later_edges)
+    return 0 < (later_start - earlier_end) <= max_gap
+
+
+def amount_consistency(edges: List[EdgeRecord]) -> float:
+    amounts = [float(e.amount) for e in edges if float(e.amount) > 0]
+    if not amounts:
+        return 0.0
+    max_amount = max(amounts)
+    if max_amount <= 0:
+        return 0.0
+    return float(min(amounts) / max_amount)
+
+# Alias for backward compatibility
+compute_amount_consistency = amount_consistency
+
+
+def flow_ratio(in_edges: List[EdgeRecord], out_edges: List[EdgeRecord]) -> float:
+    in_sum = float(sum(e.amount for e in in_edges))
+    out_sum = float(sum(e.amount for e in out_edges))
+    return out_sum / in_sum if in_sum > 0 else 0.0
+
+
+def make_canonical_key(
+    motif_type: str,
+    edge_ids: List[int],
+    ordered: bool = True,
+) -> str:
+    if ordered:
+        canonical_edge_ids = [int(eid) for eid in edge_ids]
+    else:
+        canonical_edge_ids = sorted(int(eid) for eid in edge_ids)
+
+    key_obj = {
+        "motif_type": motif_type,
+        "edge_ids": canonical_edge_ids,
+    }
+    return json.dumps(key_obj, sort_keys=True)
+
+
+# ------------------------------------------------------------
+# SUSPICIOUSNESS SCORING FUNCTIONS
+# ------------------------------------------------------------
+
+def score_temporal_compactness(edges: List[EdgeRecord], max_duration: int) -> float:
+    if len(edges) <= 1:
+        return 1.0
+    if max_duration <= 0:
+        return 0.0
+    steps = [e.step for e in edges]
+    duration = max(steps) - min(steps)
+    return max(0.0, min(1.0, 1.0 - (duration / max_duration)))
+
+
+def score_amount_consistency(edges: List[EdgeRecord]) -> float:
+    return amount_consistency(edges)
+
+
+def score_amount_scale(edges: List[EdgeRecord], amount_quantiles: Dict[float, float]) -> float:
+    if not edges:
+        return 0.0
+    mean_amount = sum(e.amount for e in edges) / len(edges)
+    
+    q50 = amount_quantiles.get(0.5, 0.0)
+    q90 = amount_quantiles.get(0.9, 0.0)
+    q99 = amount_quantiles.get(0.99, 0.0)
+    
+    if mean_amount >= q99:
+        return 1.0
+    elif mean_amount >= q90:
+        return 0.8 + 0.2 * (mean_amount - q90) / (q99 - q90) if q99 > q90 else 0.8
+    elif mean_amount >= q50:
+        return 0.5 + 0.3 * (mean_amount - q50) / (q90 - q50) if q90 > q50 else 0.5
+    else:
+        return 0.5 * mean_amount / q50 if q50 > 0 else 0.0
+
+
+def score_degree_penalty(
+    edges: List[EdgeRecord],
+    node_in_degree: Dict[int, int],
+    node_out_degree: Dict[int, int]
+) -> float:
+    nodes = set()
+    for e in edges:
+        nodes.add(e.src)
+        nodes.add(e.dst)
+        
+    max_deg = 0
+    for n in nodes:
+        in_d = node_in_degree.get(n, 0)
+        out_d = node_out_degree.get(n, 0)
+        deg = in_d + out_d
+        if deg > max_deg:
+            max_deg = deg
+            
+    if max_deg <= 10:
+        return 1.0
+    elif max_deg <= 100:
+        return 1.0 - 0.5 * (max_deg - 10) / 90
+    else:
+        return max(0.1, 0.5 * 100 / max_deg)
+
+
+def score_flow_conservation(in_edges: List[EdgeRecord], out_edges: List[EdgeRecord]) -> float:
+    ratio = flow_ratio(in_edges, out_edges)
+    if ratio <= 0:
+        return 0.0
+    return math.exp(-((ratio - 1.0) ** 2) / 0.5)
+
+
+def score_instance(edges: List[EdgeRecord], index: TemporalIndex, pattern: MotifPattern) -> float:
+    if pattern.matcher_type == "split_merge":
+        n = len(edges) // 2
+        split_edges = edges[:n]
+        merge_edges = edges[n:]
+        
+        split_comp = score_temporal_compactness(split_edges, pattern.max_duration)
+        merge_comp = score_temporal_compactness(merge_edges, pattern.max_duration)
+        
+        in_end = max(e.step for e in split_edges)
+        out_start = min(e.step for e in merge_edges)
+        gap = max(0, out_start - in_end)
+        gap_score = math.exp(-gap / 3.0)
+        
+        flow_score = score_flow_conservation(split_edges, merge_edges)
+        consistency = score_amount_consistency(edges)
+        penalty = score_degree_penalty(edges, index.node_in_degree, index.node_out_degree)
+        
+        overall_score = (split_comp * 0.15) + (merge_comp * 0.15) + (gap_score * 0.15) + (flow_score * 0.25) + (consistency * 0.20) + (penalty * 0.10)
+        return float(overall_score)
+        
+    elif pattern.matcher_type == "center_in_out":
+        n_in = sum(1 for e in pattern.edges if e.dst == "center")
+        in_edges = edges[:n_in]
+        out_edges = edges[n_in:]
+        
+        in_comp = score_temporal_compactness(in_edges, pattern.max_duration)
+        out_comp = score_temporal_compactness(out_edges, pattern.max_duration)
+        
+        in_end = max(e.step for e in in_edges)
+        out_start = min(e.step for e in out_edges)
+        gap = max(0, out_start - in_end)
+        gap_score = math.exp(-gap / 3.0)
+        
+        flow_score = score_flow_conservation(in_edges, out_edges)
+        consistency = score_amount_consistency(edges)
+        penalty = score_degree_penalty(edges, index.node_in_degree, index.node_out_degree)
+        
+        overall_score = (in_comp * 0.15) + (out_comp * 0.15) + (gap_score * 0.15) + (flow_score * 0.25) + (consistency * 0.20) + (penalty * 0.10)
+        return float(overall_score)
+        
+    else:
+        compactness = score_temporal_compactness(edges, pattern.max_duration)
+        consistency = score_amount_consistency(edges)
+        scale = score_amount_scale(edges, index.amount_quantiles)
+        penalty = score_degree_penalty(edges, index.node_in_degree, index.node_out_degree)
+        
+        overall_score = (compactness * 0.25) + (consistency * 0.25) + (scale * 0.25) + (penalty * 0.25)
+        return float(overall_score)
+
+
+# ------------------------------------------------------------
+# RANKING-BASED CANDIDATE SELECTION
+# ------------------------------------------------------------
+
+def cap_edges(
+    edges: List[EdgeRecord],
+    max_candidates: int,
+    policy: str = "hybrid",
+    anchor_edge: Optional[EdgeRecord] = None,
+    amount_quantiles: Optional[Dict[float, float]] = None,
+) -> List[EdgeRecord]:
+    """
+    Candidate cap helper implementing multiple policies.
+    Policies:
+        - earliest: earliest by step
+        - top_amount: highest transaction amount
+        - temporally_dense: closest in time to anchor_edge
+        - amount_coherent: closest in amount to anchor_edge (or index median)
+        - hybrid: a combination of earliest, top_amount, temporally_dense, and amount_coherent
+    
+    Important: is_sar is never used in candidate selection.
+    """
+    if max_candidates is None or len(edges) <= max_candidates:
+        return sorted(edges, key=lambda e: (e.step, e.edge_id))
+
+    if policy == "earliest":
+        selected = sorted(edges, key=lambda e: (e.step, e.edge_id))[:max_candidates]
+        return sorted(selected, key=lambda e: (e.step, e.edge_id))
+
+    if policy == "top_amount":
+        selected = sorted(edges, key=lambda e: (-e.amount, e.step, e.edge_id))[:max_candidates]
+        return sorted(selected, key=lambda e: (e.step, e.edge_id))
+
+    if policy == "temporally_dense" and anchor_edge is not None:
+        selected = sorted(edges, key=lambda e: (abs(e.step - anchor_edge.step), e.step, e.edge_id))[:max_candidates]
+        return sorted(selected, key=lambda e: (e.step, e.edge_id))
+
+    if policy == "amount_coherent" and anchor_edge is not None:
+        selected = sorted(edges, key=lambda e: (abs(e.amount - anchor_edge.amount), e.step, e.edge_id))[:max_candidates]
+        return sorted(selected, key=lambda e: (e.step, e.edge_id))
+
+    # Fallback to hybrid combination
+    k_earliest = max(1, max_candidates // 4)
+    k_amount = max(1, max_candidates // 4)
+    k_dense = max(1, max_candidates // 4) if anchor_edge is not None else 0
+    k_coherent = max(1, max_candidates - (k_earliest + k_amount + k_dense)) if anchor_edge is not None else 0
+    
+    if anchor_edge is None:
+        k_earliest = max_candidates // 2
+        k_amount = max_candidates - k_earliest
+
+    earliest = sorted(edges, key=lambda e: (e.step, e.edge_id))[:k_earliest]
+    top_amount = sorted(edges, key=lambda e: (-e.amount, e.step, e.edge_id))[:k_amount]
+    
+    dense = []
+    if anchor_edge is not None:
+        dense = sorted(edges, key=lambda e: (abs(e.step - anchor_edge.step), e.step, e.edge_id))[:k_dense]
+
+    coherent = []
+    if anchor_edge is not None:
+        coherent = sorted(edges, key=lambda e: (abs(e.amount - anchor_edge.amount), e.step, e.edge_id))[:k_coherent]
+    else:
+        median_amount = amount_quantiles.get(0.5, 0.0) if amount_quantiles else 0.0
+        coherent = sorted(edges, key=lambda e: (abs(e.amount - median_amount), e.step, e.edge_id))[:k_amount]
+
+    selected_dict = {}
+    for e in earliest + top_amount + dense + coherent:
+        selected_dict[e.edge_id] = e
+
+    if len(selected_dict) < max_candidates:
+        remaining = sorted(edges, key=lambda e: (e.step, e.edge_id))
+        for e in remaining:
+            if e.edge_id not in selected_dict:
+                selected_dict[e.edge_id] = e
+                if len(selected_dict) >= max_candidates:
+                    break
+
+    return sorted(selected_dict.values(), key=lambda e: (e.step, e.edge_id))
+
+
+def select_edges_by_hybrid_policy(
+    edges: List[EdgeRecord],
+    max_candidates: int,
+    early_ratio: float = 0.5,
+) -> List[EdgeRecord]:
+    return cap_edges(edges, max_candidates, "hybrid")
+
+
+print("Cell 7b: Common validation, scoring, and candidate selection helpers ready.")
+
 
 # ============================================================
 # Cell 8: Helper Functions for Motif Instance Output
@@ -1623,31 +1943,6 @@ def edge_record_to_dict(e: EdgeRecord) -> Dict[str, Any]:
         "amount": float(e.amount),
         "is_sar": int(e.is_sar),
     }
-
-
-def make_canonical_key(
-    motif_type: str,
-    edge_ids: List[int],
-    ordered: bool = True,
-) -> str:
-    """
-    Canonical key used to avoid duplicate motif instances.
-
-    For path/cycle motifs, ordered=True keeps edge order.
-    For fan-in/fan-out motifs, ordered=False sorts edge IDs because branch order is not meaningful.
-    """
-
-    if ordered:
-        canonical_edge_ids = [int(eid) for eid in edge_ids]
-    else:
-        canonical_edge_ids = sorted(int(eid) for eid in edge_ids)
-
-    key_obj = {
-        "motif_type": motif_type,
-        "edge_ids": canonical_edge_ids,
-    }
-
-    return json.dumps(key_obj, sort_keys=True)
 
 
 def make_motif_instance_id(
@@ -1732,6 +2027,8 @@ def make_motif_instance_row(
     role_map: Dict[str, int],
     anchor_edge_id: Optional[int] = None,
     validate: bool = False,
+    index: Optional[TemporalIndex] = None,
+    candidate_rank: int = -1,
 ) -> Dict[str, Any]:
     """
     Create one row for motif_instances.
@@ -1745,23 +2042,24 @@ def make_motif_instance_row(
 
         edges:
             Ordered list of EdgeRecord objects according to pattern edge order.
-            For fan-in/fan-out, this should still be canonicalized by the matcher.
 
         node_map:
             Mapping from abstract pattern node to real node.
-            Example:
-                {"a": 1001, "b": 1002, "d": 9001}
 
         role_map:
             Mapping from pattern edge role/name to real edge_id.
-            Example:
-                {"incoming_1": 11, "incoming_2": 12, "incoming_3": 13}
 
         anchor_edge_id:
             Edge used as anchor. If None, use the first edge.
 
-    Returns:
-        A JSON/parquet-safe dictionary.
+        validate:
+            Whether to run structural validation.
+
+        index:
+            TemporalIndex object (optional, for scoring and degrees).
+
+        candidate_rank:
+            Rank of candidate anchor edge (optional).
     """
 
     if validate:
@@ -1805,6 +2103,80 @@ def make_motif_instance_row(
     if anchor_edge_id is None:
         anchor_edge_id = edge_ids[0]
 
+    # Flow ratio, handoff_gap/flow_gap, in_sum, out_sum
+    in_sum_val = 0.0
+    out_sum_val = 0.0
+    flow_ratio_val = 0.0
+    flow_gap_val = 0.0
+
+    if pattern.matcher_type in {"split_merge", "center_in_out"}:
+        if pattern.matcher_type == "split_merge":
+            n = len(edges) // 2
+            in_edges = edges[:n]
+            out_edges = edges[n:]
+        else: # center_in_out
+            n_in = sum(1 for e in pattern.edges if e.dst == "center")
+            in_edges = edges[:n_in]
+            out_edges = edges[n_in:]
+
+        in_sum_val = float(sum(e.amount for e in in_edges))
+        out_sum_val = float(sum(e.amount for e in out_edges))
+        flow_ratio_val = out_sum_val / in_sum_val if in_sum_val > 0 else 0.0
+
+        in_end = max(e.step for e in in_edges)
+        out_start = min(e.step for e in out_edges)
+        flow_gap_val = float(out_start - in_end)
+
+    # Center degree
+    center_degree_val = 0
+    if index is not None:
+        if pattern.matcher_type == "fan_in":
+            center_node = node_map.get("dst")
+            if center_node is not None:
+                center_degree_val = index.node_in_degree.get(center_node, 0) + index.node_out_degree.get(center_node, 0)
+        elif pattern.matcher_type == "fan_out":
+            center_node = node_map.get("src")
+            if center_node is not None:
+                center_degree_val = index.node_in_degree.get(center_node, 0) + index.node_out_degree.get(center_node, 0)
+        elif pattern.matcher_type == "center_in_out":
+            center_node = node_map.get("center")
+            if center_node is not None:
+                center_degree_val = index.node_in_degree.get(center_node, 0) + index.node_out_degree.get(center_node, 0)
+        else:
+            center_degree_val = max(index.node_in_degree.get(n, 0) + index.node_out_degree.get(n, 0) for n in node_map.values()) if node_map else 0
+
+    # Suspicion score and degree penalty
+    if index is not None:
+        instance_score_val = score_instance(edges, index, pattern)
+        degree_penalty_val = score_degree_penalty(edges, index.node_in_degree, index.node_out_degree)
+    else:
+        # Fallback calculations without index
+        compactness = score_temporal_compactness(edges, pattern.max_duration)
+        consistency = amount_consistency(edges)
+        overall = (compactness * 0.4) + (consistency * 0.4) + (flow_ratio_val * 0.2 if in_sum_val > 0 else 0.2)
+        instance_score_val = float(overall)
+        degree_penalty_val = 1.0
+
+    time_compactness_val = score_temporal_compactness(edges, pattern.max_duration)
+    amount_consistency_val = amount_consistency(edges)
+    amount_sum_log_val = math.log1p(amount_sum) if amount_sum > 0 else 0.0
+
+    # Compatibility features
+    amount_coherence_val = float(min(amounts) / max(amounts)) if amounts else 1.0
+    time_span_val = int(max(steps) - min(steps)) if steps else 0
+
+    dst_in_degree_window_val = 0
+    src_out_degree_window_val = 0
+    if index is not None:
+        if pattern.matcher_type == "fan_in":
+            center_node = node_map.get("dst")
+            if center_node is not None:
+                dst_in_degree_window_val = index.node_in_degree.get(center_node, 0)
+        elif pattern.matcher_type == "fan_out":
+            center_node = node_map.get("src")
+            if center_node is not None:
+                src_out_degree_window_val = index.node_out_degree.get(center_node, 0)
+
     row = {
         "motif_instance_id": motif_instance_id,
         "motif_type": pattern.name,
@@ -1812,11 +2184,9 @@ def make_motif_instance_row(
         "window_id": int(window_id),
         "anchor_edge_id": int(anchor_edge_id),
 
-        # List columns.
         "edge_ids": edge_ids,
         "node_ids": node_ids,
 
-        # JSON strings are more stable than nested dicts in early-stage parquet output.
         "node_map_json": json.dumps(
             {str(k): int(v) for k, v in node_map.items()},
             sort_keys=True,
@@ -1843,6 +2213,26 @@ def make_motif_instance_row(
         "amount_min": float(amount_min),
         "amount_max": float(amount_max),
         "amount_mean": float(amount_mean),
+
+        # New ranking fields
+        "instance_score": float(instance_score_val),
+        "time_compactness": float(time_compactness_val),
+        "amount_consistency": float(amount_consistency_val),
+        "amount_sum_log": float(amount_sum_log_val),
+        "degree_penalty": float(degree_penalty_val),
+        "flow_ratio": float(flow_ratio_val),
+        "flow_gap": float(flow_gap_val),
+        "center_degree": int(center_degree_val),
+        "candidate_rank": int(candidate_rank),
+
+        # Compatibility fields
+        "in_sum": float(in_sum_val),
+        "out_sum": float(out_sum_val),
+        "handoff_gap": float(flow_gap_val),
+        "amount_coherence": float(amount_coherence_val),
+        "time_span": int(time_span_val),
+        "dst_in_degree_window": int(dst_in_degree_window_val),
+        "src_out_degree_window": int(src_out_degree_window_val),
     }
 
     return row
@@ -1855,9 +2245,6 @@ def make_edge_motif_membership_rows(
 ) -> List[Dict[str, Any]]:
     """
     Create edge_motif_membership rows from one motif instance.
-
-    Each row says:
-        edge_id belongs to motif_instance_id with a role.
     """
 
     if len(edges) != len(pattern.edges):
@@ -1920,10 +2307,21 @@ def motif_instance_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
         "amount_min": pl.Float64,
         "amount_max": pl.Float64,
         "amount_mean": pl.Float64,
+        
+        # New ranking fields
+        "instance_score": pl.Float64,
+        "time_compactness": pl.Float64,
         "amount_consistency": pl.Float64,
+        "amount_sum_log": pl.Float64,
+        "degree_penalty": pl.Float64,
+        "flow_ratio": pl.Float64,
+        "flow_gap": pl.Float64,
+        "center_degree": pl.Int64,
+        "candidate_rank": pl.Int64,
+
+        # Compatibility fields
         "in_sum": pl.Float64,
         "out_sum": pl.Float64,
-        "flow_ratio": pl.Float64,
         "handoff_gap": pl.Float64,
         "amount_coherence": pl.Float64,
         "time_span": pl.Int64,
@@ -1934,15 +2332,14 @@ def motif_instance_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
         return pl.DataFrame(schema=schema)
 
     df = pl.DataFrame(rows)
-    
-    # Enforce stable schema and order for concatenation compatibility
+
     select_exprs = []
     for col_name, col_type in schema.items():
         if col_name in df.columns:
             select_exprs.append(pl.col(col_name).cast(col_type))
         else:
             select_exprs.append(pl.lit(None, dtype=col_type).alias(col_name))
-            
+
     return df.select(select_exprs)
 
 
@@ -1969,17 +2366,15 @@ def membership_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
         return pl.DataFrame(schema=schema)
 
     df = pl.DataFrame(rows)
-    
-    # Enforce stable schema and order for concatenation compatibility
+
     select_exprs = []
     for col_name, col_type in schema.items():
         if col_name in df.columns:
             select_exprs.append(pl.col(col_name).cast(col_type))
         else:
             select_exprs.append(pl.lit(None, dtype=col_type).alias(col_name))
-            
-    return df.select(select_exprs)
 
+    return df.select(select_exprs)
 
 
 def write_motif_outputs(
@@ -1992,9 +2387,6 @@ def write_motif_outputs(
 ) -> Tuple[str, str]:
     """
     Write motif_instances and edge_motif_membership parquet shards.
-
-    Returns:
-        motif_path, membership_path
     """
 
     motif_df = motif_instance_rows_to_polars(motif_rows)
@@ -2009,81 +2401,4 @@ def write_motif_outputs(
     return motif_path, membership_path
 
 
-# ------------------------------------------------------------
-# Smoke test using a small synthetic fan-in instance
-# ------------------------------------------------------------
-
-print("Running Cell 8 smoke test...")
-
-# Try to create a synthetic-like example from the first three primary edges
-# only if they can be coerced into the fan_in_4 structure for output testing.
-# This test is about output schema, not real motif correctness.
-test_edges_raw = df_primary_test.head(3).to_dicts()
-
-if len(test_edges_raw) >= 3:
-    test_edges = [
-        EdgeRecord(
-            edge_id=int(e["edge_id"]),
-            src=int(e["src"]),
-            dst=int(e["dst"]),
-            step=int(e["step"]),
-            amount=float(e["amount"]),
-            is_sar=int(e["is_sar"]),
-        )
-        for e in test_edges_raw
-    ]
-
-    # Sort by step, edge_id to satisfy fan_in_4 nondecreasing validation.
-    test_edges = sorted(test_edges, key=lambda e: (e.step, e.edge_id))
-
-    # For smoke test only, create an artificial node_map from the selected edges.
-    # The matcher later will build a real structural node_map.
-    test_node_map = {
-        "a": test_edges[0].src,
-        "b": test_edges[1].src,
-        "c": test_edges[2].src,
-        "d": test_edges[0].dst,
-    }
-
-    test_role_map = {
-        "incoming_1": test_edges[0].edge_id,
-        "incoming_2": test_edges[1].edge_id,
-        "incoming_3": test_edges[2].edge_id,
-    }
-
-    try:
-        test_motif_row = make_motif_instance_row(
-            window_id=test_window.window_id,
-            pattern=fan_in_4,
-            edges=test_edges,
-            node_map=test_node_map,
-            role_map=test_role_map,
-            anchor_edge_id=test_edges[0].edge_id,
-            validate=True,
-        )
-
-        test_membership_rows = make_edge_motif_membership_rows(
-            motif_row=test_motif_row,
-            pattern=fan_in_4,
-            edges=test_edges,
-        )
-
-        test_motif_df = motif_instance_rows_to_polars([test_motif_row])
-        test_membership_df = membership_rows_to_polars(test_membership_rows)
-
-        print("Motif instance output schema:")
-        print(test_motif_df.schema)
-        display(test_motif_df)
-
-        print("\nMembership output schema:")
-        print(test_membership_df.schema)
-        display(test_membership_df)
-
-    except Exception as exc:
-        print("Smoke test could not create a validated output row.")
-        print("Reason:", repr(exc))
-        print("This is acceptable if the first three rows violate time duration/order constraints.")
-else:
-    print("Not enough rows in df_primary_test for smoke test.")
-
-print("\nCell 8 completed.")
+# End of code.md
