@@ -201,7 +201,7 @@ class FanMatcher:
             groups = sliding_temporal_groups(candidates, pattern.max_duration, n_branches)
             n_groups_checked += len(groups)
 
-            center_candidates_to_rank = []
+            center_candidates_by_ck = {}
             center_capped = False
             center_combos_count = 0
 
@@ -254,11 +254,11 @@ class FanMatcher:
                             n_rej_lookback += 1
                             continue
 
-                    # 7. Deduplicate via canonical key
+                    # 7. Deduplicate via canonical key (ordered=False consistently for fan-in/fan-out)
                     ck = make_canonical_key(
                         pattern.name,
                         [e.edge_id for e in edges],
-                        ordered=True,
+                        ordered=False,
                     )
                     if ck in seen_canonical_keys:
                         continue
@@ -276,8 +276,10 @@ class FanMatcher:
                     # Score the combination
                     score = score_instance(edges, index, pattern)
 
-                    center_candidates_to_rank.append((score, edges, node_map, role_map, anchor, ck))
+                    if ck not in center_candidates_by_ck or score > center_candidates_by_ck[ck][0]:
+                        center_candidates_by_ck[ck] = (score, edges, node_map, role_map, anchor, ck)
 
+            center_candidates_to_rank = list(center_candidates_by_ck.values())
             # Rank and keep only top K per center
             center_candidates_to_rank.sort(key=lambda x: x[0], reverse=True)
             top_k_candidates = center_candidates_to_rank[:self.max_instances_per_center]
@@ -573,6 +575,9 @@ class SplitMergeMatcher:
             source_combos_count = 0
 
             for split_combo in combinations(split_candidates, n_branches):
+                if source_combos_count >= self.max_combinations_per_source:
+                    break
+
                 split_edges = sorted(
                     list(split_combo),
                     key=lambda e: (e.step, e.edge_id),

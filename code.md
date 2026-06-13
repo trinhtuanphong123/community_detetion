@@ -171,119 +171,35 @@ print("MAX_MOTIF_DURATION:", MAX_MOTIF_DURATION)
 
 
 # ============================================================
-# Cell 3: Load Parquet with Polars and Standardize Schema
+# Cell 3: Load Raw Parquet with Polars
 # ============================================================
 
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(f"Input parquet file not found: {DATA_PATH}")
 
 load_start = time.time()
-
 df_raw = pl.read_parquet(DATA_PATH)
+load_end = time.time()
 
-print("Loaded raw dataframe.")
+print("Loaded raw transaction dataframe.")
 print("Shape:", df_raw.shape)
 print("Schema:")
 print(df_raw.schema)
+print("Load time:", round(load_end - load_start, 3), "seconds")
 
-# ----------------------------
-# Validate required columns
-# ----------------------------
+# Validate that required columns are in df_raw
 missing_cols = [col for col in REQUIRED_RAW_COLUMNS if col not in df_raw.columns]
-
 if missing_cols:
     raise ValueError(
-        f"Missing required columns: {missing_cols}. "
+        f"Missing required raw columns: {missing_cols}. "
         f"Available columns: {df_raw.columns}"
     )
-
-# ----------------------------
-# Rename raw columns to internal schema
-# ----------------------------
-df = (
-    df_raw
-    .rename(RAW_TO_INTERNAL_COLS)
-    .with_columns([
-        pl.col("edge_id").cast(pl.UInt32),
-        pl.col("src").cast(pl.Int64),
-        pl.col("dst").cast(pl.Int64),
-        pl.col("step").cast(pl.Int64),
-        pl.col("amount").cast(pl.Float64),
-        pl.col("is_sar").cast(pl.Int8),
-    ])
-    .sort(["step", "edge_id"])
-)
-
-# Minimal dataframe for motif matcher.
-df_edges = df.select(MATCHER_COLUMNS)
-
-load_end = time.time()
-
-print("\nStandardized dataframe ready.")
-print("df shape:", df.shape)
-print("df_edges shape:", df_edges.shape)
-print("Load + preprocess time:", round(load_end - load_start, 3), "seconds")
-
-print("\nInternal schema:")
-print(df_edges.schema)
-
-print("\nHead of df_edges:")
-display(df_edges.head(10))
-
-# ----------------------------
-# Basic sanity checks
-# ----------------------------
-summary = df_edges.select([
-    pl.len().alias("num_edges"),
-    pl.col("edge_id").n_unique().alias("n_unique_edges"),
-    pl.col("src").n_unique().alias("n_unique_src"),
-    pl.col("dst").n_unique().alias("n_unique_dst"),
-    pl.col("step").min().alias("min_step"),
-    pl.col("step").max().alias("max_step"),
-    pl.col("amount").min().alias("min_amount"),
-    pl.col("amount").max().alias("max_amount"),
-    pl.col("is_sar").sum().alias("num_sar_edges"),
-    pl.col("is_sar").mean().alias("sar_rate"),
-])
-
-print("\nBasic summary:")
-display(summary)
-
-# ----------------------------
-# Data quality checks
-# ----------------------------
-duplicate_edge_ids = (
-    df_edges
-    .group_by("edge_id")
-    .len()
-    .filter(pl.col("len") > 1)
-)
-
-self_loops = df_edges.filter(pl.col("src") == pl.col("dst"))
-
-non_positive_amount = df_edges.filter(pl.col("amount") <= 0)
-
-print("\nData quality checks:")
-print("Duplicate edge_id rows:", duplicate_edge_ids.height)
-print("Self-loop rows:", self_loops.height)
-print("Non-positive amount rows:", non_positive_amount.height)
-
-if duplicate_edge_ids.height > 0:
-    print("\nWarning: duplicate edge_id detected. Show first 10:")
-    display(duplicate_edge_ids.head(10))
-
-if self_loops.height > 0:
-    print("\nWarning: self-loops detected. Show first 10:")
-    display(self_loops.head(10))
-
-if non_positive_amount.height > 0:
-    print("\nWarning: non-positive amount detected. Show first 10:")
-    display(non_positive_amount.head(10))
-
+print("All required raw columns are present.")
 print("\nCell 3 completed.")
 
+
 # ============================================================
-# Cell 4: Standardize Schema
+# Cell 4: Standardize Schema and Execute Quality Checks
 # ============================================================
 
 def standardize_transaction_schema(
@@ -304,7 +220,6 @@ def standardize_transaction_schema(
         df_full: full dataframe with renamed columns and metadata preserved.
         df_edges: minimal edge dataframe for motif matching.
     """
-
     required_raw_cols = [
         "edge_id",
         "step",
@@ -346,7 +261,7 @@ def standardize_transaction_schema(
     return df_full, df_edges
 
 
-# Re-standardize from df_raw loaded in Cell 3.
+# Standardize raw transaction dataframe loaded in Cell 3
 df_full, df_edges = standardize_transaction_schema(
     df_raw=df_raw,
     raw_to_internal_cols=RAW_TO_INTERNAL_COLS,
@@ -920,27 +835,28 @@ cycle_5    = cycle_patterns[0]
 split_merge_5 = split_merge_patterns[0]   # 3 branch pairs, 5 total nodes
 fanin_fanout_6 = center_inout_patterns[0] # (3 in, 2 out)
 
+# 1. Core Patterns: Flow patterns (standard split-merge, standard center-in-out) + small fan patterns
 CORE_PATTERNS = (
-    fan_in_patterns
-    + fan_out_patterns
-    + cycle_patterns
-    + split_merge_patterns
-    + center_inout_patterns
+    [p for p in fan_in_patterns if len(p.edges) <= 4]        # fan_in_4, fan_in_5
+    + [p for p in fan_out_patterns if len(p.edges) <= 4]    # fan_out_4, fan_out_5
+    + [p for p in split_merge_patterns if len(p.edges) // 2 == 3]  # split_merge_5 (3 branch pairs)
+    + [p for p in center_inout_patterns if p.name == "center_inout_3in_2out"]
 )
 
-OPTIONAL_PATTERNS = []
+# 2. Exploration Patterns: Large fan patterns + larger split-merge + larger center-in-out
+EXPLORATION_PATTERNS = (
+    [p for p in fan_in_patterns if len(p.edges) > 4]        # fan_in_6, fan_in_7, fan_in_8
+    + [p for p in fan_out_patterns if len(p.edges) > 4]    # fan_out_6, fan_out_7, fan_out_8
+    + [p for p in split_merge_patterns if len(p.edges) // 2 > 3]  # split_merge_7, split_merge_9
+    + [p for p in center_inout_patterns if p.name != "center_inout_3in_2out"]
+)
 
-DIAGNOSTIC_PATTERNS = [
-    fan_in_4,
-    fan_out_4,
-    cycle_5,
-    split_merge_5,
-    fanin_fanout_6,
-]
+# 3. Diagnostic Patterns: Cycles
+DIAGNOSTIC_PATTERNS = cycle_patterns
 
-# For backward compatibility
-ALL_PATTERNS = CORE_PATTERNS + OPTIONAL_PATTERNS
-ACTIVE_PATTERNS = DIAGNOSTIC_PATTERNS
+# For backward compatibility and dynamic validation of all configurations
+ALL_PATTERNS = CORE_PATTERNS + EXPLORATION_PATTERNS + DIAGNOSTIC_PATTERNS
+ACTIVE_PATTERNS = CORE_PATTERNS
 
 for p in ALL_PATTERNS:
     validate_pattern(p)
@@ -2255,9 +2171,20 @@ def make_edge_motif_membership_rows(
 
     pattern_edges_sorted = sorted(pattern.edges, key=lambda x: x.order)
 
+    # Reconstruct edges in the correct role order using role_map_json from motif_row if available
+    ordered_edges = edges
+    role_map_str = motif_row.get("role_map_json")
+    if role_map_str:
+        try:
+            role_map = json.loads(role_map_str)
+            edge_by_id = {e.edge_id: e for e in edges}
+            ordered_edges = [edge_by_id[int(role_map[p_e.role])] for p_e in pattern_edges_sorted]
+        except Exception:
+            ordered_edges = edges
+
     rows = []
 
-    for p_edge, real_edge in zip(pattern_edges_sorted, edges):
+    for p_edge, real_edge in zip(pattern_edges_sorted, ordered_edges):
         role = p_edge.role if p_edge.role else p_edge.name
 
         rows.append({

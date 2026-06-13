@@ -76,7 +76,7 @@ def run_matchers_over_windows(
         # Setup paths
         motif_dir = f"{MOTIF_INSTANCE_DIR}/window_id={w_id:06d}"
         membership_dir = f"{MEMBERSHIP_DIR}/window_id={w_id:06d}"
-        log_dir = f"logs/window_id={w_id:06d}"
+        log_dir = f"{LOG_DIR}/window_id={w_id:06d}"
 
         os.makedirs(motif_dir, exist_ok=True)
         os.makedirs(membership_dir, exist_ok=True)
@@ -210,13 +210,11 @@ def run_matchers_over_windows(
     else:
         run_stats_df = pl.DataFrame(stats_rows)
 
-    # Save aggregated run stats to the last active logs folder
-    if len(windows_to_run) > 0:
-        last_w_id = int(windows_to_run[-1].window_id)
-        stats_dir = f"logs/window_id={last_w_id:06d}"
-        os.makedirs(stats_dir, exist_ok=True)
-        run_stats_df.write_parquet(f"{stats_dir}/run_stats.parquet")
-        print(f"\nRun stats saved to {stats_dir}/run_stats.parquet")
+    # Save aggregated run stats to the LOG_DIR folder
+    os.makedirs(LOG_DIR, exist_ok=True)
+    stats_path = f"{LOG_DIR}/run_stats_{run_mode}.parquet"
+    run_stats_df.write_parquet(stats_path)
+    print(f"\nRun stats saved to {stats_path}")
 
     print(f"\nMotif mining runner finished in {round(time.time() - run_start_time, 3)}s")
     return run_stats_df
@@ -356,17 +354,13 @@ print("Cell 14 completed.")
 # using the RUN_GROUP control.
 
 # Choose which group to run: "all", "fan", "flow", "cycle"
-RUN_GROUP = "all" 
+RUN_GROUP = "flow" 
 
-PATTERNS_TO_RUN_ALL = (
-    fan_in_patterns          # fan_in_4 .. fan_in_8
-    + fan_out_patterns       # fan_out_4 .. fan_out_8
-    + split_merge_patterns   # split_merge_6, _8, _10
-    + center_inout_patterns  # all CENTER_INOUT_CONFIGS
-)
+# Full production set consists of Core and Exploration patterns
+PATTERNS_TO_RUN_ALL = CORE_PATTERNS + EXPLORATION_PATTERNS
 
 if globals().get("ENABLE_CYCLES", False):
-    PATTERNS_TO_RUN_ALL = PATTERNS_TO_RUN_ALL + globals().get("cycle_patterns", [])
+    PATTERNS_TO_RUN_ALL = PATTERNS_TO_RUN_ALL + DIAGNOSTIC_PATTERNS
 
 # Filter patterns based on RUN_GROUP
 if RUN_GROUP == "fan":
@@ -381,12 +375,13 @@ else:
 print(f"Running production run for group: {RUN_GROUP}")
 print(f"Patterns to match: {[p.name for p in patterns_to_run]}")
 
-MAX_WINDOWS_TO_RUN_ALL    = None    # Set to small int for quick test
+MAX_WINDOWS_TO_RUN_ALL    = 2    # Set to small int for quick test
 SKIP_EXISTING_OUTPUTS_ALL = True
 # Write empty outputs to prevent missing parquet file errors in downstream evaluation cells
 WRITE_EMPTY_OUTPUTS_ALL   = True
+AUTO_RUN_PRODUCTION       = False
 
-if 'df_edges' in globals() and 'windows' in globals():
+if AUTO_RUN_PRODUCTION and 'df_edges' in globals() and 'windows' in globals():
     all_run_stats_df = run_matchers_over_windows(
         df_edges=df_edges,
         windows=windows,
@@ -399,7 +394,7 @@ if 'df_edges' in globals() and 'windows' in globals():
     )
     print("\nProduction run complete.")
 else:
-    print("[NOTE] df_edges or windows not found in globals. Skipping production run execution.")
+    print("[NOTE] AUTO_RUN_PRODUCTION is False or df_edges/windows not found. Skipping production run execution.")
 
 print("Cell 15 completed.")
 
