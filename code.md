@@ -1214,6 +1214,11 @@ print("\nCell 6 completed.")
 # Cell 7: Temporal Index
 # ============================================================
 
+from collections import namedtuple
+
+# Lightweight return type for query results — no __dict__, no Python int boxing overhead
+_EdgeTuple = namedtuple('EdgeRecord', ['edge_id', 'src', 'dst', 'step', 'amount', 'is_sar'])
+
 @dataclass
 class EdgeRecord:
     """
@@ -1221,6 +1226,7 @@ class EdgeRecord:
 
     Keeping this as a dataclass makes matcher code clearer than using raw dicts.
     """
+    __slots__ = ('edge_id', 'src', 'dst', 'step', 'amount', 'is_sar')
     edge_id: int
     src: int
     dst: int
@@ -1230,273 +1236,188 @@ class EdgeRecord:
 
 
 class EdgeIndexView:
-    """
-    Read-only mapping view that materializes EdgeRecord lists on demand
-    from integer edge indices stored in TemporalIndex.
-    """
-
-    def __init__(self, index: "TemporalIndex", idx_dict: Dict[Any, List[int]]):
-        self._index = index
+    def __init__(self, index: "TemporalIndex", idx_dict: Dict[Any, np.ndarray]):
+        self._index    = index
         self._idx_dict = idx_dict
 
-    def get(self, key: Any, default=None) -> List[EdgeRecord]:
-        indices = self._idx_dict.get(key)
-        if indices is None:
+    def get(self, key, default=None):
+        positions = self._idx_dict.get(key)
+        if positions is None:
             return [] if default is None else default
-        return self._index._materialize_edges(indices)
+        return self._index._materialize_edges(positions)
 
     def keys(self):
         return self._idx_dict.keys()
 
     def items(self):
-        for key, indices in self._idx_dict.items():
-            yield key, self._index._materialize_edges(indices)
+        for key, positions in self._idx_dict.items():
+            yield key, self._index._materialize_edges(positions)
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self._idx_dict)
 
 
 class TemporalIndex:
     """
-    Temporal index for directed transaction edges.
-
-    Indexes:
-        outgoing_by_src[src] -> edges sorted by step
-        incoming_by_dst[dst] -> edges sorted by step
-
-    Query methods return candidate EdgeRecord objects within a step interval.
-    This prevents scanning all edges in a delta_t range.
+    NumPy-backed temporal index.
+    
+    Edge data stored as parallel NumPy arrays (28 bytes/edge total).
+    Index dicts map node/pair keys to NumPy int32 index arrays (4 bytes/entry).
+    Step arrays are views into self._steps — zero additional allocation.
+    
+    Query interface is identical to the previous version.
+    Matchers require NO changes.
     """
 
     def __init__(self, edges: List[EdgeRecord]):
         self.num_edges = len(edges)
+        if self.num_edges == 0:
+            self._edge_ids   = np.empty(0, dtype=np.int32)
+            self._srcs       = np.empty(0, dtype=np.int64)
+            self._dsts       = np.empty(0, dtype=np.int64)
+            self._steps      = np.empty(0, dtype=np.int32)
+            self._amounts    = np.empty(0, dtype=np.float32)
+            self._is_sars    = np.empty(0, dtype=np.int8)
+            self._out_idx    = {}
+            self._in_idx     = {}
+            self._pair_idx   = {}
+            self.node_in_degree  = {}
+            self.node_out_degree = {}
+            self.pair_count      = {}
+            self.amount_quantiles = {q: 0.0 for q in [0.1,0.25,0.5,0.75,0.9,0.95,0.99]}
+            self.sar_rate_window = 0.0
+            self.out_edges = EdgeIndexView(self, self._out_idx)
+            self.in_edges  = EdgeIndexView(self, self._in_idx)
+            return
 
-        # Single sorted edge store. All query structures index into this list.
-        self._edges = sorted(edges, key=lambda e: (e.step, e.edge_id))
-        self._out_idx = defaultdict(list)
-        self._in_idx = defaultdict(list)
-        self._pair_idx = defaultdict(list)
+        # Sort once by (step, edge_id) — all arrays share this order
+        sort_keys = sorted(range(len(edges)), key=lambda i: (edges[i].step, edges[i].edge_id))
+        
+        self._edge_ids = np.array([edges[i].edge_id for i in sort_keys], dtype=np.int32)
+        self._srcs     = np.array([edges[i].src     for i in sort_keys], dtype=np.int64)
+        self._dsts     = np.array([edges[i].dst     for i in sort_keys], dtype=np.int64)
+        self._steps    = np.array([edges[i].step    for i in sort_keys], dtype=np.int32)
+        self._amounts  = np.array([edges[i].amount  for i in sort_keys], dtype=np.float32)
+        self._is_sars  = np.array([edges[i].is_sar  for i in sort_keys], dtype=np.int8)
 
-        # Initialize metadata
-        self.node_in_degree = defaultdict(int)
-        self.node_out_degree = defaultdict(int)
-        self.pair_count = defaultdict(int)
+        # Build index dicts: key -> sorted np.int32 array of positions into above arrays
+        out_lists  = defaultdict(list)
+        in_lists   = defaultdict(list)
+        pair_lists = defaultdict(list)
+        in_deg  = defaultdict(int)
+        out_deg = defaultdict(int)
+        pair_ct = defaultdict(int)
 
-        for idx, e in enumerate(self._edges):
-            self._out_idx[e.src].append(idx)
-            self._in_idx[e.dst].append(idx)
-            self._pair_idx[(e.src, e.dst)].append(idx)
+        for pos in range(self.num_edges):
+            s = int(self._srcs[pos])
+            d = int(self._dsts[pos])
+            out_lists[s].append(pos)
+            in_lists[d].append(pos)
+            pair_lists[(s, d)].append(pos)
+            out_deg[s] += 1
+            in_deg[d]  += 1
+            pair_ct[(s, d)] += 1
 
-            # Increment degrees and pair counts
-            self.node_out_degree[e.src] += 1
-            self.node_in_degree[e.dst] += 1
-            self.pair_count[(e.src, e.dst)] += 1
+        # Convert to NumPy int32 arrays — 4 bytes per entry vs 36 bytes for Python int
+        self._out_idx  = {k: np.array(v, dtype=np.int32) for k, v in out_lists.items()}
+        self._in_idx   = {k: np.array(v, dtype=np.int32) for k, v in in_lists.items()}
+        self._pair_idx = {k: np.array(v, dtype=np.int32) for k, v in pair_lists.items()}
 
-        self._out_idx = dict(self._out_idx)
-        self._in_idx = dict(self._in_idx)
-        self._pair_idx = dict(self._pair_idx)
-        self._out_steps = {
-            key: [self._edges[i].step for i in indices]
-            for key, indices in self._out_idx.items()
-        }
-        self._in_steps = {
-            key: [self._edges[i].step for i in indices]
-            for key, indices in self._in_idx.items()
-        }
-        self._pair_steps = {
-            key: [self._edges[i].step for i in indices]
-            for key, indices in self._pair_idx.items()
-        }
+        self.node_in_degree  = dict(in_deg)
+        self.node_out_degree = dict(out_deg)
+        self.pair_count      = dict(pair_ct)
 
-        # Convert defaultdicts to regular dicts to save space.
-        self.node_in_degree = dict(self.node_in_degree)
-        self.node_out_degree = dict(self.node_out_degree)
-        self.pair_count = dict(self.pair_count)
         self.out_edges = EdgeIndexView(self, self._out_idx)
-        self.in_edges = EdgeIndexView(self, self._in_idx)
+        self.in_edges  = EdgeIndexView(self, self._in_idx)
 
-        # Index-level metadata
-        total_sar = sum(1 for e in self._edges if e.is_sar)
-        self.sar_rate_window = float(total_sar / self.num_edges) if self.num_edges > 0 else 0.0
+        # Window-level stats
+        total_sar = int(self._is_sars.sum())
+        self.sar_rate_window = float(total_sar / self.num_edges)
+        q_vals = np.quantile(self._amounts, [0.1,0.25,0.5,0.75,0.9,0.95,0.99])
+        self.amount_quantiles = {
+            q: float(v)
+            for q, v in zip([0.1,0.25,0.5,0.75,0.9,0.95,0.99], q_vals)
+        }
 
-        amounts = [e.amount for e in self._edges]
-        quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
-        if amounts:
-            q_vals = np.quantile(amounts, quantiles)
-            self.amount_quantiles = {q: float(v) for q, v in zip(quantiles, q_vals)}
-        else:
-            self.amount_quantiles = {q: 0.0 for q in quantiles}
-
-    def _materialize_edges(self, indices: List[int]) -> List[EdgeRecord]:
-        return [self._edges[i] for i in indices]
+    def _materialize_edges(self, positions: np.ndarray) -> List[_EdgeTuple]:
+        """
+        Convert a NumPy int32 position array into a list of _EdgeTuple namedtuples.
+        Namedtuples have no __dict__ and use ~120 bytes each vs ~416 for dataclass.
+        Called only for the small result sets returned by query methods (cap <= 100).
+        """
+        return [
+            _EdgeTuple(
+                edge_id = int(self._edge_ids[p]),
+                src     = int(self._srcs[p]),
+                dst     = int(self._dsts[p]),
+                step    = int(self._steps[p]),
+                amount  = float(self._amounts[p]),
+                is_sar  = int(self._is_sars[p]),
+            )
+            for p in positions
+        ]
 
     def _range_query(
         self,
-        idx_dict: Dict[Any, List[int]],
-        steps_dict: Dict[Any, List[int]],
+        idx_dict: Dict[Any, np.ndarray],
         key: Any,
         t_min: int,
         t_max: int,
         include_left: bool = False,
         max_candidates: Optional[int] = None,
-    ) -> List[EdgeRecord]:
-        """
-        Return edges with step in:
-            (t_min, t_max] if include_left=False
-            [t_min, t_max] if include_left=True
-
-        By default, temporal motif expansion should use strict forward time:
-            t_next > t_current
-        """
-
-        indices = idx_dict.get(key)
-        if not indices:
+    ) -> List[_EdgeTuple]:
+        positions = idx_dict.get(key)
+        if positions is None or len(positions) == 0:
             return []
-        steps = steps_dict[key]
 
+        # np.searchsorted on the step values at these positions
+        step_vals = self._steps[positions]   # view, no copy
         if include_left:
-            left = bisect_right(steps, t_min - 1)
+            left  = int(np.searchsorted(step_vals, t_min,     side='left'))
         else:
-            left = bisect_right(steps, t_min)
+            left  = int(np.searchsorted(step_vals, t_min,     side='right'))
+        right = int(np.searchsorted(step_vals, t_max, side='right'))
 
-        right = bisect_right(steps, t_max)
+        result_pos = positions[left:right]   # NumPy slice, no copy
+        if max_candidates is not None and len(result_pos) > max_candidates:
+            result_pos = result_pos[:max_candidates]
 
-        result_idx = indices[left:right]
+        return self._materialize_edges(result_pos)
 
-        if max_candidates is not None and len(result_idx) > max_candidates:
-            result_idx = result_idx[:max_candidates]
+    def outgoing(self, src, t_min, t_max, include_left=False, max_candidates=None):
+        return self._range_query(self._out_idx, src, t_min, t_max, include_left, max_candidates)
 
-        return self._materialize_edges(result_idx)
+    def incoming(self, dst, t_min, t_max, include_left=False, max_candidates=None):
+        return self._range_query(self._in_idx, dst, t_min, t_max, include_left, max_candidates)
 
-    def outgoing(
-        self,
-        src: int,
-        t_min: int,
-        t_max: int,
-        include_left: bool = False,
-        max_candidates: Optional[int] = None,
-    ) -> List[EdgeRecord]:
-        """
-        Query src -> ? edges in temporal range.
-        """
-        return self._range_query(
-            self._out_idx,
-            self._out_steps,
-            src,
-            t_min,
-            t_max,
-            include_left=include_left,
-            max_candidates=max_candidates,
-        )
+    def pair(self, src, dst, t_min, t_max, include_left=False, max_candidates=None):
+        return self._range_query(self._pair_idx, (src, dst), t_min, t_max, include_left, max_candidates)
 
-    def incoming(
-        self,
-        dst: int,
-        t_min: int,
-        t_max: int,
-        include_left: bool = False,
-        max_candidates: Optional[int] = None,
-    ) -> List[EdgeRecord]:
-        """
-        Query ? -> dst edges in temporal range.
-        """
-        return self._range_query(
-            self._in_idx,
-            self._in_steps,
-            dst,
-            t_min,
-            t_max,
-            include_left=include_left,
-            max_candidates=max_candidates,
-        )
+    def _has_any(self, idx_dict, key, t_min, t_max):
+        positions = idx_dict.get(key)
+        if positions is None or len(positions) == 0:
+            return False
+        step_vals = self._steps[positions]
+        left  = int(np.searchsorted(step_vals, t_min, side='right'))
+        right = int(np.searchsorted(step_vals, t_max, side='right'))
+        return right > left
 
-    def pair(
-        self,
-        src: int,
-        dst: int,
-        t_min: int,
-        t_max: int,
-        include_left: bool = False,
-        max_candidates: Optional[int] = None,
-    ) -> List[EdgeRecord]:
-        """
-        Query src -> dst edges in temporal range.
-        """
-        return self._range_query(
-            self._pair_idx,
-            self._pair_steps,
-            (src, dst),
-            t_min,
-            t_max,
-            include_left=include_left,
-            max_candidates=max_candidates,
-        )
+    def has_any_outgoing(self, src, t_min, t_max):
+        return self._has_any(self._out_idx, src, t_min, t_max)
 
-    def stats(self) -> Dict[str, int]:
-        """
-        Basic index statistics.
-        """
+    def has_any_incoming(self, dst, t_min, t_max):
+        return self._has_any(self._in_idx, dst, t_min, t_max)
+
+    def has_any_pair(self, src, dst, t_min, t_max):
+        return self._has_any(self._pair_idx, (src, dst), t_min, t_max)
+
+    def stats(self):
         return {
             "num_edges": self.num_edges,
             "num_src_nodes": len(self._out_idx),
             "num_dst_nodes": len(self._in_idx),
             "num_pairs": len(self.pair_count),
         }
-
-    def has_any_outgoing(
-        self,
-        src: int,
-        t_min: int,
-        t_max: int,
-    ) -> bool:
-        """
-        Return True if there is at least one outgoing edge from src
-        with step in (t_min, t_max].
-        Used for cheap return-to-start feasibility checks in cycle DFS.
-        """
-        steps = self._out_steps.get(src)
-        if not steps:
-            return False
-        left = bisect_right(steps, t_min)
-        right = bisect_right(steps, t_max)
-        return right > left
-
-    def has_any_pair(
-        self,
-        src: int,
-        dst: int,
-        t_min: int,
-        t_max: int,
-    ) -> bool:
-        """
-        Return True if there is at least one edge src -> dst
-        with step in (t_min, t_max].
-        Used for cheap cycle-close feasibility checks.
-        """
-        steps = self._pair_steps.get((src, dst))
-        if not steps:
-            return False
-        left = bisect_right(steps, t_min)
-        right = bisect_right(steps, t_max)
-        return right > left
-
-    def has_any_incoming(
-        self,
-        dst: int,
-        t_min: int,
-        t_max: int,
-    ) -> bool:
-        """
-        Return True if there is at least one incoming edge to dst
-        with step in (t_min, t_max].
-        Used for cheap feasibility checks in lookback queries.
-        """
-        steps = self._in_steps.get(dst)
-        if not steps:
-            return False
-        left = bisect_right(steps, t_min)
-        right = bisect_right(steps, t_max)
-        return right > left
 
 
 
@@ -2085,8 +2006,8 @@ def membership_rows_to_polars(rows: List[Dict[str, Any]]) -> pl.DataFrame:
         for c, t in schema.items()
     ])
 
-# Define new MotifOutputBuffer
-class MotifOutputBuffer:
+# Define new MatcherOutputBuffer
+class MatcherOutputBuffer:
     def __init__(
         self,
         motif_dir: str,

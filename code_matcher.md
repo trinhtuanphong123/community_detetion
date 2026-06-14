@@ -176,7 +176,8 @@ class FanMatcher:
         cap = self._get_cap(n_branches)
         
         seen_canonical_keys = set()
-        scanned_center_degrees = []
+        n_centers_degree_sum = 0
+        n_centers_degree_max = 0
 
         edge_dict = index.in_edges if self.center_role == "dst" else index.out_edges
 
@@ -187,7 +188,10 @@ class FanMatcher:
                 continue
 
             n_centers_scanned += 1
-            scanned_center_degrees.append(len(incident_edges))
+            deg = len(incident_edges)
+            n_centers_degree_sum += deg
+            if deg > n_centers_degree_max:
+                n_centers_degree_max = deg
 
             # Amount floor filter
             candidates = list(incident_edges)
@@ -252,20 +256,16 @@ class FanMatcher:
                             n_rej_lookback += 1
                             continue
 
-                    # 7. Deduplicate via canonical key (ordered=False consistently for fan-in/fan-out)
-                    ck = make_canonical_key(
-                        pattern.name,
-                        [e.edge_id for e in edges],
-                        ordered=False,
-                    )
-                    if ck in seen_canonical_keys:
+                    # 7. Deduplicate via fast key tuple
+                    fast_key = (pattern.name, tuple(sorted(e.edge_id for e in edges)))
+                    if fast_key in seen_canonical_keys:
                         continue
 
                     # Score the combination
                     score = score_instance(edges, index, pattern)
 
-                    if ck not in center_candidates_by_ck or score > center_candidates_by_ck[ck][0]:
-                        center_candidates_by_ck[ck] = (score, edges, anchor, ck)
+                    if fast_key not in center_candidates_by_ck or score > center_candidates_by_ck[fast_key][0]:
+                        center_candidates_by_ck[fast_key] = (score, edges, anchor, fast_key)
 
                         if len(center_candidates_by_ck) > self.max_instances_per_center * 5:
                             kept = sorted(
@@ -287,11 +287,11 @@ class FanMatcher:
             n_rej_center_cap += len(center_candidates_to_rank) - len(top_k_candidates)
 
             # Emit the ranked top K
-            for rank_idx, (score, edges, anchor, ck) in enumerate(top_k_candidates):
+            for rank_idx, (score, edges, anchor, fast_key) in enumerate(top_k_candidates):
                 if num_instances_emitted >= self.max_instances_per_window:
                     break
 
-                seen_canonical_keys.add(ck)
+                seen_canonical_keys.add(fast_key)
 
                 try:
                     motif_row = make_motif_instance_row(
@@ -319,8 +319,8 @@ class FanMatcher:
 
         elapsed       = time.time() - start_time
 
-        max_deg = int(max(scanned_center_degrees)) if scanned_center_degrees else 0
-        mean_deg = float(sum(scanned_center_degrees) / len(scanned_center_degrees)) if scanned_center_degrees else 0.0
+        max_deg = int(n_centers_degree_max)
+        mean_deg = float(n_centers_degree_sum / n_centers_scanned) if n_centers_scanned > 0 else 0.0
 
         stats = {
             "window_id":                    int(window.window_id),
@@ -1301,7 +1301,7 @@ class CycleKMatcher:
 
     def _emit_cycle_instance(
         self,
-        output_buffer: MotifOutputBuffer,
+        output_buffer: MatcherOutputBuffer,
         window: WindowSpec,
         pattern: MotifPattern,
         edges: List[EdgeRecord],
