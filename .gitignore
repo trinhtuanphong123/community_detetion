@@ -1,6 +1,5 @@
 # --- Cấu hình cho Vibe Coding / AI Tools ---
 .agents/
-.claude/
 .cursor/
 .windsurf/
 
