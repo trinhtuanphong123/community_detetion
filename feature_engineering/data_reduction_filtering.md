@@ -1,15 +1,19 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+
 import sys
 import os
 from pathlib import Path
 
-# Setup path
-ROOT = Path(os.getcwd()).parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# Set the data directory to the specified Google Drive path
+DATA_DIR = Path('/content/drive/MyDrive/AML/dataset/')
 
-print('ROOT:', ROOT)
-print('features_nodes:', (ROOT / 'data' / 'features_nodes.csv').exists())
-print('reduced_features_nodes:', (ROOT / 'reduced_features_nodes.csv').exists())
+# Removed ROOT and related sys.path modifications as DATA_DIR is now absolute
+
+print('DATA_DIR:', DATA_DIR)
+print('features_nodes:', (DATA_DIR / 'features_nodes.csv').exists())
+print('reduced_features_nodes:', (DATA_DIR / 'reduced_features_nodes.csv').exists())
 
 import pandas as pd
 import numpy as np
@@ -29,7 +33,8 @@ DROP_FRAC    = 0.50   # drop bottom 50% mỗi vòng
 
 
 
-df_nodes = pd.read_csv(ROOT / 'data' / 'features_nodes.csv')
+
+df_nodes = pd.read_csv(DATA_DIR / 'features_nodes.csv')
 
 print(f"Accounts : {len(df_nodes):,}")
 print(f"Features : {df_nodes.shape[1] - 2}")
@@ -180,88 +185,191 @@ print(f"  SAR recall      : {sar_final/sar_original*100:.1f}%")
 print("=" * 55)
 
 
-current_df.to_csv(OUT_PATH, index=False)
-print(f"✅  Saved → {OUT_PATH}")
-print(f"   Shape  : {current_df.shape}")
-print(f"   SAR=1  : {current_df['is_sar'].sum():,}  ({current_df['is_sar'].mean()*100:.2f}%)")
-
 
 # =====================================================================
-# 🚀 TRÍCH XUẤT CẠNH (1-HOP) & ÁNH XẠ RAW ID TUYỆT ĐỐI
+# TRÍCH XUẤT GIAO DỊCH LIÊN QUAN TỚI CORE ACCOUNTS
 # =====================================================================
 import polars as pl
 import time
 
-print("\n" + "=" * 65)
-print("  BẮT ĐẦU TRÍCH XUẤT GIAO DỊCH (1-HOP)")
-print("=" * 65)
-
 start_time = time.time()
 
-# 1. Trích xuất danh sách 6,250 Core Nodes từ bước trước
-core_accounts = current_df["account"].tolist()
-core_series = pl.Series("core", core_accounts)
+# ------------------------------------------------------------------
+# 1. Danh sách 6,250 core accounts từ RM-2/RM-3
+# ------------------------------------------------------------------
+core_series = pl.Series("core", current_df["account"].tolist())
 
-# 2. Tải dữ liệu GỐC (tx_log.csv)
-RAW_PATH = DATA_DIR / 'tx_log.csv' # Use DATA_DIR and .csv extension
-print(f"Đang tải dữ liệu từ: {RAW_PATH}")
-df_raw = pl.read_csv(RAW_PATH) # Use pl.read_csv directly
+print(f"Core accounts : {len(core_series):,}")
 
-# ---------------------------------------------------------------------
-# CHÚ Ý: ĐỊNH DANH TRÊN TOÀN BỘ BẢNG RAW CHƯA QUA XỬ LÝ
-# ---------------------------------------------------------------------
-# Lệnh này đảm bảo edge_id chính là số thứ tự dòng (Index) trong file gốc ban đầu.
-# Nếu edge_id = 500,000, anh kéo xuống đúng dòng 500,000 trong file raw là thấy nó.
-df_raw = df_raw.with_row_index(name="edge_id", offset=0)
-
-# 3. Áp dụng bộ lọc nghiệp vụ
-net = df_raw.filter(
-    (pl.col("bankOrig") != "source") &
-    (pl.col("bankDest") != "sink") &
-    (pl.col("type") == "TRANSFER")
+# ------------------------------------------------------------------
+# 2. Load tx_log và đánh edge_id TRƯỚC — đây là ID tuyệt đối
+#    edge_id = số thứ tự dòng trong file gốc, bắt đầu từ 0
+# ------------------------------------------------------------------
+RAW_PATH = DATA_DIR / 'tx_log.csv'
+df_raw = (
+    pl.read_csv(RAW_PATH)
+    .with_row_index(name="edge_id", offset=0)   # đánh ID toàn bộ trước
 )
-original_edges_count = net.height
-print(f"Tổng số cạnh ban đầu       : {original_edges_count:,}")
 
-# 4. Quét mạng lưới 1-Hop
-print("Đang quét mạng lưới để tìm hàng xóm 1-Hop...")
-subgraph_edges = net.filter(
+print(f"Tổng edges (raw)  : {df_raw.height:,}")
+
+# ------------------------------------------------------------------
+# 3. Lọc: giữ edge nếu nameOrig HOẶC nameDest thuộc core accounts
+#    Không filter type, không filter bank — lấy toàn bộ
+# ------------------------------------------------------------------
+subgraph_edges = df_raw.filter(
     pl.col("nameOrig").is_in(core_series) | pl.col("nameDest").is_in(core_series)
 )
-retained_edges_count = subgraph_edges.height
 
-# 5. Toàn bộ Nodes trong Subgraph (re-introducing this calculation)
+# ------------------------------------------------------------------
+# 4. Lấy toàn bộ nodes xuất hiện trong subgraph (cả 2 chiều)
+# ------------------------------------------------------------------
 subgraph_nodes = (
     pl.concat([
         subgraph_edges.select(pl.col("nameOrig").alias("account")),
-        subgraph_edges.select(pl.col("nameDest").alias("account"))
+        subgraph_edges.select(pl.col("nameDest").alias("account")),
     ])
     .unique()
 )
-retained_nodes_count = subgraph_nodes.height
 
-print("\n" + "=" * 55)
-print("  KẾT QUẢ ĐỒ THỊ 1-HOP (INDUCED SUBGRAPH)")
-print("=" * 55)
-print(f"  Nodes ban đầu (ước tính) : ~99,996")
-print(f"  Nodes sau lọc XGBoost    : {len(core_accounts):,} (Core)")
-print(f"  Nodes trong 1-Hop Graph  :   {retained_nodes_count:>8,} (Tăng {(retained_nodes_count/len(core_accounts)):.1f} lần so với Core)")
-print(f"  {'-'*50}")
-print(f"  Edges ban đầu            :  {original_edges_count:>8,}")
-print(f"  Edges trong 1-Hop Graph  :  {retained_edges_count:>8,}")
-print(f"  Tỷ lệ Edges giữ lại      : {(retained_edges_count / original_edges_count * 100):.2f}%")
-print("=" * 55)
+# ------------------------------------------------------------------
+# 5. Thống kê
+# ------------------------------------------------------------------
+sar_total    = df_raw["isSAR"].sum()
+sar_retained = subgraph_edges["isSAR"].sum()
 
-if retained_nodes_count > 60000:
-    print("⚠️  BÁO ĐỘNG ĐỎ: Đồ thị 1-hop phình lên quá 60% kích thước gốc.")
+print(f"\n{'='*55}")
+print(f"  {'Metric':<28} {'Before':>10}  {'After':>10}")
+print(f"  {'-'*48}")
+print(f"  {'Edges':<28} {df_raw.height:>10,}  {subgraph_edges.height:>10,}")
+print(f"  {'isSAR=1 edges':<28} {sar_total:>10,}  {sar_retained:>10,}")
+print(f"  {'isSAR rate':<28} {sar_total/df_raw.height*100:>9.2f}%  "
+      f"{sar_retained/subgraph_edges.height*100:>9.2f}%")
+print(f"  {'SAR recall':<28} {'100.00%':>10}  "
+      f"{sar_retained/sar_total*100:>9.1f}%")
+print(f"  {'Nodes':<28} {'~99,996':>10}  {subgraph_nodes.height:>10,}")
+print(f"{'='*55}")
+print(f"\n⏱  Hoàn thành trong: {time.time() - start_time:.2f}s")
 
-# 6. Lưu subgraph (saving subgraph_edges and subgraph_nodes for EDA)
+# ------------------------------------------------------------------
+# 6. Lưu
+# ------------------------------------------------------------------
 out_edges_path = DATA_DIR / 'subgraph_1hop_edges.parquet'
 out_nodes_path = DATA_DIR / 'subgraph_1hop_nodes.parquet'
 
 subgraph_edges.write_parquet(out_edges_path)
 subgraph_nodes.write_parquet(out_nodes_path)
 
-print(f"\n✅ Đã lưu Edges 1-Hop : {out_edges_path}")
-print(f"✅ Đã lưu Nodes 1-Hop : {out_nodes_path}")
-print(f"⏱ Hoàn thành trong   : {time.time() - start_time:.2f} giây.")
+print(f"\n✅  Edges → {out_edges_path}  {subgraph_edges.shape}")
+print(f"✅  Nodes → {out_nodes_path}  {subgraph_nodes.shape}")
+
+
+# Load the subgraph edges data
+subgraph_edges_path = DATA_DIR / 'subgraph_1hop_edges.parquet'
+df_subgraph_edges = pl.read_parquet(subgraph_edges_path)
+
+print(f"Loaded 1-Hop Edges: {df_subgraph_edges.shape[0]:,} rows, {df_subgraph_edges.shape[1]} columns")
+
+print("\n--- Head of the DataFrame ---")
+print(df_subgraph_edges.head())
+
+print("\n--- Schema of the DataFrame ---")
+print(df_subgraph_edges.schema)
+
+
+
+print("\n--- Descriptive Statistics ---")
+print(df_subgraph_edges.describe())
+
+print("\n--- Missing Values ---")
+# Polars' null_count() method returns a DataFrame with null counts for each column
+print(df_subgraph_edges.null_count())
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Convert to pandas for easier plotting with seaborn/matplotlib
+df_subgraph_edges_pd = df_subgraph_edges.to_pandas()
+
+# Distribution of 'amount'
+plt.figure(figsize=(10, 6))
+sns.histplot(df_subgraph_edges_pd['amount'], bins=50, kde=True)
+plt.title('Distribution of Transaction Amount in 1-Hop Subgraph')
+plt.xlabel('Amount')
+plt.ylabel('Frequency')
+plt.yscale('log') # Use log scale for y-axis if distribution is heavily skewed
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.show()
+
+
+# Value counts for 'type' (transaction type)
+if 'type' in df_subgraph_edges_pd.columns:
+    print("\n--- Value Counts for Transaction Type ---")
+    type_counts = df_subgraph_edges_pd['type'].value_counts()
+    print(type_counts)
+
+    plt.figure(figsize=(8, 5))
+    sns.barplot(x=type_counts.index, y=type_counts.values, palette='viridis')
+    plt.title('Distribution of Transaction Types')
+    plt.xlabel('Transaction Type')
+    plt.ylabel('Count')
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Column 'type' not found for value count analysis.")
+
+
+# Time series trend for 'step' (if applicable)
+if 'step' in df_subgraph_edges_pd.columns:
+    plt.figure(figsize=(12, 6))
+    df_subgraph_edges_pd['step'].value_counts().sort_index().plot(kind='line')
+    plt.title('Number of Transactions per Step')
+    plt.xlabel('Step')
+    plt.ylabel('Number of Transactions')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+else:
+    print("Column 'step' not found for time series trend analysis.")
+
+
+
+import polars as pl
+import time
+
+print("=" * 55)
+print("  PHÂN TÍCH BASELINE: SỐ LƯỢNG CẠNH SAR GỐC")
+print("=" * 55)
+
+start_time = time.time()
+
+# 1. Tải dữ liệu gốc từ HuggingFace
+print("Đang tải dữ liệu gốc...")
+RAW_PATH = DATA_DIR / 'tx_log.csv'
+df_raw = pl.read_csv(RAW_PATH) # Changed to pl.read_csv directly
+
+# 2. Đếm SAR trên TOÀN BỘ dữ liệu thô (Bao gồm cả dòng tiền từ hệ thống/Deposit)
+total_raw_edges = df_raw.height
+sar_raw_edges = df_raw.filter(pl.col("isSAR") == 1).height
+
+print(f"\n[1] TRÊN TẬP DỮ LIỆU THÔ TUYỆT ĐỐI (Toàn bộ loại giao dịch):")
+print(f"    - Tổng số cạnh : {total_raw_edges:>10,}")
+print(f"    - Số cạnh SAR  : {sar_raw_edges:>10,} ({(sar_raw_edges/total_raw_edges*100):.3f}%)の結果です。")
+
+# 3. Đếm SAR trên TẬP MẠNG LƯỚI GIAO DỊCH (Chỉ lấy TRANSFER, bỏ source/sink)
+net = df_raw.filter(
+    (pl.col("bankOrig") != "source") &
+    (pl.col("bankDest") != "sink") &
+    (pl.col("type") == "TRANSFER")
+)
+
+total_net_edges = net.height
+sar_net_edges = net.filter(pl.col("isSAR") == 1).height
+
+print(f"\n[2] TRÊN TẬP MẠNG LƯỚI LÕI (Chỉ tính TRANSFER giữa người với người):")
+print(f"    - Tổng số cạnh : {total_net_edges:>10,}")
+print(f"    - Số cạnh SAR  : {sar_net_edges:>10,} ({(sar_net_edges/total_net_edges*100):.3f}%)の結果です。")
+print("=" * 55)
+print(f"⏱ Hoàn thành trong : {time.time() - start_time:.2f} giây.")

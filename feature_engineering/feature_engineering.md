@@ -1,3 +1,7 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+
 import pandas as pd
 import polars as pl
 import matplotlib.pyplot as plt
@@ -7,10 +11,7 @@ import numpy as np
 from pathlib import Path
 
 
-from datasets import load_dataset
-
-ds = load_dataset("AMLGentex/sweden_100K_dist_change_difficult")
-df = pl.from_arrow(ds["train"].data.table)
+df = pl.read_csv('/content/drive/MyDrive/AML/dataset/tx_log.csv')
 print(f"Shape: {df.shape}")
 print(df.schema)
 
@@ -49,6 +50,47 @@ print(base.shape)
 print(base["is_sar"].value_counts())
 
 
+
+# ── RM-1 Filter ──────────────────────────────────────────────
+# Tính trên raw (bỏ INITIALBALANCE), KHÔNG phải trên net
+df_clean = df.filter(pl.col("type") != "INITIALBALANCE")
+
+# F2: tx_count > 1000 (tính trên ALL types)
+tx_count_raw = df_clean.group_by("nameOrig").agg(pl.len().alias("tx_count"))
+flag_f2 = set(
+    tx_count_raw.filter(pl.col("tx_count") > 1000)["nameOrig"].to_list()
+)
+
+# F3: unique counterparty > 50 (tính trên ALL types)
+unique_cp_raw = df_clean.group_by("nameOrig").agg(
+    pl.col("nameDest").n_unique().alias("n_cp")
+)
+flag_f3 = set(
+    unique_cp_raw.filter(pl.col("n_cp") > 50)["nameOrig"].to_list()
+)
+
+accounts_to_remove = flag_f2 | flag_f3
+
+print(f"Flagged by F2 (tx > 1000) : {len(flag_f2):,}")
+print(f"Flagged by F3 (cp > 50)   : {len(flag_f3):,}")
+print(f"Total to remove           : {len(accounts_to_remove):,}")
+
+# Kiểm tra SAR bị loại
+sar_accounts = set(
+    df_clean.filter(pl.col("isSAR") == 1)["nameOrig"].unique().to_list()
+)
+print(f"SAR bị loại               : {len(accounts_to_remove & sar_accounts):,}")
+
+# Drop khỏi net
+net = net.filter(
+    ~pl.col("nameOrig").is_in(list(accounts_to_remove)) &
+    ~pl.col("nameDest").is_in(list(accounts_to_remove))
+)
+print(f"\nTransactions remaining: {len(net):,}")
+# ─────────────────────────────────────────────────────────────
+
+
+
 # Thêm window bin (0-27 → W0, 28-55 → W1, 56-83 → W2, 84-111 → W3)
 net = net.with_columns(
     (pl.col("step") // 28).alias("window")
@@ -70,9 +112,8 @@ out_feats = (
     .rename({"nameOrig": "account"})
 )
 
-print(out_feats.shape)                                                          
-print(out_feats.head())                   
-
+print(out_feats.shape)
+print(out_feats.head())
 
 
 # Incoming features (từ góc nhìn nameDest)
@@ -92,6 +133,7 @@ in_feats = (
 )
 
 print(in_feats.shape)
+
 
 def pivot_window_feats(feats_df, feature_cols):
     """Pivot long (account, window, feat...) → wide (account, feat_w0, feat_w1...)"""
@@ -118,6 +160,7 @@ in_wide  = pivot_window_feats(in_feats,  in_feature_cols)
 print(out_wide.shape)
 print(in_wide.shape)
 
+
 # Left join từ base đảm bảo tất cả 99996 accounts đều có mặt; fill_null(0) cho accounts không có giao dịch trong window đó
 features = (
     base
@@ -128,6 +171,7 @@ features = (
 
 print(features.shape)
 print(features.head(3))
+
 
 # Timing features cho outgoing
 out_timing = (
@@ -260,6 +304,7 @@ for w in range(4):
 features = features.with_columns(flow_cols)
 
 
+
 vel_cols = []
 for w in range(4):
     oc = f"out_count_w{w}"
@@ -303,7 +348,6 @@ for w in range(4):
 
 features = features.with_columns(cv_cols)
 
-
 fanio_cols = []
 for w in range(4):
     iu = f"in_count_unique_w{w}"
@@ -314,6 +358,7 @@ for w in range(4):
     ]
 
 features = features.with_columns(fanio_cols)
+
 
 
 sent_to   = net.group_by("nameOrig").agg(pl.col("nameDest").unique().alias("sent_to"))
@@ -433,6 +478,9 @@ features = features.drop(["total_out_sum", "total_in_sum"])
 print(features.shape)
 print("SAR rate:", features["is_sar"].mean())
 
-features.write_parquet("features_nodes.parquet")
-features.write_csv("features_nodes.csv")
+folder_path = '/content/drive/MyDrive/AML/dataset/'
+
+
+features.write_parquet(folder_path + "features_nodes.parquet")
+features.write_csv(folder_path + "features_nodes.csv")
 print("Saved:", features.shape)
